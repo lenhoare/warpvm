@@ -1,0 +1,7 @@
+build/
+target/
+*.o
+*.wvm
+*.snap
+compile_commands.json
+.cache/
