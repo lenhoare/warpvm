@@ -20,11 +20,16 @@ benchmarks/ performance experiments
 
 ## Build
 
-Requires CUDA toolkit (nvcc) and CMake ≥ 3.24. Default CUDA architecture is
-sm_86 (RTX 3060); override with `-DCMAKE_CUDA_ARCHITECTURES=<cc>`.
+Requires a CUDA toolkit (nvcc) and CMake ≥ 3.24.
+
+The CUDA target architecture is build configuration, not a project default.
+Pass `-DCMAKE_CUDA_ARCHITECTURES=<arch>` or set the `CUDAARCHS` environment
+variable; left unset, the toolkit's own default is used (sm_75 on CUDA 13.2),
+which may not match your GPU. The configured list must include a native
+cubin for the GPU you run on.
 
 ```sh
-cmake -S . -B build
+cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES=86   # e.g. RTX 3060
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
