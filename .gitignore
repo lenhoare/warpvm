@@ -3,5 +3,6 @@ target/
 *.o
 *.wvm
 *.snap
+*:Zone.Identifier
 compile_commands.json
 .cache/

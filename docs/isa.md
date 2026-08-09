@@ -240,7 +240,8 @@ Jump/call targets are absolute word indices (I-form immediate).
 `JMP_IF_ANY`/`JMP_IF_ALL` use the **guard field** as their condition
 predicate; their own guard should be 0 (assembler enforces).
 
-After any non-jump instruction, `pc` advances by 1.
+After any non-jump instruction, `pc` advances by 1. Execution that reaches
+`pc == code_len` without a `HALT` faults (`FAULT_JUMP`).
 
 ### 4.9 Scalar operations
 
@@ -331,6 +332,9 @@ directly to the destination's inbound ring via `SEND`. Full mailbox:
 - Guard prefix: `@p0` … `@p3`, `@!p0` … `@!p3`.
 - Operand forms: `OP rd, rs1, rs2` / `OP rd, rs1, IMM` / memory uses plain
   registers: `LOAD r3, r2` / `STORE r2, r3`.
+- The assembler chooses R-form vs I-form by operand kind: `ADD r0, r1, r2`
+  and `ADD r0, r1, #5` are both legal; explicit `_I` mnemonics are accepted
+  too. Immediates may be written bare or `#`-prefixed.
 
 Assembler behaviour for constants in immediate position:
 

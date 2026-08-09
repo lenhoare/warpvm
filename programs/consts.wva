@@ -1,0 +1,8 @@
+; consts.wva — large constant via the literal pool (slice 2)
+; BIG does not fit the 13-bit immediate, so the assembler materialises it
+; into the scratch register (r15) with LDW and uses the R-form ADD.
+.const BIG 123456
+
+    MOV_I r0, 0
+    ADD_I r0, r0, BIG
+    HALT

@@ -11,7 +11,7 @@ See [project_spec.md](project_spec.md) for the full vision and
 
 ```text
 runtime/    C++/CUDA — kernel, interpreter, host runtime, CLI
-tools/      Rust — assembler, disassembler (lands in slice 2)
+tools/      Rust — assembler (`warpvm-as`) and disassembler (`warpvm-dis`)
 programs/   .wva example programs
 docs/       architecture + ISA documentation
 tests/      host-side tests
@@ -34,13 +34,24 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
+## Language tools
+
+The Rust assembler/disassembler build as part of `cmake --build` and land in
+`build/tools-rust/release/`:
+
+```sh
+build/tools-rust/release/warpvm-as programs/hello.wva -o hello.wvm
+build/tools-rust/release/warpvm-dis hello.wvm
+build/runtime/warpvm run hello.wvm
+```
+
 ## Slice status
 
 | Slice | Content | Status |
 |---|---|---|
 | 0 | repo skeleton, ISA contract (`docs/isa.md`) | done |
 | 1 | one warp, lane-wise arithmetic + reduction to host | done |
-| 2 | interpreter (MOV/ADD/HALT), Rust assembler/disassembler | — |
+| 2 | interpreter (MOV/ADD/HALT), Rust assembler/disassembler | done |
 | 3 | many VMs, stable IDs, private RAM | — |
 | 4 | warp-native ops, stride-32 loops | — |
 | 5 | persistent kernel control plane, `warpvm list` | — |

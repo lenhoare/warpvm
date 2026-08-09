@@ -1,0 +1,16 @@
+[package]
+name = "warpvm-asm"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "wvmasm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "warpvm-as"
+path = "src/bin/as.rs"
+
+[[bin]]
+name = "warpvm-dis"
+path = "src/bin/dis.rs"

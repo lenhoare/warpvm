@@ -1,0 +1,8 @@
+; hello.wva — first WarpVM program (slice 2)
+; r0 <- 42 in every lane, then derive r1/r2 from it.
+
+    MOV_I r0, 7
+    ADD_I r0, r0, 35
+    MOV   r1, r0
+    ADD   r2, r0, r1
+    HALT
