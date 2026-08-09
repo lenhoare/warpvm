@@ -89,7 +89,9 @@ pub const OP_STORE: u32 = 0x51;
 pub const OP_LOG: u32 = 0x58;
 pub const OP_LOG_I: u32 = 0x59;
 
-// 0x60-0x6F reserved for messaging.
+pub const OP_SEND: u32 = 0x60;
+pub const OP_TRY_RECV: u32 = 0x61;
+// 0x62-0x6F reserved for more messaging.
 
 pub const OP_JMP: u32 = 0x70;
 pub const OP_JMP_IF_ANY: u32 = 0x71;

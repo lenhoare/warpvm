@@ -1,0 +1,41 @@
+; demo.wva — v0.1 capstone demonstration (run with 64 VMs).
+;
+; Every VM:
+;   1. does a 32-lane computation (LANEID + ADD + REDUCE_ADD), producing
+;      aggregate = 32*vm_id + 496;
+;   2. SENDs that aggregate to the next VM in a ring (vm_id+1 mod N);
+;   3. TRY_RECVs the aggregate from the previous VM and stores it at mem[0];
+;   4. settles into a heartbeat loop so it stays RUNNING and inspectable.
+;
+; With N=64, VM i's mem[0] ends up holding 32*((i-1) mod 64) + 496.
+; Try:  warpvm-as demo.wva -o demo.wvm && warpvm demo demo.wvm --vms 64
+;       or interactively: warpvm attach demo.wvm --vms 64, then `vm 37`.
+
+.const N 64
+
+; ---- 32-lane computation ----
+    VMID r0                 ; r0 = vm_id (all lanes)
+    LANEID r1               ; r1 = lane id
+    ADD r2, r0, r1          ; r2 = vm_id + lane (varied per lane)
+    REDUCE_ADD r3, r2       ; r3 = 32*vm_id + 496 (uniform)
+
+; ---- send the aggregate to the next VM ----
+    ADD_I r4, r0, 1         ; candidate destination = vm_id + 1
+    CMP_EQ p0, r4, N        ; about to run off the end of the ring?
+    @p0 MOV_I r4, 0         ; wrap destination to VM 0
+    MOV_I r5, 1             ; message type
+    SEND r4, r5, r3
+
+; ---- receive the previous VM's aggregate ----
+recv:
+    TRY_RECV p1, r6, r7     ; r6 = payload, r7 = (type<<16)|src
+    NOTMASK p2, p1
+    JMP_IF_ANY p2, recv     ; poll until a message arrives
+    MOV_I r8, 0
+    STORE r8, r6            ; mem[0] = received aggregate
+
+; ---- heartbeat: stay alive so the VM remains inspectable ----
+beat:
+    ADD_I r3, r3, 1
+    YIELD
+    JMP beat

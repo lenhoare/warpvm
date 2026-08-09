@@ -22,7 +22,8 @@
 namespace wvm {
 
 __global__ void PersistentKernel(const VmDesc* descs, VmState* states,
-                                 Control* ctrl, uint32_t num_vms);
+                                 Control* ctrl, uint32_t num_vms,
+                                 Mailbox* mailboxes);
 
 struct LogSnapshot {
   uint32_t head = 0;
@@ -103,6 +104,12 @@ class PersistentRuntime {
       return false;
     }
     cudaMemset(d_states_, 0, num_vms_ * sizeof(VmState));
+    if (cudaMalloc(reinterpret_cast<void**>(&d_mailboxes_),
+                   num_vms_ * sizeof(Mailbox)) != cudaSuccess) {
+      err = "cudaMalloc mailboxes failed";
+      return false;
+    }
+    cudaMemset(d_mailboxes_, 0, num_vms_ * sizeof(Mailbox));
     return true;
   }
 
@@ -119,7 +126,7 @@ class PersistentRuntime {
     const int block = 256;
     const int grid = static_cast<int>((num_vms_ * kLanes + block - 1) / block);
     PersistentKernel<<<grid, block, 0, stream_>>>(d_descs_, d_states_, d_ctrl_,
-                                                  num_vms_);
+                                                  num_vms_, d_mailboxes_);
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
       err = std::string("kernel launch failed: ") + cudaGetErrorString(e);
@@ -221,6 +228,7 @@ class PersistentRuntime {
   void Free() {
     if (d_descs_) cudaFree(d_descs_), d_descs_ = nullptr;
     if (d_states_) cudaFree(d_states_), d_states_ = nullptr;
+    if (d_mailboxes_) cudaFree(d_mailboxes_), d_mailboxes_ = nullptr;
     for (auto p : d_code_) cudaFree(p);
     for (auto p : d_lit_) cudaFree(p);
     for (auto p : d_mem_) cudaFree(p);
@@ -237,6 +245,7 @@ class PersistentRuntime {
   Control* d_ctrl_ = nullptr;
   VmDesc* d_descs_ = nullptr;
   VmState* d_states_ = nullptr;
+  Mailbox* d_mailboxes_ = nullptr;
   std::vector<uint32_t*> d_code_, d_lit_, d_mem_;
   std::vector<VmImage> h_images_;
   cudaStream_t stream_ = nullptr;

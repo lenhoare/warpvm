@@ -475,6 +475,26 @@ impl Asm {
                 }
             }
 
+            // SEND rDest, rType, rPayload — lane 0 posts to VM rDest[0].
+            "SEND" => {
+                let [rdest, rtype, rpayload] = ops else {
+                    return Err(format!("line {line}: SEND takes rDest, rType, rPayload"));
+                };
+                let rdest = Self::vreg(rdest, line, "dest")?;
+                let rtype = Self::vreg(rtype, line, "type")?;
+                let rpayload = Self::vreg(rpayload, line, "payload")?;
+                self.emit(enc_r(OP_SEND, guard, rdest, rtype, rpayload));
+            }
+            // TRY_RECV pGot, rPayload, rMeta — consume one pending message.
+            "TRY_RECV" => {
+                let [Operand::Pred(pgot), rpayload, rmeta] = ops else {
+                    return Err(format!("line {line}: TRY_RECV takes pGot, rPayload, rMeta"));
+                };
+                let rpayload = Self::vreg(rpayload, line, "payload")?;
+                let rmeta = Self::vreg(rmeta, line, "meta")?;
+                self.emit(enc_r(OP_TRY_RECV, guard, *pgot, rpayload, rmeta));
+            }
+
             // ---- scalar ops ----
             "S_MOV" => {
                 let [sd, ss1] = ops else {
@@ -764,6 +784,23 @@ mod tests {
     #[test]
     fn roundtrip_control_flow() {
         let src = ".const N 100\nS_MOV_I s0, 0\nloop:\nLANEID r0\nS_BCAST r1, s0\nADD r2, r0, r1\nCMP_LT p0, r2, N\n@p0 LOAD r3, r2\n@p0 MUL r3, r3, r3\n@p0 STORE r2, r3\nS_ADD_I s0, s0, 32\nS_CMP_LT_I p1, s0, N\nJMP_IF_ANY p1, loop\nCALL done\nRET\ndone:\nHALT\n";
+        let a = assemble(src).unwrap();
+        let text = disasm::disassemble(&a.code, &a.literals);
+        let b = assemble(&text).expect("re-assemble failed");
+        assert_eq!(a.code, b.code);
+        assert_eq!(a.literals, b.literals);
+    }
+
+    #[test]
+    fn messaging_ops_encode() {
+        let a = assemble("SEND r1, r2, r3\nTRY_RECV p2, r4, r5\nHALT\n").unwrap();
+        assert_eq!(a.code[0], enc_r(OP_SEND, 0, 1, 2, 3));
+        assert_eq!(a.code[1], enc_r(OP_TRY_RECV, 0, 2, 4, 5));
+    }
+
+    #[test]
+    fn roundtrip_messaging() {
+        let src = "VMID r0\nCMP_EQ p0, r0, #0\nJMP_IF_ANY p0, done\nSEND r1, r2, r3\ndone:\nTRY_RECV p1, r4, r5\nHALT\n";
         let a = assemble(src).unwrap();
         let text = disasm::disassemble(&a.code, &a.literals);
         let b = assemble(&text).expect("re-assemble failed");

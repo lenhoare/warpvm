@@ -19,6 +19,22 @@ constexpr uint32_t kMaxCodeWords = 4096;
 constexpr uint32_t kMaxLiterals = 256;
 constexpr uint32_t kMailboxSlots = 16;
 
+// ---- Messaging (isa.md §4.7) -------------------------------------------
+// Fixed-size 16-byte message. payload[1..2] are reserved (zero) in v0.1;
+// SEND transmits payload[0] only.
+struct Message {
+  uint32_t header;      // src_vm in low 16 bits, msg_type in high 16 bits
+  uint32_t payload[3];
+};
+
+// Per-VM inbound mailbox: a ring of kMailboxSlots messages. Producers claim a
+// slot by atomically advancing head; the owner consumes from tail.
+struct Mailbox {
+  volatile uint32_t head;
+  volatile uint32_t tail;
+  Message slots[kMailboxSlots];
+};
+
 // ---- VM status (isa.md §6) ---------------------------------------------
 enum Status : uint32_t {
   kIdle = 0,
@@ -95,7 +111,7 @@ enum Opcode : uint32_t {
 
   kLog = 0x58, kLogI = 0x59,
 
-  // 0x60-0x6F reserved for messaging (slice 7)
+  kSend = 0x60, kTryRecv = 0x61,  // messaging (0x62-0x6F reserved)
 
   kJmp = 0x70, kJmpIfAny = 0x71, kJmpIfAll = 0x72, kCall = 0x73,
   kRet = 0x74, kHalt = 0x75, kYield = 0x76, kStepTrap = 0x77,

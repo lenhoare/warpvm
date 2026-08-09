@@ -96,9 +96,18 @@ without terminating the kernel.
 
 ## Messaging
 
-Fixed 16-byte messages (`src_vm`, `msg_type`, 3×u32 payload). Each VM has a
-16-slot inbound ring; `SEND` claims a slot with an atomic on the
-destination's `head`. v0.1: mailbox full ⇒ `FAULT_MSG` (no blocking).
+Fixed 16-byte messages. The header packs `src_vm` (low 16 bits) and
+`msg_type` (high 16 bits); of the 3 payload words, v0.1 `SEND` transmits only
+`payload[0]` (`payload[1..2]` reserved). Each VM has a 16-slot inbound ring in
+a global mailbox array: `SEND` claims a slot with an atomic on the
+destination's `head`, the owner consumes from `tail`. v0.1: mailbox full ⇒
+`FAULT_MSG` (no blocking). `TRY_RECV` is non-blocking and returns a
+got-message predicate.
+
+The claim-then-write / read-then-advance scheme has a small producer/consumer
+race window (a receiver could read a slot a sender is still filling). v0.1
+accepts this for cooperative traffic; a two-phase commit or per-slot flag is a
+later hardening if messaging becomes load-bearing.
 
 ## Scheduling
 

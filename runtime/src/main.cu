@@ -877,6 +877,175 @@ int RunSlice5() {
   return ok ? 0 : 1;
 }
 
+int RunSlice7() {
+  using wvm::enc_i;
+  using wvm::enc_r;
+  bool ok = true;
+
+  // VM 0 sends payload 1234 to VM 1; VM 1 receives it and stores mem[0].
+  // All other VMs halt immediately.
+  const std::vector<uint32_t> prog = {
+      enc_r(wvm::kVmid, 0, 0, 0, 0),        // 0: VMID r0
+      enc_i(wvm::kCmpEqI, 0, 0, 0, 0),      // 1: CMP_EQ p0, r0, #0
+      enc_i(wvm::kJmpIfAny, 1, 0, 0, 6),    // 2: JMP_IF_ANY p0, sender(6)
+      enc_i(wvm::kCmpEqI, 0, 1, 0, 1),      // 3: CMP_EQ p1, r0, #1
+      enc_i(wvm::kJmpIfAny, 2, 0, 0, 11),   // 4: JMP_IF_ANY p1, receiver(11)
+      enc_r(wvm::kHalt, 0, 0, 0, 0),        // 5: HALT (other VMs)
+      enc_i(wvm::kMovI, 0, 1, 0, 1),        // 6: sender: MOV_I r1, 1 (dest)
+      enc_i(wvm::kMovI, 0, 2, 0, 7),        // 7: MOV_I r2, 7 (type)
+      enc_i(wvm::kMovI, 0, 3, 0, 1234),     // 8: MOV_I r3, 1234 (payload)
+      enc_r(wvm::kSend, 0, 1, 2, 3),        // 9: SEND r1, r2, r3
+      enc_r(wvm::kHalt, 0, 0, 0, 0),        // 10: HALT
+      enc_r(wvm::kTryRecv, 0, 2, 4, 5),     // 11: recv: TRY_RECV p2, r4, r5
+      enc_r(wvm::kNotMask, 0, 3, 2, 0),     // 12: NOTMASK p3, p2
+      enc_i(wvm::kJmpIfAny, 4, 0, 0, 11),   // 13: JMP_IF_ANY p3, recv(11)
+      enc_i(wvm::kMovI, 0, 6, 0, 0),        // 14: MOV_I r6, 0 (addr)
+      enc_r(wvm::kStore, 0, 6, 4, 0),       // 15: STORE r6, r4 (mem[0]=payload)
+      enc_r(wvm::kHalt, 0, 0, 0, 0),        // 16: HALT
+  };
+
+  const uint32_t N = 4;
+  std::vector<wvm::VmImage> images(N);
+  for (uint32_t i = 0; i < N; ++i) {
+    images[i].code = prog;
+    images[i].mem_size_words = 16;
+  }
+  wvm::PersistentRuntime rt;
+  std::string err;
+  if (!rt.Init(images, err) || !rt.Launch(err)) {
+    std::fprintf(stderr, "slice7: setup failed: %s\n", err.c_str());
+    return 1;
+  }
+  rt.BootAll();
+
+  // Wait for every VM to halt (sender/receiver handshake completes).
+  bool all_halted = true;
+  for (int waited = 0;; ++waited) {
+    all_halted = true;
+    for (uint32_t i = 0; i < N; ++i) {
+      const uint32_t s = rt.Status(i);
+      if (s != wvm::kHalted && s != wvm::kFaulted) all_halted = false;
+    }
+    if (all_halted || waited > 5000) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  if (!all_halted) {
+    std::printf("  %-22s FAIL (timeout waiting for halt)\n", "messaging");
+    rt.ShutdownAll();
+    rt.Sync();
+    return 1;
+  }
+
+  // VM 1 must have received VM 0's payload (1234) in mem[0]; no faults.
+  std::vector<uint32_t> mem;
+  const bool read_ok = rt.ReadMem(1, 0, 1, mem);
+  const bool delivered = read_ok && !mem.empty() && mem[0] == 1234;
+  bool no_faults = true;
+  for (uint32_t i = 0; i < N; ++i)
+    no_faults &= rt.Status(i) == wvm::kHalted;
+  char buf[96];
+  std::snprintf(buf, sizeof(buf), "vm1 mem[0]=%u", read_ok && !mem.empty() ? mem[0] : 0);
+  std::printf("  %-22s %s (%s)\n", "vm_send_recv",
+              (delivered && no_faults) ? "PASS" : "FAIL", buf);
+  ok &= delivered && no_faults;
+
+  rt.ShutdownAll();
+  const cudaError_t e = rt.Sync();
+  ok &= e == cudaSuccess;
+
+  std::printf(ok ? "slice7: PASS\n" : "slice7: FAIL\n");
+  return ok ? 0 : 1;
+}
+
+// v0.1 capstone: boot 64+ resident VMs that each do a 32-lane computation,
+// exchange a message around a ring, and keep running so they stay
+// inspectable. Verifies the whole milestone, then inspects one VM live.
+int CmdDemo(const char* path, uint32_t n_vms) {
+  wvm::WvmFile file;
+  std::string err;
+  if (!wvm::LoadWvm(path, file, err)) {
+    std::fprintf(stderr, "error: %s: %s\n", path, err.c_str());
+    return 2;
+  }
+  if (n_vms < 2 || n_vms > wvm::kMaxVms) {
+    std::fprintf(stderr, "error: --vms must be 2..%u\n", wvm::kMaxVms);
+    return 2;
+  }
+  std::vector<wvm::VmImage> images(n_vms);
+  for (uint32_t i = 0; i < n_vms; ++i) {
+    images[i].code = file.code;
+    images[i].literals = file.literals;
+    images[i].mem_size_words = 64;
+  }
+  wvm::PersistentRuntime rt;
+  if (!rt.Init(images, err) || !rt.Launch(err)) {
+    std::fprintf(stderr, "error: %s\n", err.c_str());
+    return 1;
+  }
+  rt.BootAll();
+  std::printf("demo: %u resident VMs from %s\n", n_vms, path);
+
+  // Wait until every VM has received its ring message and stored mem[0].
+  // Each stored aggregate is >= 496, so 0 means "not yet".
+  bool ready = false;
+  for (int waited = 0; waited < 10000; waited += 5) {
+    ready = true;
+    for (uint32_t i = 0; i < n_vms; ++i) {
+      std::vector<uint32_t> m;
+      if (!rt.ReadMem(i, 0, 1, m) || m.empty() || m[0] == 0) {
+        ready = false;
+        break;
+      }
+    }
+    if (ready) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  if (!ready) {
+    std::printf("demo: FAIL (VMs did not complete the ring exchange)\n");
+    rt.ShutdownAll();
+    rt.Sync();
+    return 1;
+  }
+
+  // Verify the ring: VM i holds the aggregate of VM (i-1) mod n, where
+  // aggregate(vm) = 32*vm + 496 (the demo's 32-lane reduction).
+  uint32_t bad = 0;
+  uint32_t running = 0;
+  for (uint32_t i = 0; i < n_vms; ++i) {
+    std::vector<uint32_t> m;
+    rt.ReadMem(i, 0, 1, m);
+    const uint32_t prev = (i + n_vms - 1) % n_vms;
+    const uint32_t expect = 32u * prev + 496u;
+    if (m.empty() || m[0] != expect) ++bad;
+    if (rt.Status(i) == wvm::kRunning) ++running;
+  }
+  std::printf("demo: ring exchange   %s (%u/%u correct)\n",
+              bad == 0 ? "PASS" : "FAIL", n_vms - bad, n_vms);
+  std::printf("demo: still RUNNING   %s (%u/%u)\n",
+              running == n_vms ? "PASS" : "FAIL", running, n_vms);
+  bool ok = bad == 0 && running == n_vms;
+
+  // Live inspection: pick a VM mid-run and watch its instruction counter
+  // advance (the control-plane counter updates at control points even while
+  // the VM keeps running).
+  const uint32_t probe = n_vms > 37 ? 37 : 0;
+  const uint64_t i_first = rt.Instrs(probe);
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  const uint64_t i_second = rt.Instrs(probe);
+  std::printf("demo: vm %u live       status=%s instrs %llu -> %llu (%s)\n",
+              probe, wvm::StatusName(rt.Status(probe)),
+              (unsigned long long)i_first, (unsigned long long)i_second,
+              i_second > i_first ? "ticking" : "static");
+  ok &= i_second > i_first && rt.Status(probe) == wvm::kRunning;
+
+  rt.ShutdownAll();
+  const cudaError_t e = rt.Sync();
+  std::printf("demo: shutdown        %s\n",
+              e == cudaSuccess ? "ok" : cudaGetErrorString(e));
+  std::printf(ok && e == cudaSuccess ? "demo: PASS\n" : "demo: FAIL\n");
+  return ok && e == cudaSuccess ? 0 : 1;
+}
+
 void Usage(const char* argv0) {
   std::printf("usage: %s <command>\n", argv0);
   std::printf("  run <file.wvm>  run a .wvm program to completion on one warp\n");
@@ -884,7 +1053,9 @@ void Usage(const char* argv0) {
   std::printf("                  boot N resident VMs, print `list` for S seconds\n");
   std::printf("  attach <file.wvm> [--vms N]\n");
   std::printf("                  boot N resident VMs, interactive console on stdin\n");
-  std::printf("  slice1..slice5  self-test suites\n");
+  std::printf("  demo <file.wvm> [--vms N]\n");
+  std::printf("                  v0.1 capstone: N VMs compute + ring-message + stay live\n");
+  std::printf("  slice1..slice5,slice7  self-test suites\n");
 }
 
 }  // namespace
@@ -907,6 +1078,7 @@ int main(int argc, char** argv) {
   if (std::strcmp(cmd, "slice3") == 0) return RunSlice3();
   if (std::strcmp(cmd, "slice4") == 0) return RunSlice4();
   if (std::strcmp(cmd, "slice5") == 0) return RunSlice5();
+  if (std::strcmp(cmd, "slice7") == 0) return RunSlice7();
   if (std::strcmp(cmd, "run") == 0) {
     if (argc < 3) {
       std::fprintf(stderr, "error: run requires a .wvm file\n");
@@ -944,6 +1116,18 @@ int main(int argc, char** argv) {
         n_vms = static_cast<uint32_t>(std::atoi(argv[++i]));
     }
     return CmdAttach(argv[2], n_vms);
+  }
+  if (std::strcmp(cmd, "demo") == 0) {
+    if (argc < 3) {
+      std::fprintf(stderr, "error: demo requires a .wvm file (demo.wvm)\n");
+      return 2;
+    }
+    uint32_t n_vms = 64;
+    for (int i = 3; i < argc; ++i) {
+      if (std::strcmp(argv[i], "--vms") == 0 && i + 1 < argc)
+        n_vms = static_cast<uint32_t>(std::atoi(argv[++i]));
+    }
+    return CmdDemo(argv[2], n_vms);
   }
   if (std::strcmp(cmd, "help") == 0 || std::strcmp(cmd, "--help") == 0) {
     Usage(argv[0]);

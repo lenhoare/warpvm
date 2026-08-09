@@ -27,6 +27,9 @@ struct VmCtx {
   uint32_t vm_id;
   uint32_t lane;
 
+  Mailbox* mailboxes;   // global mailbox array (nullptr if messaging absent)
+  uint32_t num_vms;     // for validating SEND destinations
+
   uint32_t pc;
   uint32_t vregs[kVectorRegs];  // this lane's slice of each vector register
   uint32_t sregs[kScalarRegs];  // uniform, replicated
@@ -434,6 +437,75 @@ __device__ StopReason VmRun(VmCtx& ctx, Control* ctrl = nullptr,
           LogAppend(ctrl, ctx.vm_id, tag, ctx.vregs[rs1]);
         }
         break;
+
+      // ---- messaging -------------------------------------------------------
+      // SEND rDest, rType, rPayload: lane 0 posts a message to VM rDest[0].
+      case kSend: {
+        uint32_t err = 0;
+        if (active && ctx.lane == 0) {
+          if (ctx.mailboxes == nullptr) {
+            err = 1;
+          } else {
+            const uint32_t dest = ctx.vregs[rd];
+            if (dest >= ctx.num_vms) {
+              err = 1;
+            } else {
+              Mailbox& mb = ctx.mailboxes[dest];
+              const uint32_t h = mb.head;
+              const uint32_t t = mb.tail;
+              if (h - t >= kMailboxSlots) {
+                err = 1;  // mailbox full
+              } else {
+                const uint32_t slot =
+                    atomicAdd(const_cast<uint32_t*>(&mb.head), 1u);
+                Message m;
+                m.header = (ctx.vm_id & 0xFFFFu) |
+                           ((ctx.vregs[rs1] & 0xFFFFu) << 16);
+                m.payload[0] = ctx.vregs[rs2];
+                m.payload[1] = 0;
+                m.payload[2] = 0;
+                mb.slots[slot % kMailboxSlots] = m;
+              }
+            }
+          }
+        }
+        err = __shfl_sync(kFullMask, err, 0);
+        if (err != 0u) VmFault(ctx, kFaultMsg);
+        break;
+      }
+      // TRY_RECV pGot, rPayload, rMeta: lane 0 consumes one pending message.
+      // On success pGot = all lanes, rPayload = payload[0],
+      // rMeta = header (type<<16 | src); else pGot = 0.
+      case kTryRecv: {
+        if (BadPredField(rd)) {
+          VmFault(ctx, kFaultOperand);
+          break;
+        }
+        uint32_t got = 0, payload = 0, meta = 0;
+        if (ctx.lane == 0 && ctx.mailboxes != nullptr) {
+          Mailbox& mb = ctx.mailboxes[ctx.vm_id];
+          const uint32_t h = mb.head;
+          const uint32_t t = mb.tail;
+          if (h != t) {
+            const Message m = mb.slots[t % kMailboxSlots];
+            mb.tail = t + 1;
+            got = 1;
+            payload = m.payload[0];
+            meta = m.header;
+          }
+        }
+        got = __shfl_sync(kFullMask, got, 0);
+        payload = __shfl_sync(kFullMask, payload, 0);
+        meta = __shfl_sync(kFullMask, meta, 0);
+        if (active) {
+          ctx.preds[rd] = got != 0u ? kFullMask : 0u;
+          if (got != 0u) {
+            ctx.vregs[rs1] = payload;
+            ctx.vregs[rs2] = meta;
+          }
+        }
+        break;
+      }
 
       // ---- scalar operations (uniform) --------------------------------------
       case kSMov:

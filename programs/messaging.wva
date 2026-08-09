@@ -1,0 +1,33 @@
+; messaging.wva — VM-to-VM messaging (slice 7).
+;
+; VM 0 sends the value 1234 to VM 1; VM 1 receives it and stores it at
+; mem[0]. Every other VM halts immediately. This is the spec's "one machine
+; sends a value to another" demonstration.
+;
+; Try it:
+;   warpvm-as messaging.wva -o messaging.wvm
+;   warpvm attach messaging.wvm --vms 2
+;   vm-0> (wait a moment) then: vm 1 / mem 0 4   -> shows 1234
+
+    VMID r0
+    CMP_EQ p0, r0, #0
+    JMP_IF_ANY p0, sender
+    CMP_EQ p1, r0, #1
+    JMP_IF_ANY p1, receiver
+    HALT                    ; VMs other than 0 and 1
+
+sender:
+    MOV_I r1, 1             ; destination = VM 1
+    MOV_I r2, 7             ; message type
+    MOV_I r3, 1234          ; payload
+    SEND r1, r2, r3
+    HALT
+
+receiver:
+recv:
+    TRY_RECV p2, r4, r5     ; r4 = payload, r5 = (type<<16)|src
+    NOTMASK p3, p2          ; p3 = no message yet?
+    JMP_IF_ANY p3, recv     ; keep polling until one arrives
+    MOV_I r6, 0
+    STORE r6, r4            ; mem[0] = received payload (1234)
+    HALT

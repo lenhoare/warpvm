@@ -88,4 +88,23 @@ vm-0> quit
 | 4 | warp-native ops, control flow, stride-32 loops | done |
 | 5 | persistent kernel control plane, `serve` + live `list`, log | done |
 | 6 | `warpvm attach`, live inspection, single-step | done |
-| 7 | messaging | — |
+| 7 | messaging (`SEND`/`TRY_RECV`, mailboxes) | done |
+| ★ | **v0.1 demo**: 64 resident VMs compute + ring-message + stay live | done |
+
+## v0.1 milestone
+
+The capstone boots 64 resident machines that each run a 32-lane computation
+(`LANEID` + `REDUCE_ADD`), send the result to the next machine in a ring,
+receive their neighbour's, and keep running so they remain inspectable:
+
+```sh
+build/tools-rust/release/warpvm-as programs/demo.wva -o demo.wvm
+build/runtime/warpvm demo demo.wvm --vms 64
+#   demo: ring exchange   PASS (64/64 correct)
+#   demo: still RUNNING   PASS (64/64)
+#   demo: vm 37 live       status=RUNNING instrs 0 -> 1025 (ticking)
+#   demo: PASS
+```
+
+To poke at a live machine by hand: `warpvm attach demo.wvm --vms 64`, then
+`vm 37`, `regs`, `mem 0 8`, `disasm`, `step`, `resume`.

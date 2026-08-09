@@ -211,16 +211,32 @@ may drop entries when full.
 
 ### 4.7 Messaging
 
-Reserved opcode range `0x60–0x6F`. Concrete encodings are defined in
-slice 7; planned: `SEND`, `TRY_RECV`, `RECV`, `BROADCAST_MSG`.
-
-Message record (fixed size, 16 bytes):
+Message record (fixed size, 16 bytes). `payload[1..2]` are reserved (zero) in
+v0.1; `SEND` transmits `payload[0]` only.
 
 ```text
-u16 src_vm
-u16 msg_type
+u32 header      // src_vm in low 16 bits, msg_type in high 16 bits
 u32 payload[3]
 ```
+
+Each VM has an inbound mailbox: a ring of 16 message slots. Producers claim a
+slot by atomically advancing `head`; the owner consumes from `tail`.
+
+| Op | Name | Form | Semantics |
+|---|---|---|---|
+| 0x60 | `SEND`     | R | lane 0 posts `{src=vm_id, type=rs1[0], payload=rs2[0]}` to VM `rd[0]` |
+| 0x61 | `TRY_RECV` | R | lane 0 consumes one pending message |
+
+`SEND rd, rType, rPayload`: destination is `rd[0]`. Faults (`FAULT_MSG`) if
+the destination VM does not exist or its mailbox is full.
+
+`TRY_RECV pGot, rPayload, rMeta`: non-blocking. If a message is pending,
+`pGot` = all lanes, `rPayload` = `payload[0]`, `rMeta` = header
+(`msg_type<<16 | src_vm`); otherwise `pGot` = 0 and the registers are
+unchanged. Poll with `NOTMASK` + `JMP_IF_ANY` to wait for a message.
+
+`RECV` (blocking) and `BROADCAST_MSG` remain reserved (`0x62–0x6F`) for a
+later slice.
 
 ### 4.8 Control flow
 

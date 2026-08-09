@@ -181,6 +181,14 @@ fn render(d: &Decoded, literals: &[u32]) -> Option<String> {
         isa::OP_LOG => format!("LOG {}, {}", vreg(d.rs1), vreg(d.rs2())),
         isa::OP_LOG_I => format!("LOG_I {}, #{}", vreg(d.rs1), d.imm()),
 
+        isa::OP_SEND => format!("SEND {}, {}, {}", vreg(d.rd), vreg(d.rs1), vreg(d.rs2())),
+        isa::OP_TRY_RECV => {
+            if !pred_ok(d.rd) {
+                return None;
+            }
+            format!("TRY_RECV {}, {}, {}", pred(d.rd), vreg(d.rs1), vreg(d.rs2()))
+        }
+
         isa::OP_S_MOV => {
             if !sreg_ok(d.rd) || !sreg_ok(d.rs1) {
                 return None;
