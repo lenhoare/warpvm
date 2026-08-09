@@ -7,7 +7,9 @@
 // every lane; they stay in sync by construction.
 //
 // Guarded instructions never branch per lane — inactive lanes keep their
-// old rd value and perform no memory/message side effects.
+// old destination value and perform no memory/message side effects.
+// Warp-collective operations (ballot/shuffle/reduce) are computed on all
+// lanes regardless of the guard; only the write is masked.
 #pragma once
 
 #include "warpvm.cuh"
@@ -28,6 +30,9 @@ struct VmCtx {
   uint32_t vregs[kVectorRegs];  // this lane's slice of each vector register
   uint32_t sregs[kScalarRegs];  // uniform, replicated
   uint32_t preds[kPredRegs];    // uniform lane masks, replicated
+  uint32_t call_stack[kCallDepth];
+  uint32_t call_depth;
+  uint32_t rng_state;
   uint64_t instr_count;
   uint32_t fault;
 };
@@ -42,10 +47,70 @@ __device__ inline bool GuardActive(const VmCtx& ctx, uint32_t guard) {
   return inv ? !bit : bit;
 }
 
+// Warp-uniform mask selected by a guard field (used by JMP_IF_*).
+__device__ inline uint32_t GuardMask(const VmCtx& ctx, uint32_t guard) {
+  if (guard == 0 || guard > 8u) return 0u;
+  const uint32_t m = ctx.preds[(guard - 1) & 3u];
+  return guard >= 5u ? ~m : m;
+}
+
 __device__ inline int32_t SignExt13(uint32_t lo) {
   return (lo & 0x1000u) != 0u ? static_cast<int32_t>(lo | 0xFFFFE000u)
                                : static_cast<int32_t>(lo);
 }
+
+__device__ inline uint32_t Xorshift32(uint32_t s) {
+  s ^= s << 13;
+  s ^= s >> 17;
+  s ^= s << 5;
+  return s;
+}
+
+__device__ inline uint32_t WarpReduceAdd(uint32_t v) {
+#pragma unroll
+  for (int off = kLanes / 2; off > 0; off >>= 1)
+    v += __shfl_xor_sync(kFullMask, v, off);
+  return v;
+}
+__device__ inline uint32_t WarpReduceMin(uint32_t v) {
+#pragma unroll
+  for (int off = kLanes / 2; off > 0; off >>= 1) {
+    const uint32_t o = __shfl_xor_sync(kFullMask, v, off);
+    v = o < v ? o : v;
+  }
+  return v;
+}
+__device__ inline uint32_t WarpReduceMax(uint32_t v) {
+#pragma unroll
+  for (int off = kLanes / 2; off > 0; off >>= 1) {
+    const uint32_t o = __shfl_xor_sync(kFullMask, v, off);
+    v = o > v ? o : v;
+  }
+  return v;
+}
+__device__ inline uint32_t WarpReduceAnd(uint32_t v) {
+#pragma unroll
+  for (int off = kLanes / 2; off > 0; off >>= 1)
+    v &= __shfl_xor_sync(kFullMask, v, off);
+  return v;
+}
+__device__ inline uint32_t WarpReduceOr(uint32_t v) {
+#pragma unroll
+  for (int off = kLanes / 2; off > 0; off >>= 1)
+    v |= __shfl_xor_sync(kFullMask, v, off);
+  return v;
+}
+__device__ inline uint32_t WarpReduceXor(uint32_t v) {
+#pragma unroll
+  for (int off = kLanes / 2; off > 0; off >>= 1)
+    v ^= __shfl_xor_sync(kFullMask, v, off);
+  return v;
+}
+
+// Scalar-register field check (s0-s7 live in 3 bits of a 4-bit field).
+__device__ inline bool BadScalarField(uint32_t f) { return (f & 8u) != 0u; }
+// Predicate field check (p0-p3 in 2 bits).
+__device__ inline bool BadPredField(uint32_t f) { return f >= kPredRegs; }
 
 __device__ void VmRun(VmCtx& ctx) {
   while (ctx.fault == kFaultOk) {
@@ -61,38 +126,261 @@ __device__ void VmRun(VmCtx& ctx) {
     const uint32_t rs1 = (instr >> kRs1Shift) & kRegFieldMask;
     const uint32_t lo = instr & kLoMask;
     const uint32_t rs2 = lo & 0xFu;
+    if (guard > 8u) {
+      VmFault(ctx, kFaultOperand);
+    }
     const bool active = GuardActive(ctx, guard);
+    const uint32_t imm = static_cast<uint32_t>(SignExt13(lo));
 
     bool stop = false;
+    bool jumped = false;
+
     switch (op) {
       case kNop:
         break;
 
+      // ---- vector arithmetic / bitwise (lane-wise) ----------------------
       case kMov:
         if (active) ctx.vregs[rd] = ctx.vregs[rs1];
         break;
       case kAdd:
         if (active) ctx.vregs[rd] = ctx.vregs[rs1] + ctx.vregs[rs2];
         break;
-      case kMovI:
-        if (active) ctx.vregs[rd] = static_cast<uint32_t>(SignExt13(lo));
+      case kSub:
+        if (active) ctx.vregs[rd] = ctx.vregs[rs1] - ctx.vregs[rs2];
         break;
-      case kAddI:
-        if (active)
-          ctx.vregs[rd] =
-              ctx.vregs[rs1] + static_cast<uint32_t>(SignExt13(lo));
+      case kMul:
+        if (active) ctx.vregs[rd] = ctx.vregs[rs1] * ctx.vregs[rs2];
         break;
-
-      case kLdw:
+      case kDiv:
+        // Division by zero yields 0 (GP-friendliness, isa.md §11).
         if (active) {
-          if (lo >= ctx.literals_len) {
-            VmFault(ctx, kFaultOperand);
-            break;
-          }
-          ctx.vregs[rd] = ctx.literals[lo];
+          const uint32_t b = ctx.vregs[rs2];
+          ctx.vregs[rd] = b != 0u ? ctx.vregs[rs1] / b : 0u;
         }
         break;
+      case kMod:
+        if (active) {
+          const uint32_t b = ctx.vregs[rs2];
+          ctx.vregs[rd] = b != 0u ? ctx.vregs[rs1] % b : 0u;
+        }
+        break;
+      case kMin:
+        if (active)
+          ctx.vregs[rd] =
+              ctx.vregs[rs1] < ctx.vregs[rs2] ? ctx.vregs[rs1] : ctx.vregs[rs2];
+        break;
+      case kMax:
+        if (active)
+          ctx.vregs[rd] =
+              ctx.vregs[rs1] > ctx.vregs[rs2] ? ctx.vregs[rs1] : ctx.vregs[rs2];
+        break;
+      case kAnd:
+        if (active) ctx.vregs[rd] = ctx.vregs[rs1] & ctx.vregs[rs2];
+        break;
+      case kOr:
+        if (active) ctx.vregs[rd] = ctx.vregs[rs1] | ctx.vregs[rs2];
+        break;
+      case kXor:
+        if (active) ctx.vregs[rd] = ctx.vregs[rs1] ^ ctx.vregs[rs2];
+        break;
+      case kShl:
+        if (active) ctx.vregs[rd] = ctx.vregs[rs1] << (ctx.vregs[rs2] & 31u);
+        break;
+      case kShr:
+        if (active) ctx.vregs[rd] = ctx.vregs[rs1] >> (ctx.vregs[rs2] & 31u);
+        break;
 
+      case kMovI:
+        if (active) ctx.vregs[rd] = imm;
+        break;
+      case kAddI:
+        if (active) ctx.vregs[rd] = ctx.vregs[rs1] + imm;
+        break;
+      case kSubI:
+        if (active) ctx.vregs[rd] = ctx.vregs[rs1] - imm;
+        break;
+      case kMulI:
+        if (active) ctx.vregs[rd] = ctx.vregs[rs1] * imm;
+        break;
+      case kAndI:
+        if (active) ctx.vregs[rd] = ctx.vregs[rs1] & imm;
+        break;
+      case kOrI:
+        if (active) ctx.vregs[rd] = ctx.vregs[rs1] | imm;
+        break;
+      case kXorI:
+        if (active) ctx.vregs[rd] = ctx.vregs[rs1] ^ imm;
+        break;
+      case kShlI:
+        if (active) ctx.vregs[rd] = ctx.vregs[rs1] << (lo & 31u);
+        break;
+      case kShrI:
+        if (active) ctx.vregs[rd] = ctx.vregs[rs1] >> (lo & 31u);
+        break;
+
+      case kAbs:
+        if (active) {
+          const uint32_t v = ctx.vregs[rs1];
+          ctx.vregs[rd] = static_cast<int32_t>(v) < 0 ? 0u - v : v;
+        }
+        break;
+      case kNeg:
+        if (active) ctx.vregs[rd] = 0u - ctx.vregs[rs1];
+        break;
+      case kNot:
+        if (active) ctx.vregs[rd] = ~ctx.vregs[rs1];
+        break;
+
+      // ---- comparisons (write predicate masks) ---------------------------
+      case kCmpEq:
+      case kCmpNe:
+      case kCmpLt:
+      case kCmpLe:
+      case kCmpGt:
+      case kCmpGe:
+      case kCmpEqI:
+      case kCmpNeI:
+      case kCmpLtI:
+      case kCmpLeI:
+      case kCmpGtI:
+      case kCmpGeI: {
+        if (BadPredField(rd)) {
+          VmFault(ctx, kFaultOperand);
+          break;
+        }
+        const uint32_t a = ctx.vregs[rs1];
+        const uint32_t b = (op >= kCmpEqI) ? imm : ctx.vregs[rs2];
+        bool cond;
+        switch (op) {
+          case kCmpEq: case kCmpEqI: cond = a == b; break;
+          case kCmpNe: case kCmpNeI: cond = a != b; break;
+          case kCmpLt: case kCmpLtI: cond = a < b; break;
+          case kCmpLe: case kCmpLeI: cond = a <= b; break;
+          case kCmpGt: case kCmpGtI: cond = a > b; break;
+          default:                   cond = a >= b; break;
+        }
+        const uint32_t mask = __ballot_sync(kFullMask, cond);
+        if (active) ctx.preds[rd] = mask;
+        break;
+      }
+
+      // ---- predicate-mask operations --------------------------------------
+      case kNotMask:
+        if (BadPredField(rd) || BadPredField(rs1)) {
+          VmFault(ctx, kFaultOperand);
+          break;
+        }
+        if (active) ctx.preds[rd] = ~ctx.preds[rs1];
+        break;
+      case kAndMask:
+        if (BadPredField(rd) || BadPredField(rs1) || BadPredField(rs2)) {
+          VmFault(ctx, kFaultOperand);
+          break;
+        }
+        if (active) ctx.preds[rd] = ctx.preds[rs1] & ctx.preds[rs2];
+        break;
+      case kOrMask:
+        if (BadPredField(rd) || BadPredField(rs1) || BadPredField(rs2)) {
+          VmFault(ctx, kFaultOperand);
+          break;
+        }
+        if (active) ctx.preds[rd] = ctx.preds[rs1] | ctx.preds[rs2];
+        break;
+      case kBallot: {
+        if (BadPredField(rd)) {
+          VmFault(ctx, kFaultOperand);
+          break;
+        }
+        const uint32_t mask = __ballot_sync(kFullMask, ctx.vregs[rs1] != 0u);
+        if (active) ctx.preds[rd] = mask;
+        break;
+      }
+      case kAny:
+        if (BadPredField(rd) || BadPredField(rs1)) {
+          VmFault(ctx, kFaultOperand);
+          break;
+        }
+        if (active) ctx.preds[rd] = ctx.preds[rs1] != 0u ? kFullMask : 0u;
+        break;
+      case kAll:
+        if (BadPredField(rd) || BadPredField(rs1)) {
+          VmFault(ctx, kFaultOperand);
+          break;
+        }
+        if (active)
+          ctx.preds[rd] = ctx.preds[rs1] == kFullMask ? kFullMask : 0u;
+        break;
+
+      // ---- lane / warp operations -----------------------------------------
+      case kLaneId:
+        if (active) ctx.vregs[rd] = ctx.lane;
+        break;
+      case kBroadcast: {
+        const uint32_t v = __shfl_sync(kFullMask, ctx.vregs[rs1], lo & 31u);
+        if (active) ctx.vregs[rd] = v;
+        break;
+      }
+      case kShuffle: {
+        const uint32_t v =
+            __shfl_sync(kFullMask, ctx.vregs[rs1], ctx.vregs[rs2] & 31u);
+        if (active) ctx.vregs[rd] = v;
+        break;
+      }
+      case kShuffleXor: {
+        const uint32_t v =
+            __shfl_xor_sync(kFullMask, ctx.vregs[rs1], lo & 31u);
+        if (active) ctx.vregs[rd] = v;
+        break;
+      }
+      case kReduceAdd: {
+        const uint32_t v = WarpReduceAdd(ctx.vregs[rs1]);
+        if (active) ctx.vregs[rd] = v;
+        break;
+      }
+      case kReduceMin: {
+        const uint32_t v = WarpReduceMin(ctx.vregs[rs1]);
+        if (active) ctx.vregs[rd] = v;
+        break;
+      }
+      case kReduceMax: {
+        const uint32_t v = WarpReduceMax(ctx.vregs[rs1]);
+        if (active) ctx.vregs[rd] = v;
+        break;
+      }
+      case kReduceAnd: {
+        const uint32_t v = WarpReduceAnd(ctx.vregs[rs1]);
+        if (active) ctx.vregs[rd] = v;
+        break;
+      }
+      case kReduceOr: {
+        const uint32_t v = WarpReduceOr(ctx.vregs[rs1]);
+        if (active) ctx.vregs[rd] = v;
+        break;
+      }
+      case kReduceXor: {
+        const uint32_t v = WarpReduceXor(ctx.vregs[rs1]);
+        if (active) ctx.vregs[rd] = v;
+        break;
+      }
+      case kVmid:
+        if (active) ctx.vregs[rd] = ctx.vm_id;
+        break;
+      case kClock: {
+        const uint32_t t = static_cast<uint32_t>(clock64());
+        if (active) ctx.vregs[rd] = t;
+        break;
+      }
+      case kRand: {
+        // Uniform state advance; per-lane decorrelation.
+        ctx.rng_state = Xorshift32(ctx.rng_state);
+        uint32_t v = ctx.rng_state ^ (ctx.lane * 0x9E3779B9u);
+        v = Xorshift32(v | 1u);
+        if (active) ctx.vregs[rd] = v;
+        break;
+      }
+
+      // ---- memory -----------------------------------------------------------
       case kLoad:
         // Per-lane addresses: each lane bounds-checks and loads its own.
         // If any lane faults, the whole VM faults (resolved below); writes
@@ -118,9 +406,151 @@ __device__ void VmRun(VmCtx& ctx) {
         }
         break;
 
+      case kLdw:
+        if (active) {
+          if (lo >= ctx.literals_len) {
+            VmFault(ctx, kFaultOperand);
+            break;
+          }
+          ctx.vregs[rd] = ctx.literals[lo];
+        }
+        break;
+
+      // ---- scalar operations (uniform) --------------------------------------
+      case kSMov:
+        if (BadScalarField(rd) || BadScalarField(rs1)) {
+          VmFault(ctx, kFaultOperand);
+          break;
+        }
+        if (active) ctx.sregs[rd] = ctx.sregs[rs1];
+        break;
+      case kSMovI:
+        if (BadScalarField(rd)) {
+          VmFault(ctx, kFaultOperand);
+          break;
+        }
+        if (active) ctx.sregs[rd] = imm;
+        break;
+      case kSAdd:
+        if (BadScalarField(rd) || BadScalarField(rs1) || BadScalarField(rs2)) {
+          VmFault(ctx, kFaultOperand);
+          break;
+        }
+        if (active) ctx.sregs[rd] = ctx.sregs[rs1] + ctx.sregs[rs2];
+        break;
+      case kSAddI:
+        if (BadScalarField(rd) || BadScalarField(rs1)) {
+          VmFault(ctx, kFaultOperand);
+          break;
+        }
+        if (active) ctx.sregs[rd] = ctx.sregs[rs1] + imm;
+        break;
+      case kSLdw:
+        if (BadScalarField(rd)) {
+          VmFault(ctx, kFaultOperand);
+          break;
+        }
+        if (active) {
+          if (lo >= ctx.literals_len) {
+            VmFault(ctx, kFaultOperand);
+            break;
+          }
+          ctx.sregs[rd] = ctx.literals[lo];
+        }
+        break;
+      case kSCmpLt:
+        if (BadPredField(rd) || BadScalarField(rs1) || BadScalarField(rs2)) {
+          VmFault(ctx, kFaultOperand);
+          break;
+        }
+        if (active)
+          ctx.preds[rd] = ctx.sregs[rs1] < ctx.sregs[rs2] ? kFullMask : 0u;
+        break;
+      case kSCmpLtI:
+        if (BadPredField(rd) || BadScalarField(rs1)) {
+          VmFault(ctx, kFaultOperand);
+          break;
+        }
+        if (active) ctx.preds[rd] = ctx.sregs[rs1] < imm ? kFullMask : 0u;
+        break;
+      case kSBcast:
+        if (BadScalarField(rs1)) {
+          VmFault(ctx, kFaultOperand);
+          break;
+        }
+        if (active) ctx.vregs[rd] = ctx.sregs[rs1];
+        break;
+      case kSGet: {
+        if (BadScalarField(rd)) {
+          VmFault(ctx, kFaultOperand);
+          break;
+        }
+        const uint32_t v = __shfl_sync(kFullMask, ctx.vregs[rs1], 0);
+        if (active) ctx.sregs[rd] = v;
+        break;
+      }
+
+      // ---- control flow -------------------------------------------------------
+      case kJmp:
+        if (lo >= ctx.code_len) {
+          VmFault(ctx, kFaultJump);
+          break;
+        }
+        ctx.pc = lo;
+        jumped = true;
+        break;
+      case kJmpIfAny: {
+        const uint32_t m = GuardMask(ctx, guard);
+        if (m != 0u) {
+          if (lo >= ctx.code_len) {
+            VmFault(ctx, kFaultJump);
+            break;
+          }
+          ctx.pc = lo;
+          jumped = true;
+        }
+        break;
+      }
+      case kJmpIfAll: {
+        const uint32_t m = GuardMask(ctx, guard);
+        if (m == kFullMask) {
+          if (lo >= ctx.code_len) {
+            VmFault(ctx, kFaultJump);
+            break;
+          }
+          ctx.pc = lo;
+          jumped = true;
+        }
+        break;
+      }
+      case kCall:
+        if (lo >= ctx.code_len) {
+          VmFault(ctx, kFaultJump);
+          break;
+        }
+        if (ctx.call_depth >= kCallDepth) {
+          VmFault(ctx, kFaultStack);
+          break;
+        }
+        ctx.call_stack[ctx.call_depth++] = ctx.pc + 1;
+        ctx.pc = lo;
+        jumped = true;
+        break;
+      case kRet:
+        if (ctx.call_depth == 0u) {
+          VmFault(ctx, kFaultStack);
+          break;
+        }
+        ctx.pc = ctx.call_stack[--ctx.call_depth];
+        jumped = true;
+        break;
       case kHalt:
         stop = true;
         break;
+      case kYield:
+        break;  // cooperation point; meaningful once the kernel is persistent
+      case kStepTrap:
+        break;  // debugger hook; NOP unless debug-active
 
       default:
         VmFault(ctx, kFaultOpcode);
@@ -138,7 +568,7 @@ __device__ void VmRun(VmCtx& ctx) {
     }
     ++ctx.instr_count;
     if (stop) break;
-    ++ctx.pc;
+    if (!jumped) ++ctx.pc;
   }
 }
 

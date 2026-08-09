@@ -19,6 +19,10 @@ __device__ static void SpillState(const VmCtx& ctx, VmState* state) {
     state->instruction_counter = ctx.instr_count;
     for (int r = 0; r < kScalarRegs; ++r) state->sregs[r] = ctx.sregs[r];
     for (int r = 0; r < kPredRegs; ++r) state->preds[r] = ctx.preds[r];
+    for (int r = 0; r < kCallDepth; ++r)
+      state->call_stack[r] = ctx.call_stack[r];
+    state->call_depth = ctx.call_depth;
+    state->rng_state = ctx.rng_state;
   }
 }
 
@@ -39,6 +43,8 @@ __global__ void VmArrayKernel(const VmDesc* descs, VmState* states) {
   ctx.mem_size_words = d.mem_size_words;
   ctx.vm_id = vm_id;
   ctx.lane = global & (kLanes - 1);
+  // Deterministic per-VM rng seed; a later slice may let the host set it.
+  ctx.rng_state = vm_id * 0x9E3779B9u + 0x1234567u;
 
   VmRun(ctx);
   SpillState(ctx, &states[vm_id]);

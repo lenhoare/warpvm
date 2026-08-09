@@ -53,7 +53,7 @@ build/runtime/warpvm run hello.wvm
 | 1 | one warp, lane-wise arithmetic + reduction to host | done |
 | 2 | interpreter (MOV/ADD/HALT), Rust assembler/disassembler | done |
 | 3 | many VMs, stable IDs, private RAM | done |
-| 4 | warp-native ops, stride-32 loops | — |
+| 4 | warp-native ops, control flow, stride-32 loops | done |
 | 5 | persistent kernel control plane, `warpvm list` | — |
 | 6 | `warpvm attach`, live inspection | — |
 | 7 | messaging | — |

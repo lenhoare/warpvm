@@ -395,12 +395,152 @@ int RunSlice3() {
   return ok ? 0 : 1;
 }
 
+int RunSlice4() {
+  using wvm::enc_i;
+  using wvm::enc_r;
+  bool ok = true;
+  wvm::VmState st{};
+
+  // Reductions over lane ids: sum 0..31 = 496, max = 31, xor = 0.
+  {
+    const std::vector<uint32_t> prog = {
+        enc_r(wvm::kLaneId, 0, 0, 0, 0),      // LANEID r0
+        enc_r(wvm::kReduceAdd, 0, 1, 0, 0),   // REDUCE_ADD r1, r0
+        enc_r(wvm::kReduceMax, 0, 2, 0, 0),   // REDUCE_MAX r2, r0
+        enc_r(wvm::kReduceXor, 0, 3, 0, 0),   // REDUCE_XOR r3, r0
+        enc_r(wvm::kHalt, 0, 0, 0, 0),
+    };
+    ExecProgram(prog, {}, st);
+    const bool pass = st.status == wvm::kHalted &&
+                      st.vregs[1 * wvm::kLanes] == 496 &&
+                      st.vregs[2 * wvm::kLanes] == 31 &&
+                      st.vregs[3 * wvm::kLanes] == 0;
+    std::printf("  %-22s %s (sum=%u max=%u xor=%u)\n", "reductions",
+                pass ? "PASS" : "FAIL", st.vregs[1 * wvm::kLanes],
+                st.vregs[2 * wvm::kLanes], st.vregs[3 * wvm::kLanes]);
+    ok &= pass;
+  }
+
+  // Broadcast / shuffle: pull specific lanes.
+  {
+    const std::vector<uint32_t> prog = {
+        enc_r(wvm::kLaneId, 0, 0, 0, 0),      // LANEID r0
+        enc_i(wvm::kBroadcast, 0, 1, 0, 5),   // BROADCAST r1, r0, #5 -> 5
+        enc_i(wvm::kMovI, 0, 2, 0, 3),        // MOV_I r2, 3
+        enc_r(wvm::kShuffle, 0, 3, 0, 2),     // SHUFFLE r3, r0, r2 -> 3
+        enc_i(wvm::kShuffleXor, 0, 4, 0, 1),  // SHUFFLE_XOR r4, r0, #1
+        enc_r(wvm::kHalt, 0, 0, 0, 0),
+    };
+    ExecProgram(prog, {}, st);
+    const bool pass = st.status == wvm::kHalted &&
+                      st.vregs[1 * wvm::kLanes] == 5 &&
+                      st.vregs[3 * wvm::kLanes] == 3 &&
+                      st.vregs[4 * wvm::kLanes + 0] == 1 &&  // lane0 ^ 1 = 1
+                      st.vregs[4 * wvm::kLanes + 1] == 0;    // lane1 ^ 1 = 0
+    std::printf("  %-22s %s (bcast=%u shuf=%u xor[0]=%u xor[1]=%u)\n",
+                "broadcast_shuffle", pass ? "PASS" : "FAIL",
+                st.vregs[1 * wvm::kLanes], st.vregs[3 * wvm::kLanes],
+                st.vregs[4 * wvm::kLanes + 0], st.vregs[4 * wvm::kLanes + 1]);
+    ok &= pass;
+  }
+
+  // Compare -> predicate mask -> guarded execution; ballot reads it back.
+  {
+    const std::vector<uint32_t> prog = {
+        enc_r(wvm::kLaneId, 0, 0, 0, 0),       // LANEID r0
+        enc_i(wvm::kCmpLtI, 0, 0, 0, 16),      // CMP_LT p0, r0, #16 (lanes 0-15)
+        enc_i(wvm::kMovI, 0, 1, 0, 7),         // MOV_I r1, 7
+        enc_i(wvm::kAddI, 1, 1, 1, 1),         // @p0 ADD_I r1, r1, 1
+        enc_r(wvm::kBallot, 0, 1, 1, 0),       // BALLOT p1, r1 (all nonzero)
+        enc_r(wvm::kHalt, 0, 0, 0, 0),
+    };
+    ExecProgram(prog, {}, st);
+    const bool pass = st.status == wvm::kHalted &&
+                      st.preds[0] == 0x0000FFFFu &&
+                      st.preds[1] == 0xFFFFFFFFu &&
+                      st.vregs[1 * wvm::kLanes + 0] == 8 &&   // active lane -> 8
+                      st.vregs[1 * wvm::kLanes + 15] == 8 &&
+                      st.vregs[1 * wvm::kLanes + 16] == 7 &&  // inactive -> stays 7
+                      st.vregs[1 * wvm::kLanes + 31] == 7;
+    std::printf("  %-22s %s (p0=%08x p1=%08x r1[0]=%u r1[31]=%u)\n",
+                "cmp_mask_guard", pass ? "PASS" : "FAIL", st.preds[0],
+                st.preds[1], st.vregs[1 * wvm::kLanes + 0],
+                st.vregs[1 * wvm::kLanes + 31]);
+    ok &= pass;
+  }
+
+  // Scalar loop counter driven by JMP_IF_ANY.
+  {
+    const std::vector<uint32_t> prog = {
+        enc_i(wvm::kSMovI, 0, 0, 0, 0),        // S_MOV_I s0, 0
+        enc_i(wvm::kSAddI, 0, 0, 0, 1),        // loop: S_ADD_I s0, s0, 1
+        enc_i(wvm::kSCmpLtI, 0, 0, 0, 5),      // S_CMP_LT_I p0, s0, 5
+        enc_i(wvm::kJmpIfAny, 1, 0, 0, 1),     // JMP_IF_ANY p0, loop(=1)
+        enc_r(wvm::kHalt, 0, 0, 0, 0),
+    };
+    ExecProgram(prog, {}, st);
+    const bool pass = st.status == wvm::kHalted && st.sregs[0] == 5 &&
+                      st.instruction_counter == 17;
+    std::printf("  %-22s %s (s0=%u instrs=%llu)\n", "scalar_loop",
+                pass ? "PASS" : "FAIL", st.sregs[0],
+                (unsigned long long)st.instruction_counter);
+    ok &= pass;
+  }
+
+  // CALL / RET round trip.
+  {
+    const std::vector<uint32_t> prog = {
+        enc_i(wvm::kMovI, 0, 0, 0, 10),        // 0: MOV_I r0, 10
+        enc_i(wvm::kCall, 0, 0, 0, 4),         // 1: CALL sub(=4)
+        enc_i(wvm::kAddI, 0, 0, 0, 1),         // 2: ADD_I r0, r0, 1
+        enc_r(wvm::kHalt, 0, 0, 0, 0),         // 3: HALT
+        enc_i(wvm::kMulI, 0, 0, 0, 2),         // 4: sub: MUL_I r0, r0, 2
+        enc_r(wvm::kRet, 0, 0, 0, 0),          // 5: RET
+    };
+    ExecProgram(prog, {}, st);
+    const bool pass = st.status == wvm::kHalted &&
+                      st.vregs[0 * wvm::kLanes] == 21 && st.call_depth == 0;
+    std::printf("  %-22s %s (r0=%u depth=%u)\n", "call_ret",
+                pass ? "PASS" : "FAIL", st.vregs[0 * wvm::kLanes],
+                st.call_depth);
+    ok &= pass;
+  }
+
+  // RET on an empty call stack faults.
+  {
+    const std::vector<uint32_t> prog = {enc_r(wvm::kRet, 0, 0, 0, 0),
+                                        enc_r(wvm::kHalt, 0, 0, 0, 0)};
+    ExecProgram(prog, {}, st);
+    ok &= CheckState("ret_empty_stack", st, wvm::kFaulted, wvm::kFaultStack, 0);
+  }
+
+  // Jump target past the end faults.
+  {
+    const std::vector<uint32_t> prog = {enc_i(wvm::kJmp, 0, 0, 0, 100),
+                                        enc_r(wvm::kHalt, 0, 0, 0, 0)};
+    ExecProgram(prog, {}, st);
+    ok &= CheckState("jmp_out_of_range", st, wvm::kFaulted, wvm::kFaultJump, 0);
+  }
+
+  // Comparison into an invalid predicate field faults.
+  {
+    const std::vector<uint32_t> prog = {enc_r(wvm::kCmpLt, 0, 5, 0, 0),
+                                        enc_r(wvm::kHalt, 0, 0, 0, 0)};
+    ExecProgram(prog, {}, st);
+    ok &= CheckState("bad_pred_field", st, wvm::kFaulted, wvm::kFaultOperand, 0);
+  }
+
+  std::printf(ok ? "slice4: PASS\n" : "slice4: FAIL\n");
+  return ok ? 0 : 1;
+}
+
 void Usage(const char* argv0) {
   std::printf("usage: %s <command>\n", argv0);
   std::printf("  run <file.wvm>  run a .wvm program on one warp\n");
   std::printf("  slice1          slice-1 warp arithmetic demo\n");
   std::printf("  slice2          slice-2 interpreter self-tests\n");
   std::printf("  slice3          slice-3 multi-VM independence tests\n");
+  std::printf("  slice4          slice-4 warp-native/control-flow tests\n");
 }
 
 }  // namespace
@@ -421,6 +561,7 @@ int main(int argc, char** argv) {
   if (std::strcmp(cmd, "slice1") == 0) return RunSlice1();
   if (std::strcmp(cmd, "slice2") == 0) return RunSlice2();
   if (std::strcmp(cmd, "slice3") == 0) return RunSlice3();
+  if (std::strcmp(cmd, "slice4") == 0) return RunSlice4();
   if (std::strcmp(cmd, "run") == 0) {
     if (argc < 3) {
       std::fprintf(stderr, "error: run requires a .wvm file\n");

@@ -18,6 +18,9 @@ struct VmState {
   uint32_t vregs[kVectorRegs * kLanes];  // [r * kLanes + lane]
   uint32_t sregs[kScalarRegs];
   uint32_t preds[kPredRegs];
+  uint32_t call_stack[kCallDepth];
+  uint32_t call_depth;
+  uint32_t rng_state;
 };
 
 // Per-VM execution descriptor: everything a warp needs to run one machine.

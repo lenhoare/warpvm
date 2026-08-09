@@ -1,0 +1,41 @@
+; loop32.wva — spec §9.2 stride-32 loop pattern, self-contained.
+;
+; Pass 1 fills VM RAM with indices:  mem[i] = i.
+; Pass 2 squares in place with masked lane-parallel ops:  mem[i] = mem[i]^2.
+; Finally loads mem[10] into r7, which must hold 100.
+;
+; The tail (indices not a multiple of 32) is handled by the p0 mask, proving
+; guarded LOAD/STORE skip inactive lanes.
+
+.const N 100
+
+; ---- pass 1: mem[i] = i ----
+    S_MOV_I s0, 0              ; base
+fill:
+    LANEID  r0
+    S_BCAST r1, s0
+    ADD     r2, r0, r1         ; index = base + lane
+    CMP_LT  p0, r2, N
+    @p0 STORE r2, r2           ; mem[index] = index
+    S_ADD_I s0, s0, 32
+    S_CMP_LT_I p1, s0, N
+    JMP_IF_ANY p1, fill
+
+; ---- pass 2: mem[i] = mem[i]^2 ----
+    S_MOV_I s0, 0
+square:
+    LANEID  r0
+    S_BCAST r1, s0
+    ADD     r2, r0, r1
+    CMP_LT  p0, r2, N
+    @p0 LOAD  r3, r2
+    @p0 MUL   r3, r3, r3
+    @p0 STORE r2, r3
+    S_ADD_I s0, s0, 32
+    S_CMP_LT_I p1, s0, N
+    JMP_IF_ANY p1, square
+
+; ---- verify: r7 = mem[10] = 100 ----
+    MOV_I r4, 10
+    LOAD  r7, r4
+    HALT

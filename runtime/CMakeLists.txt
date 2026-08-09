@@ -29,6 +29,7 @@ add_custom_target(rust_tools ALL
 add_test(NAME slice1_warp_arithmetic COMMAND warpvm slice1)
 add_test(NAME slice2_interpreter COMMAND warpvm slice2)
 add_test(NAME slice3_multi_vm COMMAND warpvm slice3)
+add_test(NAME slice4_warp_control COMMAND warpvm slice4)
 
 add_test(NAME pipeline_hello
   COMMAND bash ${CMAKE_SOURCE_DIR}/tests/pipeline.sh
@@ -45,3 +46,8 @@ add_test(NAME pipeline_memory
           ${WVM_AS} $<TARGET_FILE:warpvm>
           ${CMAKE_SOURCE_DIR}/programs/memory.wva
           "r2  = 100" ${CMAKE_BINARY_DIR}/memory.wvm)
+add_test(NAME pipeline_loop32
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/pipeline.sh
+          ${WVM_AS} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/programs/loop32.wva
+          "r7  = 100" ${CMAKE_BINARY_DIR}/loop32.wvm)
