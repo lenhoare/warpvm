@@ -1,0 +1,17 @@
+; heartbeat.wva — persistent demo machine (slice 5).
+;
+; Runs forever: increments r5, stores it to mem[0], and logs it each beat.
+; YIELD + the backward JMP are pause control points, so the host can
+; pause/resume/reset this VM while the kernel stays resident.
+;
+; Use with:  warpvm serve programs/heartbeat.wvm
+; (Unlike the other examples it never HALTs, so don't use `warpvm run`.)
+
+    MOV_I r5, 0
+beat:
+    ADD_I r5, r5, 1
+    MOV_I r0, 0          ; address
+    STORE r0, r5         ; mem[0] = counter
+    LOG_I r5, 7          ; log the counter with tag 7
+    YIELD
+    JMP beat

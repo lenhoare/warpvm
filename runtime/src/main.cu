@@ -16,6 +16,8 @@
 
 #include "gpu/vm_state.cuh"
 #include "gpu/warpvm.cuh"
+#include "host/persistent.h"
+#include "host/vm_image.h"
 #include "host/wvm_file.h"
 
 namespace wvm {
@@ -89,16 +91,7 @@ int RunSlice1() {
 
 // ---- VM execution ----------------------------------------------------------
 
-// Host-side description of one VM to execute: program, literals, and private
-// RAM (zero-filled, optionally pre-seeded).
-struct VmImage {
-  std::vector<uint32_t> code;
-  std::vector<uint32_t> literals;
-  uint32_t mem_size_words = 0;
-  std::vector<uint32_t> mem_init;
-};
-
-bool ExecVmArray(const std::vector<VmImage>& images,
+bool ExecVmArray(const std::vector<wvm::VmImage>& images,
                  std::vector<wvm::VmState>& states,
                  std::vector<std::vector<uint32_t>>& mem_out) {
   const size_t n = images.size();
@@ -107,7 +100,7 @@ bool ExecVmArray(const std::vector<VmImage>& images,
   std::vector<wvm::VmDesc> descs(n);
 
   for (size_t i = 0; i < n; ++i) {
-    const VmImage& img = images[i];
+    const wvm::VmImage& img = images[i];
     CUDA_CHECK(cudaMalloc(&d_code[i], img.code.size() * sizeof(uint32_t)));
     CUDA_CHECK(cudaMemcpy(d_code[i], img.code.data(),
                           img.code.size() * sizeof(uint32_t),
@@ -180,7 +173,7 @@ bool ExecVmArray(const std::vector<VmImage>& images,
 // Single-VM convenience wrapper used by `run` and the slice-2 self-tests.
 bool ExecProgram(const std::vector<uint32_t>& code,
                  const std::vector<uint32_t>& literals, wvm::VmState& out) {
-  VmImage img;
+  wvm::VmImage img;
   img.code = code;
   img.literals = literals;
   img.mem_size_words = 16384;  // `run` default: 64 KB VM RAM
@@ -233,6 +226,50 @@ int CmdRun(const char* path) {
   ExecProgram(file.code, file.literals, st);
   PrintState(st);
   return st.status == wvm::kHalted ? 0 : 1;
+}
+
+void PrintVmTable(const wvm::PersistentRuntime& rt);
+
+// `warpvm serve <file.wvm> [--vms N] [--for SECONDS]` — launch the persistent
+// kernel with N copies of the program, boot them, print a `list` table once a
+// second, then shut down. Bounded by design (display-GPU friendly).
+int CmdServe(const char* path, uint32_t n_vms, int seconds) {
+  wvm::WvmFile file;
+  std::string err;
+  if (!wvm::LoadWvm(path, file, err)) {
+    std::fprintf(stderr, "error: %s: %s\n", path, err.c_str());
+    return 2;
+  }
+  if (n_vms == 0 || n_vms > wvm::kMaxVms) {
+    std::fprintf(stderr, "error: --vms must be 1..%u\n", wvm::kMaxVms);
+    return 2;
+  }
+
+  std::vector<wvm::VmImage> images(n_vms);
+  for (uint32_t i = 0; i < n_vms; ++i) {
+    images[i].code = file.code;
+    images[i].literals = file.literals;
+    images[i].mem_size_words = 16384;
+  }
+
+  wvm::PersistentRuntime rt;
+  if (!rt.Init(images, err) || !rt.Launch(err)) {
+    std::fprintf(stderr, "error: %s\n", err.c_str());
+    return 1;
+  }
+  rt.BootAll();
+  std::printf("serving %u VMs from %s for %ds\n", n_vms, path, seconds);
+
+  for (int t = 1; t <= seconds; ++t) {
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    std::printf("t=%ds\n", t);
+    PrintVmTable(rt);
+  }
+
+  rt.ShutdownAll();
+  const cudaError_t e = rt.Sync();
+  std::printf("shutdown: %s\n", e == cudaSuccess ? "ok" : cudaGetErrorString(e));
+  return e == cudaSuccess ? 0 : 1;
 }
 
 bool CheckState(const char* name, const wvm::VmState& st, uint32_t status,
@@ -321,7 +358,7 @@ int RunSlice3() {
   // ---- 64 VMs, stable IDs, private RAM, distinct programs/data -----------
   {
     const uint32_t N = 64;
-    std::vector<VmImage> images(N);
+    std::vector<wvm::VmImage> images(N);
     for (uint32_t i = 0; i < N; ++i) {
       images[i].code = (i % 2 == 0) ? prog_even : prog_odd;
       images[i].mem_size_words = 8;
@@ -362,7 +399,7 @@ int RunSlice3() {
   {
     const uint32_t N = 16;
     const uint32_t bad_vm = 5;
-    std::vector<VmImage> images(N);
+    std::vector<wvm::VmImage> images(N);
     for (uint32_t i = 0; i < N; ++i) {
       images[i].code = prog_even;
       images[i].mem_size_words = (i == bad_vm) ? 1 : 8;
@@ -534,13 +571,122 @@ int RunSlice4() {
   return ok ? 0 : 1;
 }
 
+void PrintVmTable(const wvm::PersistentRuntime& rt) {
+  std::printf("  %-4s %-9s %-8s %-6s %s\n", "vm", "status", "fault", "pc",
+              "instrs");
+  for (uint32_t i = 0; i < rt.num_vms(); ++i) {
+    std::printf("  %-4u %-9s %-8s %-6u %llu\n", i,
+                wvm::StatusName(rt.Status(i)), wvm::FaultName(rt.Fault(i)),
+                rt.Pc(i), (unsigned long long)rt.Instrs(i));
+  }
+}
+
+int RunSlice5() {
+  using wvm::enc_i;
+  using wvm::enc_r;
+  bool ok = true;
+  auto sleep_ms = [](int ms) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+  };
+  auto report = [&ok](const char* name, bool pass, const char* detail = "") {
+    if (detail[0])
+      std::printf("  %-22s %s (%s)\n", name, pass ? "PASS" : "FAIL", detail);
+    else
+      std::printf("  %-22s %s\n", name, pass ? "PASS" : "FAIL");
+    ok &= pass;
+  };
+
+  // Heartbeat: infinite loop, counter in r5, stored to mem[0], logged, with
+  // a YIELD and a backward JMP as pause control points.
+  const std::vector<uint32_t> heartbeat = {
+      enc_i(wvm::kMovI, 0, 5, 0, 0),   // 0: MOV_I r5, 0
+      enc_i(wvm::kAddI, 0, 5, 5, 1),   // 1: beat: ADD_I r5, r5, 1
+      enc_i(wvm::kMovI, 0, 0, 0, 0),   // 2: MOV_I r0, 0
+      enc_r(wvm::kStore, 0, 0, 5, 0),  // 3: STORE r0, r5
+      enc_i(wvm::kLogI, 0, 0, 5, 7),   // 4: LOG_I r5, #7
+      enc_r(wvm::kYield, 0, 0, 0, 0),  // 5: YIELD
+      enc_i(wvm::kJmp, 0, 0, 0, 1),    // 6: JMP beat
+  };
+
+  const uint32_t N = 8;
+  std::vector<wvm::VmImage> images(N);
+  for (uint32_t i = 0; i < N; ++i) {
+    images[i].code = heartbeat;
+    images[i].mem_size_words = 8;
+  }
+
+  wvm::PersistentRuntime rt;
+  std::string err;
+  if (!rt.Init(images, err) || !rt.Launch(err)) {
+    std::fprintf(stderr, "slice5: setup failed: %s\n", err.c_str());
+    return 1;
+  }
+
+  // Boot all VMs; they should reach RUNNING.
+  rt.BootAll();
+  bool all_running = true;
+  for (uint32_t i = 0; i < N; ++i)
+    all_running &= rt.WaitStatus(i, wvm::kRunning, 2000);
+  report("boot_all_running", all_running);
+
+  // Running VMs make progress: instruction counter advances.
+  const uint64_t a0 = rt.Instrs(0);
+  sleep_ms(20);
+  const uint64_t b0 = rt.Instrs(0);
+  char buf[96];
+  std::snprintf(buf, sizeof(buf), "instrs %llu -> %llu",
+                (unsigned long long)a0, (unsigned long long)b0);
+  report("running_progress", b0 > a0, buf);
+
+  // Pause VM 0: it halts at a control point and its counter freezes.
+  rt.SendCmd(0, wvm::kCmdPause);
+  const bool paused = rt.WaitStatus(0, wvm::kPaused, 2000);
+  const uint64_t p1 = rt.Instrs(0);
+  sleep_ms(20);
+  const uint64_t p2 = rt.Instrs(0);
+  std::snprintf(buf, sizeof(buf), "frozen at %llu", (unsigned long long)p2);
+  report("pause_freezes", paused && p2 == p1, buf);
+
+  // Resume VM 0: counter advances again.
+  rt.SendCmd(0, wvm::kCmdRun);
+  const bool resumed = rt.WaitStatus(0, wvm::kRunning, 2000);
+  sleep_ms(20);
+  const uint64_t r0 = rt.Instrs(0);
+  report("resume_progress", resumed && r0 > p2);
+
+  // Reset VM 0 (pause first, then reset): returns to IDLE.
+  rt.SendCmd(0, wvm::kCmdPause);
+  rt.WaitStatus(0, wvm::kPaused, 2000);
+  rt.SendCmd(0, wvm::kCmdReset);
+  report("reset_to_idle", rt.WaitStatus(0, wvm::kIdle, 2000));
+
+  // Log ring received entries tagged 7 from the heartbeats.
+  const wvm::LogSnapshot snap = rt.ReadLog();
+  bool has_tag7 = false;
+  for (const auto& e : snap.entries)
+    if (e.tag == 7) has_tag7 = true;
+  std::snprintf(buf, sizeof(buf), "%u entries", snap.head);
+  report("vm_log", snap.head > 0 && has_tag7, buf);
+
+  // `warpvm list` view: vm 0 idle after reset, others still running.
+  std::printf("  --- warpvm list ---\n");
+  PrintVmTable(rt);
+
+  // Shutdown: every warp exits and the kernel completes.
+  rt.ShutdownAll();
+  const cudaError_t sync_err = rt.Sync();
+  report("clean_shutdown", sync_err == cudaSuccess);
+
+  std::printf(ok ? "slice5: PASS\n" : "slice5: FAIL\n");
+  return ok ? 0 : 1;
+}
+
 void Usage(const char* argv0) {
   std::printf("usage: %s <command>\n", argv0);
-  std::printf("  run <file.wvm>  run a .wvm program on one warp\n");
-  std::printf("  slice1          slice-1 warp arithmetic demo\n");
-  std::printf("  slice2          slice-2 interpreter self-tests\n");
-  std::printf("  slice3          slice-3 multi-VM independence tests\n");
-  std::printf("  slice4          slice-4 warp-native/control-flow tests\n");
+  std::printf("  run <file.wvm>  run a .wvm program to completion on one warp\n");
+  std::printf("  serve <file.wvm> [--vms N] [--for S]\n");
+  std::printf("                  boot N resident VMs, print `list` for S seconds\n");
+  std::printf("  slice1..slice5  self-test suites\n");
 }
 
 }  // namespace
@@ -562,12 +708,32 @@ int main(int argc, char** argv) {
   if (std::strcmp(cmd, "slice2") == 0) return RunSlice2();
   if (std::strcmp(cmd, "slice3") == 0) return RunSlice3();
   if (std::strcmp(cmd, "slice4") == 0) return RunSlice4();
+  if (std::strcmp(cmd, "slice5") == 0) return RunSlice5();
   if (std::strcmp(cmd, "run") == 0) {
     if (argc < 3) {
       std::fprintf(stderr, "error: run requires a .wvm file\n");
       return 2;
     }
     return CmdRun(argv[2]);
+  }
+  if (std::strcmp(cmd, "serve") == 0) {
+    if (argc < 3) {
+      std::fprintf(stderr, "error: serve requires a .wvm file\n");
+      return 2;
+    }
+    uint32_t n_vms = 8;
+    int seconds = 3;
+    for (int i = 3; i < argc; ++i) {
+      if (std::strcmp(argv[i], "--vms") == 0 && i + 1 < argc) {
+        n_vms = static_cast<uint32_t>(std::atoi(argv[++i]));
+      } else if (std::strcmp(argv[i], "--for") == 0 && i + 1 < argc) {
+        seconds = std::atoi(argv[++i]);
+      } else {
+        std::fprintf(stderr, "error: unknown serve option '%s'\n", argv[i]);
+        return 2;
+      }
+    }
+    return CmdServe(argv[2], n_vms, seconds);
   }
   if (std::strcmp(cmd, "help") == 0 || std::strcmp(cmd, "--help") == 0) {
     Usage(argv[0]);

@@ -453,6 +453,28 @@ impl Asm {
                 self.emit(enc_i(OP_LDW, guard, rd, 0, *idx as i32));
             }
 
+            // LOG rValue, rTag | LOG_I rValue, #tag — host-visible log (lane 0).
+            "LOG" => {
+                let [rval, rtag] = ops else {
+                    return Err(format!("line {line}: LOG takes rValue, rTag"));
+                };
+                let rval = Self::vreg(rval, line, "value")?;
+                let rtag = Self::vreg(rtag, line, "tag")?;
+                self.emit(enc_r(OP_LOG, guard, 0, rval, rtag));
+            }
+            "LOG_I" => {
+                let [rval, tag] = ops else {
+                    return Err(format!("line {line}: LOG_I takes rValue, #tag"));
+                };
+                let rval = Self::vreg(rval, line, "value")?;
+                match self.resolve_imm(tag, line)? {
+                    ImmRes::Inline(v) => self.emit(enc_i(OP_LOG_I, guard, 0, rval, v)),
+                    ImmRes::ViaLit(_) => {
+                        return Err(format!("line {line}: LOG_I tag must fit in 13 bits"))
+                    }
+                }
+            }
+
             // ---- scalar ops ----
             "S_MOV" => {
                 let [sd, ss1] = ops else {

@@ -45,6 +45,22 @@ build/tools-rust/release/warpvm-dis hello.wvm
 build/runtime/warpvm run hello.wvm
 ```
 
+## Persistent machines (slice 5)
+
+`run` executes a program to completion. To keep VMs **resident** — boot them,
+watch them run, pause/resume/reset them from the host — use `serve`, which
+launches the persistent kernel and prints a live `list`:
+
+```sh
+build/tools-rust/release/warpvm-as programs/heartbeat.wva -o heartbeat.wvm
+build/runtime/warpvm serve heartbeat.wvm --vms 12 --for 5
+```
+
+`programs/heartbeat.wva` never halts (it is a small event loop), so it stays
+`RUNNING` and its instruction counter advances until you shut it down. The
+control plane (host↔GPU commands + status + log) is documented in
+[docs/architecture.md](docs/architecture.md).
+
 ## Slice status
 
 | Slice | Content | Status |
@@ -54,6 +70,6 @@ build/runtime/warpvm run hello.wvm
 | 2 | interpreter (MOV/ADD/HALT), Rust assembler/disassembler | done |
 | 3 | many VMs, stable IDs, private RAM | done |
 | 4 | warp-native ops, control flow, stride-32 loops | done |
-| 5 | persistent kernel control plane, `warpvm list` | — |
+| 5 | persistent kernel control plane, `serve` + live `list`, log | done |
 | 6 | `warpvm attach`, live inspection | — |
 | 7 | messaging | — |

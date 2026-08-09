@@ -12,6 +12,7 @@
 // lanes regardless of the guard; only the write is masked.
 #pragma once
 
+#include "control.cuh"
 #include "warpvm.cuh"
 
 namespace wvm {
@@ -34,6 +35,7 @@ struct VmCtx {
   uint32_t call_depth;
   uint32_t rng_state;
   uint64_t instr_count;
+  uint64_t last_pub;  // instr_count at last control-plane progress publish
   uint32_t fault;
 };
 
@@ -112,13 +114,20 @@ __device__ inline bool BadScalarField(uint32_t f) { return (f & 8u) != 0u; }
 // Predicate field check (p0-p3 in 2 bits).
 __device__ inline bool BadPredField(uint32_t f) { return f >= kPredRegs; }
 
-__device__ void VmRun(VmCtx& ctx) {
+// Execute until HALT, fault, or — when a control plane is attached — a
+// pause/shutdown request at a control point (YIELD, backward jumps).
+// Returns why execution stopped. With ctrl == nullptr this is the plain
+// run-to-completion path used by `warpvm run` and the slice self-tests.
+__device__ StopReason VmRun(VmCtx& ctx, Control* ctrl = nullptr,
+                            uint32_t vm_id = 0) {
+  StopReason reason = kStopHalted;
   while (ctx.fault == kFaultOk) {
     if (ctx.pc >= ctx.code_len) {
       // Ran off the end without HALT.
       VmFault(ctx, kFaultJump);
       break;
     }
+    const uint32_t this_pc = ctx.pc;
     const uint32_t instr = ctx.code[ctx.pc];
     const uint32_t op = (instr >> kOpcodeShift) & kOpcodeMask;
     const uint32_t guard = (instr >> kGuardShift) & kGuardMask;
@@ -416,6 +425,15 @@ __device__ void VmRun(VmCtx& ctx) {
         }
         break;
 
+      // ---- logging (lane 0 appends to the host-visible ring) ---------------
+      case kLog:
+      case kLogI:
+        if (active && ctrl != nullptr && ctx.lane == 0) {
+          const uint32_t tag = (op == kLogI) ? imm : ctx.vregs[rs2];
+          LogAppend(ctrl, ctx.vm_id, tag, ctx.vregs[rs1]);
+        }
+        break;
+
       // ---- scalar operations (uniform) --------------------------------------
       case kSMov:
         if (BadScalarField(rd) || BadScalarField(rs1)) {
@@ -548,7 +566,21 @@ __device__ void VmRun(VmCtx& ctx) {
         stop = true;
         break;
       case kYield:
-        break;  // cooperation point; meaningful once the kernel is persistent
+        // Cooperation point: publish live progress, then honour a pending
+        // pause/shutdown when a control plane is attached.
+        if (ctrl != nullptr) {
+          if (ctx.instr_count - ctx.last_pub >= 1024u) {
+            ctx.last_pub = ctx.instr_count;
+            PublishStatus(ctrl, vm_id, ctx.lane, kRunning, 0, ctx.pc,
+                          ctx.instr_count);
+          }
+          StopReason ir;
+          if (CheckInterrupt(ctrl, vm_id, ctx.lane, &ir)) {
+            reason = ir;
+            stop = true;
+          }
+        }
+        break;
       case kStepTrap:
         break;  // debugger hook; NOP unless debug-active
 
@@ -568,8 +600,27 @@ __device__ void VmRun(VmCtx& ctx) {
     }
     ++ctx.instr_count;
     if (stop) break;
+
+    // Control point: backward branches are loop heads, so check for a
+    // pause/shutdown there too. pc already holds the taken target; stopping
+    // here resumes at that target. Publish throttled progress for the host.
+    if (jumped && ctrl != nullptr && ctx.pc <= this_pc) {
+      if (ctx.instr_count - ctx.last_pub >= 1024u) {
+        ctx.last_pub = ctx.instr_count;
+        PublishStatus(ctrl, vm_id, ctx.lane, kRunning, 0, ctx.pc,
+                      ctx.instr_count);
+      }
+      StopReason ir;
+      if (CheckInterrupt(ctrl, vm_id, ctx.lane, &ir)) {
+        reason = ir;
+        break;
+      }
+    }
+
     if (!jumped) ++ctx.pc;
   }
+  if (ctx.fault != kFaultOk) return kStopFaulted;
+  return reason;
 }
 
 }  // namespace wvm

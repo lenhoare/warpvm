@@ -30,6 +30,7 @@ add_test(NAME slice1_warp_arithmetic COMMAND warpvm slice1)
 add_test(NAME slice2_interpreter COMMAND warpvm slice2)
 add_test(NAME slice3_multi_vm COMMAND warpvm slice3)
 add_test(NAME slice4_warp_control COMMAND warpvm slice4)
+add_test(NAME slice5_control_plane COMMAND warpvm slice5)
 
 add_test(NAME pipeline_hello
   COMMAND bash ${CMAKE_SOURCE_DIR}/tests/pipeline.sh

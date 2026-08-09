@@ -178,6 +178,9 @@ fn render(d: &Decoded, literals: &[u32]) -> Option<String> {
             format!("LDW {}, #{}{note}", vreg(d.rd), d.lo)
         }
 
+        isa::OP_LOG => format!("LOG {}, {}", vreg(d.rs1), vreg(d.rs2())),
+        isa::OP_LOG_I => format!("LOG_I {}, #{}", vreg(d.rs1), d.imm()),
+
         isa::OP_S_MOV => {
             if !sreg_ok(d.rd) || !sreg_ok(d.rs1) {
                 return None;
