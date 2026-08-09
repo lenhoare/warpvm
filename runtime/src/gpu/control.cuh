@@ -23,6 +23,7 @@ enum VmCmd : uint32_t {
   kCmdPause = 2,   // stop at the next control point
   kCmdReset = 3,   // reinitialise VM state (pc=0, registers zeroed)
   kCmdExit = 4,    // this VM's warp leaves the kernel
+  kCmdStep = 5,    // paused VM: retire exactly one instruction, re-pause
 };
 
 // Why a VM's execution loop stopped.
@@ -49,6 +50,7 @@ struct Control {
   volatile uint32_t fault[kMaxVms];
   volatile uint32_t pc[kMaxVms];
   volatile uint64_t instrs[kMaxVms];
+  volatile uint32_t seq[kMaxVms];    // bumped by the warp on each completed step
   volatile uint32_t log_head;        // total entries appended
   LogEntry log[kLogCapacity];        // ring buffer
 };

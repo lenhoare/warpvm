@@ -61,6 +61,22 @@ build/runtime/warpvm serve heartbeat.wvm --vms 12 --for 5
 control plane (host↔GPU commands + status + log) is documented in
 [docs/architecture.md](docs/architecture.md).
 
+## Attach and single-step (slice 6)
+
+`attach` boots resident VMs and drops into an interactive console to inspect
+and drive one of them — pause, single-step, dump registers/memory, disassemble:
+
+```sh
+build/runtime/warpvm attach heartbeat.wvm --vms 4
+vm-0> pause
+vm-0> step          # retire exactly one instruction
+vm-0> regs          # r0..r15 (live, from the paused VM)
+vm-0> mem 0 8       # VM RAM
+vm-0> disasm        # program around the pc, current line marked
+vm-0> resume
+vm-0> quit
+```
+
 ## Slice status
 
 | Slice | Content | Status |
@@ -71,5 +87,5 @@ control plane (host↔GPU commands + status + log) is documented in
 | 3 | many VMs, stable IDs, private RAM | done |
 | 4 | warp-native ops, control flow, stride-32 loops | done |
 | 5 | persistent kernel control plane, `serve` + live `list`, log | done |
-| 6 | `warpvm attach`, live inspection | — |
+| 6 | `warpvm attach`, live inspection, single-step | done |
 | 7 | messaging | — |

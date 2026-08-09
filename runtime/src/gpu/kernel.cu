@@ -60,9 +60,9 @@ __global__ void VmArrayKernel(const VmDesc* descs, VmState* states) {
 // Persistent kernel
 // ---------------------------------------------------------------------------
 
-// Run a VM through any number of pause/resume cycles until it halts, faults,
-// is reset, or the kernel must exit. Returns false when the warp should leave
-// the kernel (global shutdown or EXIT).
+// Run a VM through any number of pause/resume/step cycles until it halts,
+// faults, is reset, or the kernel must exit. Returns false when the warp
+// should leave the kernel (global shutdown or EXIT).
 __device__ static bool RunVmUntilStop(VmCtx& ctx, const VmDesc& d,
                                       Control* ctrl, uint32_t vm_id,
                                       uint32_t lane, VmState* state) {
@@ -73,29 +73,61 @@ __device__ static bool RunVmUntilStop(VmCtx& ctx, const VmDesc& d,
     SpillState(ctx, state);
 
     if (reason == kStopShutdown) return false;
+    if (reason == kStopHalted) {
+      PublishStatus(ctrl, vm_id, lane, kHalted, ctx.fault, ctx.pc,
+                    ctx.instr_count);
+      return true;
+    }
+    if (reason == kStopFaulted) {
+      PublishStatus(ctrl, vm_id, lane, kFaulted, ctx.fault, ctx.pc,
+                    ctx.instr_count);
+      return true;
+    }
 
-    const uint32_t status = reason == kStopHalted   ? kHalted
-                            : reason == kStopFaulted ? kFaulted
-                                                     : kPaused;
-    PublishStatus(ctrl, vm_id, lane, status, ctx.fault, ctx.pc,
+    // reason == kStopPaused: hold at the control point until the host acts.
+    PublishStatus(ctrl, vm_id, lane, kPaused, ctx.fault, ctx.pc,
                   ctx.instr_count);
-
-    if (reason != kStopPaused) return true;  // halted/faulted: await host
-
-    // Paused: hold at the control point until the host acts.
     for (;;) {
       if (ReadOnce(&ctrl->shutdown)) return false;
       const uint32_t next = ConsumeCmd(ctrl, vm_id, lane);
-      if (next == kCmdRun) break;  // resume from the paused pc
+      if (next == kCmdRun) break;  // resume: outer loop re-runs VmRun
+      if (next == kCmdStep) {
+        // Retire exactly one instruction, then re-pause. Bump seq so the host
+        // can detect completion (status may stay PAUSED throughout).
+        ctx.step = true;
+        const StopReason r = VmRun(ctx, ctrl, vm_id);
+        ctx.step = false;
+        SpillState(ctx, state);
+        if (r == kStopShutdown) return false;
+        if (r == kStopHalted) {
+          PublishStatus(ctrl, vm_id, lane, kHalted, ctx.fault, ctx.pc,
+                        ctx.instr_count);
+          if (lane == 0)
+            WriteOnce(&ctrl->seq[vm_id], ReadOnce(&ctrl->seq[vm_id]) + 1u);
+          return true;
+        }
+        if (r == kStopFaulted) {
+          PublishStatus(ctrl, vm_id, lane, kFaulted, ctx.fault, ctx.pc,
+                        ctx.instr_count);
+          if (lane == 0)
+            WriteOnce(&ctrl->seq[vm_id], ReadOnce(&ctrl->seq[vm_id]) + 1u);
+          return true;
+        }
+        PublishStatus(ctrl, vm_id, lane, kPaused, ctx.fault, ctx.pc,
+                      ctx.instr_count);
+        if (lane == 0)
+          WriteOnce(&ctrl->seq[vm_id], ReadOnce(&ctrl->seq[vm_id]) + 1u);
+        continue;  // still paused: wait for the next command
+      }
       if (next == kCmdReset) {
         InitVmCtx(ctx, d, vm_id, lane);
         PublishStatus(ctrl, vm_id, lane, kIdle, 0, 0, 0);
         return true;
       }
       if (next == kCmdExit) return false;
-      __nanosleep(1000);  // kCmdNone (or an in-band command): keep waiting
+      __nanosleep(1000);  // kCmdNone (or stray command): keep waiting
     }
-    // Loop: VmRun continues from the paused pc.
+    // kCmdRun consumed: loop and continue executing from the paused pc.
   }
 }
 

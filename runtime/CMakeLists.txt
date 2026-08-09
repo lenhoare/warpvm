@@ -52,3 +52,8 @@ add_test(NAME pipeline_loop32
           ${WVM_AS} $<TARGET_FILE:warpvm>
           ${CMAKE_SOURCE_DIR}/programs/loop32.wva
           "r7  = 100" ${CMAKE_BINARY_DIR}/loop32.wvm)
+add_test(NAME slice6_attach
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/attach.sh
+          ${WVM_AS} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/programs/heartbeat.wva
+          ${CMAKE_BINARY_DIR}/attach)

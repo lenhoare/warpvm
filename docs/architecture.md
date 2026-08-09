@@ -45,10 +45,38 @@ GPU-side reads of mapped memory are plain loads over PCIe — acceptable at
 control-plane rates. Data-plane transfers (program load, snapshots) use
 regular `cudaMemcpy` while the target VM is held at a control point.
 
+Two constraints learned the hard way:
+
+- **Launch on a non-blocking stream.** The resident kernel must be launched on
+  a stream created with `cudaStreamNonBlocking`. If it runs on the legacy
+  default stream, every host `cudaMemcpy`/read implicitly waits on the kernel
+  and deadlocks (the kernel never finishes). Non-blocking streams are exempt
+  from legacy default-stream synchronisation, so inspection copies proceed
+  while the kernel stays resident.
+- **The command channel is one word per VM.** A new command overwrites an
+  unconsumed one, so the host must wait for each command to take effect
+  (status transition or the per-VM `seq` counter) before sending the next. At
+  boot, the runtime waits for every VM to leave `IDLE` before accepting
+  further commands.
+
 Every interpreter iteration checks the VM's command word only when the VM
-reaches a control point (`HALT`, `YIELD`, debug request). Running VMs are
+reaches a control point (`HALT`, `YIELD`, backward branch). Running VMs are
 not hard-preempted; cooperation points are frequent enough for interactive
 control.
+
+## Attach and single-step
+
+`warpvm attach` boots resident VMs and drives one through a console:
+`pause / step / resume / reset / regs / sregs / mem / pc / disasm / log`.
+
+- Inspection reads the VM's spilled `VmState` and its private RAM with
+  `cudaMemcpy` while the kernel is resident (valid because a stopped VM's
+  state is stable).
+- **Single-step**: the host sends `kCmdStep` to a paused VM. The warp sets a
+  `step` flag and re-enters the interpreter, which retires exactly one
+  instruction and re-pauses at the new pc. Because the status stays `PAUSED`
+  across a step, the warp bumps a per-VM `seq` counter when the step
+  completes; the host waits on `seq` to detect completion.
 
 ## Inspection: spill-on-pause
 

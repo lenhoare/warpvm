@@ -39,6 +39,7 @@ class PersistentRuntime {
       err = "vm count must be 1.." + std::to_string(kMaxVms);
       return false;
     }
+    h_images_ = images;  // retained for inspection / disassembly
 
     if (cudaHostAlloc(&h_ctrl_, sizeof(Control), cudaHostAllocMapped) !=
         cudaSuccess) {
@@ -106,9 +107,19 @@ class PersistentRuntime {
   }
 
   bool Launch(std::string& err) {
+    // Launch on a non-blocking stream: the legacy default stream would make
+    // cudaMemcpy / host reads implicitly wait on the resident kernel and
+    // deadlock. Non-blocking streams are exempt from that synchronisation.
+    if (stream_ == nullptr &&
+        cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) !=
+            cudaSuccess) {
+      err = "cudaStreamCreate failed";
+      return false;
+    }
     const int block = 256;
     const int grid = static_cast<int>((num_vms_ * kLanes + block - 1) / block);
-    PersistentKernel<<<grid, block>>>(d_descs_, d_states_, d_ctrl_, num_vms_);
+    PersistentKernel<<<grid, block, 0, stream_>>>(d_descs_, d_states_, d_ctrl_,
+                                                  num_vms_);
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
       err = std::string("kernel launch failed: ") + cudaGetErrorString(e);
@@ -124,6 +135,56 @@ class PersistentRuntime {
     for (uint32_t i = 0; i < num_vms_; ++i) SendCmd(i, kCmdRun);
   }
   void ShutdownAll() { h_ctrl_->shutdown = 1u; }
+
+  // Pause a VM and wait for it to reach the control point.
+  bool Pause(uint32_t vm, int timeout_ms = 2000) {
+    SendCmd(vm, kCmdPause);
+    return WaitStatus(vm, kPaused, timeout_ms);
+  }
+  // Single-step a paused VM: retire one instruction and re-pause. Waits on the
+  // per-VM seq counter (status stays PAUSED, so status polling can't detect
+  // completion). Returns the post-step status (PAUSED, HALTED or FAULTED).
+  uint32_t Step(uint32_t vm, int timeout_ms = 2000) {
+    if (vm >= num_vms_) return kFaulted;
+    const uint32_t seq0 = h_ctrl_->seq[vm];
+    SendCmd(vm, kCmdStep);
+    for (int waited = 0; waited < timeout_ms; waited += 1) {
+      if (h_ctrl_->seq[vm] != seq0) return Status(vm);
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return Status(vm);
+  }
+
+  // ---- inspection while resident (no sync needed) -------------------------
+  // Copy a VM's spilled register/state block to the host.
+  bool ReadState(uint32_t vm, VmState& out) const {
+    if (vm >= num_vms_) return false;
+    return cudaMemcpy(&out, &d_states_[vm], sizeof(VmState),
+                      cudaMemcpyDeviceToHost) == cudaSuccess;
+  }
+  // Copy `count` words of a VM's RAM starting at `addr`.
+  bool ReadMem(uint32_t vm, uint32_t addr, uint32_t count,
+               std::vector<uint32_t>& out) const {
+    if (vm >= num_vms_) return false;
+    const uint32_t size = h_images_[vm].mem_size_words;
+    if (d_mem_[vm] == nullptr || addr >= size) return false;
+    if (count > size - addr) count = size - addr;
+    out.resize(count);
+    if (count == 0) return true;
+    return cudaMemcpy(out.data(), d_mem_[vm] + addr,
+                      count * sizeof(uint32_t),
+                      cudaMemcpyDeviceToHost) == cudaSuccess;
+  }
+  uint32_t MemSize(uint32_t vm) const {
+    return vm < num_vms_ ? h_images_[vm].mem_size_words : 0;
+  }
+  // The program a VM was loaded with (for disassembly).
+  const std::vector<uint32_t>& Code(uint32_t vm) const {
+    return h_images_[vm].code;
+  }
+  const std::vector<uint32_t>& Literals(uint32_t vm) const {
+    return h_images_[vm].literals;
+  }
 
   // ---- status reads (mapped memory, no sync needed) -----------------------
   uint32_t num_vms() const { return num_vms_; }
@@ -153,7 +214,9 @@ class PersistentRuntime {
   }
 
   // Block until the resident kernel has exited (call after ShutdownAll).
-  cudaError_t Sync() { return cudaDeviceSynchronize(); }
+  cudaError_t Sync() {
+    return stream_ ? cudaStreamSynchronize(stream_) : cudaDeviceSynchronize();
+  }
 
   void Free() {
     if (d_descs_) cudaFree(d_descs_), d_descs_ = nullptr;
@@ -166,6 +229,7 @@ class PersistentRuntime {
     d_mem_.clear();
     if (h_ctrl_) cudaFreeHost(h_ctrl_), h_ctrl_ = nullptr;
     d_ctrl_ = nullptr;
+    if (stream_) cudaStreamDestroy(stream_), stream_ = nullptr;
   }
 
  private:
@@ -174,6 +238,8 @@ class PersistentRuntime {
   VmDesc* d_descs_ = nullptr;
   VmState* d_states_ = nullptr;
   std::vector<uint32_t*> d_code_, d_lit_, d_mem_;
+  std::vector<VmImage> h_images_;
+  cudaStream_t stream_ = nullptr;
   uint32_t num_vms_ = 0;
   bool launched_ = false;
 };

@@ -36,6 +36,7 @@ struct VmCtx {
   uint32_t rng_state;
   uint64_t instr_count;
   uint64_t last_pub;  // instr_count at last control-plane progress publish
+  bool step;          // single-step: retire one instruction then re-pause
   uint32_t fault;
 };
 
@@ -618,6 +619,13 @@ __device__ StopReason VmRun(VmCtx& ctx, Control* ctrl = nullptr,
     }
 
     if (!jumped) ++ctx.pc;
+
+    // Single-step: the one instruction has retired; re-pause at the new pc.
+    if (ctx.step) {
+      ctx.step = false;
+      reason = kStopPaused;
+      break;
+    }
   }
   if (ctx.fault != kFaultOk) return kStopFaulted;
   return reason;

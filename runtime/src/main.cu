@@ -9,6 +9,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -16,6 +18,7 @@
 
 #include "gpu/vm_state.cuh"
 #include "gpu/warpvm.cuh"
+#include "host/disasm.h"
 #include "host/persistent.h"
 #include "host/vm_image.h"
 #include "host/wvm_file.h"
@@ -264,6 +267,199 @@ int CmdServe(const char* path, uint32_t n_vms, int seconds) {
     std::this_thread::sleep_for(std::chrono::seconds(1));
     std::printf("t=%ds\n", t);
     PrintVmTable(rt);
+  }
+
+  rt.ShutdownAll();
+  const cudaError_t e = rt.Sync();
+  std::printf("shutdown: %s\n", e == cudaSuccess ? "ok" : cudaGetErrorString(e));
+  return e == cudaSuccess ? 0 : 1;
+}
+
+void PrintVectorRegs(const wvm::VmState& st) {
+  for (int r = 0; r < wvm::kVectorRegs; ++r) {
+    const uint32_t* v = &st.vregs[r * wvm::kLanes];
+    bool uniform = true;
+    for (int i = 1; i < wvm::kLanes; ++i)
+      if (v[i] != v[0]) uniform = false;
+    if (uniform)
+      std::printf("r%-2d = %u (uniform)\n", r, v[0]);
+    else
+      std::printf("r%-2d = [%u, %u, %u, %u, ...] (varied)\n", r, v[0], v[1],
+                  v[2], v[3]);
+  }
+}
+
+void PrintScalarRegs(const wvm::VmState& st) {
+  for (int r = 0; r < wvm::kScalarRegs; ++r)
+    std::printf("s%d = %u\n", r, st.sregs[r]);
+}
+
+void PrintPreds(const wvm::VmState& st) {
+  for (int r = 0; r < wvm::kPredRegs; ++r)
+    std::printf("p%d = %08x\n", r, st.preds[r]);
+}
+
+std::vector<std::string> Tokenize(const std::string& line) {
+  std::vector<std::string> toks;
+  std::istringstream iss(line);
+  std::string t;
+  while (iss >> t) toks.push_back(t);
+  return toks;
+}
+
+// `warpvm attach <file.wvm> [--vms N]` — launch the persistent kernel, boot
+// the VMs, then run an interactive console reading commands from stdin.
+int CmdAttach(const char* path, uint32_t n_vms) {
+  wvm::WvmFile file;
+  std::string err;
+  if (!wvm::LoadWvm(path, file, err)) {
+    std::fprintf(stderr, "error: %s: %s\n", path, err.c_str());
+    return 2;
+  }
+  if (n_vms == 0 || n_vms > wvm::kMaxVms) {
+    std::fprintf(stderr, "error: --vms must be 1..%u\n", wvm::kMaxVms);
+    return 2;
+  }
+  std::vector<wvm::VmImage> images(n_vms);
+  for (uint32_t i = 0; i < n_vms; ++i) {
+    images[i].code = file.code;
+    images[i].literals = file.literals;
+    images[i].mem_size_words = 16384;
+  }
+  wvm::PersistentRuntime rt;
+  if (!rt.Init(images, err) || !rt.Launch(err)) {
+    std::fprintf(stderr, "error: %s\n", err.c_str());
+    return 1;
+  }
+  rt.BootAll();
+  // The command channel is a single word per VM, so we must let each warp
+  // consume its RUN (leave IDLE) before the console can send anything else —
+  // otherwise a later command would overwrite the unconsumed RUN.
+  for (uint32_t i = 0; i < n_vms; ++i) {
+    for (int w = 0; w < 2000 && rt.Status(i) == wvm::kIdle; ++w)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  std::printf("attached: %u VMs from %s\n", n_vms, path);
+  std::printf("type 'help' for commands, 'quit' to exit\n");
+
+  uint32_t cur = 0;
+  auto ensure_paused = [&](uint32_t vm) -> bool {
+    if (rt.Status(vm) == wvm::kPaused) return true;
+    return rt.Pause(vm);
+  };
+
+  std::string line;
+  while (true) {
+    std::printf("vm-%u> ", cur);
+    std::fflush(stdout);
+    if (!std::getline(std::cin, line)) break;  // EOF
+    const std::vector<std::string> tok = Tokenize(line);
+    if (tok.empty()) continue;
+    const std::string& c = tok[0];
+
+    if (c == "quit" || c == "exit") break;
+    else if (c == "help") {
+      std::printf("  list                 status of all VMs\n");
+      std::printf("  vm <id>              select VM to inspect\n");
+      std::printf("  status               status/fault/pc/instrs of current VM\n");
+      std::printf("  pause | halt         pause current VM\n");
+      std::printf("  resume | continue    resume current VM\n");
+      std::printf("  step [n]             single-step current VM n times\n");
+      std::printf("  reset                reset current VM\n");
+      std::printf("  regs | sregs | preds register dumps (pause first)\n");
+      std::printf("  pc                   program counter + current instr\n");
+      std::printf("  disasm [start] [n]   disassemble around pc\n");
+      std::printf("  mem <addr> <count>   dump VM RAM words\n");
+      std::printf("  log [n]              recent log entries\n");
+      std::printf("  quit                 shut down and exit\n");
+    } else if (c == "list") {
+      PrintVmTable(rt);
+    } else if (c == "vm") {
+      if (tok.size() < 2) { std::printf("usage: vm <id>\n"); continue; }
+      const uint32_t id = static_cast<uint32_t>(std::atoi(tok[1].c_str()));
+      if (id >= n_vms) { std::printf("vm id out of range\n"); continue; }
+      cur = id;
+    } else if (c == "status") {
+      std::printf("vm %u: status=%s fault=%s pc=%u instrs=%llu\n", cur,
+                  wvm::StatusName(rt.Status(cur)),
+                  wvm::FaultName(rt.Fault(cur)), rt.Pc(cur),
+                  (unsigned long long)rt.Instrs(cur));
+    } else if (c == "pause" || c == "halt") {
+      std::printf("%s\n", rt.Pause(cur) ? "paused" : "pause timed out");
+    } else if (c == "resume" || c == "continue" || c == "run") {
+      rt.SendCmd(cur, wvm::kCmdRun);
+      std::printf("resuming\n");
+    } else if (c == "step") {
+      if (!ensure_paused(cur)) { std::printf("could not pause\n"); continue; }
+      int n = tok.size() >= 2 ? std::atoi(tok[1].c_str()) : 1;
+      if (n < 1) n = 1;
+      uint32_t s = wvm::kPaused;
+      for (int i = 0; i < n; ++i) {
+        s = rt.Step(cur);
+        if (s != wvm::kPaused) break;
+      }
+      std::printf("stepped -> status=%s pc=%u instrs=%llu\n",
+                  wvm::StatusName(s), rt.Pc(cur),
+                  (unsigned long long)rt.Instrs(cur));
+    } else if (c == "reset") {
+      if (!ensure_paused(cur)) { std::printf("could not pause\n"); continue; }
+      rt.SendCmd(cur, wvm::kCmdReset);
+      std::printf("resetting\n");
+    } else if (c == "regs" || c == "sregs" || c == "preds") {
+      wvm::VmState st{};
+      if (!rt.ReadState(cur, st)) { std::printf("read failed\n"); continue; }
+      if (rt.Status(cur) != wvm::kPaused && rt.Status(cur) != wvm::kHalted &&
+          rt.Status(cur) != wvm::kFaulted)
+        std::printf("(VM not stopped — snapshot may be stale)\n");
+      if (c == "regs") PrintVectorRegs(st);
+      else if (c == "sregs") PrintScalarRegs(st);
+      else PrintPreds(st);
+    } else if (c == "pc") {
+      const uint32_t pc = rt.Pc(cur);
+      std::printf("pc=%u status=%s\n", pc, wvm::StatusName(rt.Status(cur)));
+      const auto& code = rt.Code(cur);
+      if (pc < code.size())
+        std::printf("  %u: %s\n", pc,
+                    wvm::DisasmWord(code[pc], rt.Literals(cur)).c_str());
+    } else if (c == "disasm") {
+      const auto& code = rt.Code(cur);
+      const auto& lits = rt.Literals(cur);
+      uint32_t start = rt.Pc(cur) >= 2 ? rt.Pc(cur) - 2 : 0;
+      uint32_t count = 8;
+      if (tok.size() >= 2) start = static_cast<uint32_t>(std::atoi(tok[1].c_str()));
+      if (tok.size() >= 3) count = static_cast<uint32_t>(std::atoi(tok[2].c_str()));
+      const uint32_t pc = rt.Pc(cur);
+      for (uint32_t i = start; i < code.size() && i < start + count; ++i)
+        std::printf("%s %4u: %s\n", i == pc ? ">" : " ", i,
+                    wvm::DisasmWord(code[i], lits).c_str());
+    } else if (c == "mem") {
+      if (tok.size() < 3) { std::printf("usage: mem <addr> <count>\n"); continue; }
+      const uint32_t addr = static_cast<uint32_t>(std::atoi(tok[1].c_str()));
+      const uint32_t count = static_cast<uint32_t>(std::atoi(tok[2].c_str()));
+      std::vector<uint32_t> words;
+      if (!rt.ReadMem(cur, addr, count, words)) {
+        std::printf("mem read failed (out of range?)\n");
+        continue;
+      }
+      for (size_t i = 0; i < words.size(); i += 8) {
+        std::printf("  [%5zu]:", addr + i);
+        for (size_t j = i; j < i + 8 && j < words.size(); ++j)
+          std::printf(" %10u", words[j]);
+        std::printf("\n");
+      }
+    } else if (c == "log") {
+      const int n = tok.size() >= 2 ? std::atoi(tok[1].c_str()) : 16;
+      const wvm::LogSnapshot snap = rt.ReadLog();
+      const size_t start = snap.entries.size() > (size_t)n
+                               ? snap.entries.size() - (size_t)n : 0;
+      for (size_t i = start; i < snap.entries.size(); ++i) {
+        const auto& e = snap.entries[i];
+        std::printf("  vm=%u tag=%u value=%u\n", e.vm_id, e.tag, e.value);
+      }
+      std::printf("(%u total entries)\n", snap.head);
+    } else {
+      std::printf("unknown command '%s' (try 'help')\n", c.c_str());
+    }
   }
 
   rt.ShutdownAll();
@@ -686,6 +882,8 @@ void Usage(const char* argv0) {
   std::printf("  run <file.wvm>  run a .wvm program to completion on one warp\n");
   std::printf("  serve <file.wvm> [--vms N] [--for S]\n");
   std::printf("                  boot N resident VMs, print `list` for S seconds\n");
+  std::printf("  attach <file.wvm> [--vms N]\n");
+  std::printf("                  boot N resident VMs, interactive console on stdin\n");
   std::printf("  slice1..slice5  self-test suites\n");
 }
 
@@ -734,6 +932,18 @@ int main(int argc, char** argv) {
       }
     }
     return CmdServe(argv[2], n_vms, seconds);
+  }
+  if (std::strcmp(cmd, "attach") == 0) {
+    if (argc < 3) {
+      std::fprintf(stderr, "error: attach requires a .wvm file\n");
+      return 2;
+    }
+    uint32_t n_vms = 4;
+    for (int i = 3; i < argc; ++i) {
+      if (std::strcmp(argv[i], "--vms") == 0 && i + 1 < argc)
+        n_vms = static_cast<uint32_t>(std::atoi(argv[++i]));
+    }
+    return CmdAttach(argv[2], n_vms);
   }
   if (std::strcmp(cmd, "help") == 0 || std::strcmp(cmd, "--help") == 0) {
     Usage(argv[0]);
