@@ -7,6 +7,10 @@ The instruction contract lives in [isa.md](isa.md).
 
 - One persistent CUDA kernel hosts all VMs. One warp = one VM; thread-block
   geometry is a multiple of 32 so no VM ever straddles a hardware warp.
+  Blocks of 256 threads (8 VMs) where the VM count allows, single-warp
+  blocks otherwise.
+- Logical `vm_id` is the warp's slot index into the descriptor/state arrays.
+  Nothing in the VM's identity or state references SM or block placement.
 - All warps run the **same interpreter code**; each fetches from its own
   program. Within a warp the opcode stream is uniform, so fetch/decode is
   divergence-free. Divergence between warps is free (independent scheduling).
@@ -14,6 +18,16 @@ The instruction contract lives in [isa.md](isa.md).
   (lane *i* owns element *i* of every vector register). Scalar registers and
   predicate masks are uniform values replicated in every lane; they stay in
   sync by construction because all lanes execute the same uniform operations.
+
+## Fault uniformity
+
+Per-lane conditions (e.g. one lane's LOAD address out of bounds while other
+lanes are fine) are resolved to a warp-uniform decision with
+`__ballot_sync`: if any lane faults, the whole VM faults, taking the lowest
+faulting lane's code. This keeps the fetch loop converged even with
+scattered per-lane accesses — essential for GP-mutated programs. Partial
+effects a dying VM already wrote into its own RAM are tolerated; effects on
+other VMs are impossible by construction (disjoint RAM regions).
 
 ## Host ↔ kernel control channel
 

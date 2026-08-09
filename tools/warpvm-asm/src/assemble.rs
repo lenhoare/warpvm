@@ -236,9 +236,16 @@ pub fn assemble(src: &str) -> Result<Assembled, String> {
                 ldw_refs.push((*line, *idx as u32));
                 code.push(isa::enc_i(isa::OP_LDW, *guard, *rd, 0, *idx as i32));
             }
+            "LOAD" | "STORE" => {
+                let [Operand::VReg(a), Operand::VReg(b)] = operands.as_slice() else {
+                    return Err(format!("line {line}: {mnemonic} takes two vector registers"));
+                };
+                let op = if mnemonic == "LOAD" { isa::OP_LOAD } else { isa::OP_STORE };
+                code.push(isa::enc_r(op, *guard, *a, *b, 0));
+            }
             other => {
                 return Err(format!(
-                    "line {line}: unknown mnemonic '{other}' (slice 2 supports NOP MOV MOV_I ADD ADD_I LDW HALT)"
+                    "line {line}: unknown mnemonic '{other}' (supported: NOP MOV MOV_I ADD ADD_I LDW LOAD STORE HALT)"
                 ))
             }
         }
@@ -320,8 +327,15 @@ mod tests {
     }
 
     #[test]
+    fn memory_ops_encode() {
+        let a = assemble("LOAD r3, r2\nSTORE r2, r3\nHALT\n").unwrap();
+        assert_eq!(a.code[0], enc_r(OP_LOAD, 0, 3, 2, 0));
+        assert_eq!(a.code[1], enc_r(OP_STORE, 0, 2, 3, 0));
+    }
+
+    #[test]
     fn roundtrip_stable() {
-        let src = ".const BIG 123456\nMOV_I r0, 7\nADD_I r0, r0, BIG\nADD_I r1, r0, -3\nHALT\n";
+        let src = ".const BIG 123456\nMOV_I r0, 7\nADD_I r0, r0, BIG\nADD_I r1, r0, -3\nSTORE r0, r1\nLOAD r2, r0\nHALT\n";
         let a = assemble(src).unwrap();
         let text = disasm::disassemble(&a.code, &a.literals);
         let b = assemble(&text).expect("re-assemble failed");

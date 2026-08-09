@@ -19,6 +19,8 @@ struct VmCtx {
   uint32_t code_len;
   const uint32_t* literals;
   uint32_t literals_len;
+  uint32_t* mem;
+  uint32_t mem_size_words;
   uint32_t vm_id;
   uint32_t lane;
 
@@ -91,6 +93,31 @@ __device__ void VmRun(VmCtx& ctx) {
         }
         break;
 
+      case kLoad:
+        // Per-lane addresses: each lane bounds-checks and loads its own.
+        // If any lane faults, the whole VM faults (resolved below); writes
+        // already performed by other lanes in this VM are tolerated — the
+        // VM is dead at that point.
+        if (active) {
+          const uint32_t addr = ctx.vregs[rs1];
+          if (addr >= ctx.mem_size_words) {
+            VmFault(ctx, kFaultMem);
+            break;
+          }
+          ctx.vregs[rd] = ctx.mem[addr];
+        }
+        break;
+      case kStore:
+        if (active) {
+          const uint32_t addr = ctx.vregs[rd];
+          if (addr >= ctx.mem_size_words) {
+            VmFault(ctx, kFaultMem);
+            break;
+          }
+          ctx.mem[addr] = ctx.vregs[rs1];
+        }
+        break;
+
       case kHalt:
         stop = true;
         break;
@@ -100,7 +127,15 @@ __device__ void VmRun(VmCtx& ctx) {
         break;
     }
 
-    if (ctx.fault != kFaultOk) break;  // faulting instruction does not retire
+    // Resolve per-lane fault conditions to a warp-uniform decision: any
+    // lane's fault faults the whole VM, taking the lowest faulting lane's
+    // code. Keeps control flow converged even with scattered accesses.
+    const uint32_t fault_ballot =
+        __ballot_sync(kFullMask, ctx.fault != kFaultOk);
+    if (fault_ballot != 0u) {
+      ctx.fault = __shfl_sync(kFullMask, ctx.fault, __ffs(fault_ballot) - 1);
+      break;
+    }
     ++ctx.instr_count;
     if (stop) break;
     ++ctx.pc;

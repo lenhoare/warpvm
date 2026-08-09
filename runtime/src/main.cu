@@ -5,6 +5,7 @@
 //   slice2          slice-2 interpreter self-tests (embedded programs)
 //   run <file.wvm>  load a .wvm program, run it on one warp, print state
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -19,9 +20,7 @@
 
 namespace wvm {
 __global__ void Slice1Kernel(uint32_t* lane_out, uint32_t* sum_out);
-__global__ void VmKernel(const uint32_t* code, uint32_t code_len,
-                         const uint32_t* literals, uint32_t literals_len,
-                         VmState* state);
+__global__ void VmArrayKernel(const VmDesc* descs, VmState* states);
 }  // namespace wvm
 
 namespace {
@@ -90,35 +89,105 @@ int RunSlice1() {
 
 // ---- VM execution ----------------------------------------------------------
 
-bool ExecProgram(const std::vector<uint32_t>& code,
-                 const std::vector<uint32_t>& literals, wvm::VmState& out) {
-  uint32_t* d_code = nullptr;
-  uint32_t* d_lit = nullptr;
-  wvm::VmState* d_state = nullptr;
+// Host-side description of one VM to execute: program, literals, and private
+// RAM (zero-filled, optionally pre-seeded).
+struct VmImage {
+  std::vector<uint32_t> code;
+  std::vector<uint32_t> literals;
+  uint32_t mem_size_words = 0;
+  std::vector<uint32_t> mem_init;
+};
 
-  CUDA_CHECK(cudaMalloc(&d_code, code.size() * sizeof(uint32_t)));
-  CUDA_CHECK(cudaMemcpy(d_code, code.data(), code.size() * sizeof(uint32_t),
-                        cudaMemcpyHostToDevice));
-  if (!literals.empty()) {
-    CUDA_CHECK(cudaMalloc(&d_lit, literals.size() * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMemcpy(d_lit, literals.data(),
-                          literals.size() * sizeof(uint32_t),
+bool ExecVmArray(const std::vector<VmImage>& images,
+                 std::vector<wvm::VmState>& states,
+                 std::vector<std::vector<uint32_t>>& mem_out) {
+  const size_t n = images.size();
+  std::vector<uint32_t*> d_code(n, nullptr), d_lit(n, nullptr), d_mem(n,
+                                                                      nullptr);
+  std::vector<wvm::VmDesc> descs(n);
+
+  for (size_t i = 0; i < n; ++i) {
+    const VmImage& img = images[i];
+    CUDA_CHECK(cudaMalloc(&d_code[i], img.code.size() * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_code[i], img.code.data(),
+                          img.code.size() * sizeof(uint32_t),
                           cudaMemcpyHostToDevice));
+    if (!img.literals.empty()) {
+      CUDA_CHECK(
+          cudaMalloc(&d_lit[i], img.literals.size() * sizeof(uint32_t)));
+      CUDA_CHECK(cudaMemcpy(d_lit[i], img.literals.data(),
+                            img.literals.size() * sizeof(uint32_t),
+                            cudaMemcpyHostToDevice));
+    }
+    if (img.mem_size_words > 0) {
+      CUDA_CHECK(cudaMalloc(&d_mem[i],
+                            img.mem_size_words * sizeof(uint32_t)));
+      CUDA_CHECK(cudaMemset(d_mem[i], 0,
+                            img.mem_size_words * sizeof(uint32_t)));
+      const size_t seed_words =
+          std::min<size_t>(img.mem_init.size(), img.mem_size_words);
+      if (seed_words > 0)
+        CUDA_CHECK(cudaMemcpy(d_mem[i], img.mem_init.data(),
+                              seed_words * sizeof(uint32_t),
+                              cudaMemcpyHostToDevice));
+    }
+    descs[i] = wvm::VmDesc{d_code[i],
+                           static_cast<uint32_t>(img.code.size()),
+                           d_lit[i],
+                           static_cast<uint32_t>(img.literals.size()),
+                           d_mem[i],
+                           img.mem_size_words};
   }
-  CUDA_CHECK(cudaMalloc(&d_state, sizeof(wvm::VmState)));
-  CUDA_CHECK(cudaMemset(d_state, 0, sizeof(wvm::VmState)));
 
-  wvm::VmKernel<<<1, wvm::kLanes>>>(
-      d_code, static_cast<uint32_t>(code.size()), d_lit,
-      static_cast<uint32_t>(literals.size()), d_state);
+  wvm::VmDesc* d_descs = nullptr;
+  wvm::VmState* d_states = nullptr;
+  CUDA_CHECK(cudaMalloc(&d_descs, n * sizeof(wvm::VmDesc)));
+  CUDA_CHECK(cudaMemcpy(d_descs, descs.data(), n * sizeof(wvm::VmDesc),
+                        cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMalloc(&d_states, n * sizeof(wvm::VmState)));
+  CUDA_CHECK(cudaMemset(d_states, 0, n * sizeof(wvm::VmState)));
+
+  // Warp-aligned geometry: blocks of 8 warps where the VM count allows,
+  // otherwise one warp per block. A VM never straddles a hardware warp.
+  const int block = (n % 8 == 0) ? 256 : 32;
+  const int grid = static_cast<int>(n * wvm::kLanes) / block;
+  wvm::VmArrayKernel<<<grid, block>>>(d_descs, d_states);
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaDeviceSynchronize());
 
-  CUDA_CHECK(cudaMemcpy(&out, d_state, sizeof(wvm::VmState),
+  states.resize(n);
+  CUDA_CHECK(cudaMemcpy(states.data(), d_states, n * sizeof(wvm::VmState),
                         cudaMemcpyDeviceToHost));
-  CUDA_CHECK(cudaFree(d_code));
-  CUDA_CHECK(cudaFree(d_lit));
-  CUDA_CHECK(cudaFree(d_state));
+  mem_out.resize(n);
+  for (size_t i = 0; i < n; ++i) {
+    mem_out[i].resize(images[i].mem_size_words);
+    if (images[i].mem_size_words > 0)
+      CUDA_CHECK(cudaMemcpy(mem_out[i].data(), d_mem[i],
+                            images[i].mem_size_words * sizeof(uint32_t),
+                            cudaMemcpyDeviceToHost));
+  }
+
+  CUDA_CHECK(cudaFree(d_descs));
+  CUDA_CHECK(cudaFree(d_states));
+  for (size_t i = 0; i < n; ++i) {
+    CUDA_CHECK(cudaFree(d_code[i]));
+    CUDA_CHECK(cudaFree(d_lit[i]));
+    CUDA_CHECK(cudaFree(d_mem[i]));
+  }
+  return true;
+}
+
+// Single-VM convenience wrapper used by `run` and the slice-2 self-tests.
+bool ExecProgram(const std::vector<uint32_t>& code,
+                 const std::vector<uint32_t>& literals, wvm::VmState& out) {
+  VmImage img;
+  img.code = code;
+  img.literals = literals;
+  img.mem_size_words = 16384;  // `run` default: 64 KB VM RAM
+  std::vector<wvm::VmState> states;
+  std::vector<std::vector<uint32_t>> mem;
+  if (!ExecVmArray({img}, states, mem)) return false;
+  out = states[0];
   return true;
 }
 
@@ -230,11 +299,108 @@ int RunSlice2() {
   return ok ? 0 : 1;
 }
 
+int RunSlice3() {
+  using wvm::enc_i;
+  using wvm::enc_r;
+  bool ok = true;
+
+  // Program: r0 = mem[0] + delta; mem[1] = r0. 6 words.
+  auto make_prog = [](uint32_t delta) {
+    return std::vector<uint32_t>{
+        enc_i(wvm::kMovI, 0, 1, 0, 0),      // MOV_I r1, 0   (addr)
+        enc_r(wvm::kLoad, 0, 0, 1, 0),      // LOAD  r0, r1
+        enc_i(wvm::kAddI, 0, 0, 0, static_cast<int32_t>(delta)),
+        enc_i(wvm::kMovI, 0, 2, 0, 1),      // MOV_I r2, 1   (addr)
+        enc_r(wvm::kStore, 0, 2, 0, 0),     // STORE r2, r0
+        enc_r(wvm::kHalt, 0, 0, 0, 0),      // HALT
+    };
+  };
+  const std::vector<uint32_t> prog_even = make_prog(7);
+  const std::vector<uint32_t> prog_odd = make_prog(11);
+
+  // ---- 64 VMs, stable IDs, private RAM, distinct programs/data -----------
+  {
+    const uint32_t N = 64;
+    std::vector<VmImage> images(N);
+    for (uint32_t i = 0; i < N; ++i) {
+      images[i].code = (i % 2 == 0) ? prog_even : prog_odd;
+      images[i].mem_size_words = 8;
+      images[i].mem_init = {1000u * i + 5u};
+    }
+    std::vector<wvm::VmState> states;
+    std::vector<std::vector<uint32_t>> mem;
+    ExecVmArray(images, states, mem);
+
+    uint32_t bad = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+      const uint32_t seed = 1000u * i + 5u;
+      const uint32_t delta = (i % 2 == 0) ? 7u : 11u;
+      const wvm::VmState& st = states[i];
+      bool good = st.vm_id == i && st.status == wvm::kHalted &&
+                  st.fault_code == wvm::kFaultOk &&
+                  st.instruction_counter == 6;
+      for (int lane = 0; lane < wvm::kLanes; ++lane)
+        good &= st.vregs[0 * wvm::kLanes + lane] == seed + delta;
+      good &= mem[i][0] == seed && mem[i][1] == seed + delta;
+      for (uint32_t w = 2; w < 8; ++w) good &= mem[i][w] == 0;
+      if (!good) {
+        if (bad < 4)
+          std::printf("  vm %u WRONG: status=%s fault=%s vm_id=%u r0=%u "
+                      "mem[0]=%u mem[1]=%u (want seed=%u delta=%u)\n",
+                      i, wvm::StatusName(st.status),
+                      wvm::FaultName(st.fault_code), st.vm_id,
+                      st.vregs[0], mem[i][0], mem[i][1], seed, delta);
+        ++bad;
+      }
+    }
+    std::printf("  %-22s %s (%u/%u VMs correct)\n", "64vm_independent",
+                bad == 0 ? "PASS" : "FAIL", N - bad, N);
+    ok &= bad == 0;
+  }
+
+  // ---- Fault isolation: VM 5 has 1-word RAM, neighbours must be fine -----
+  {
+    const uint32_t N = 16;
+    const uint32_t bad_vm = 5;
+    std::vector<VmImage> images(N);
+    for (uint32_t i = 0; i < N; ++i) {
+      images[i].code = prog_even;
+      images[i].mem_size_words = (i == bad_vm) ? 1 : 8;
+      images[i].mem_init = {1000u * i + 5u};
+    }
+    std::vector<wvm::VmState> states;
+    std::vector<std::vector<uint32_t>> mem;
+    ExecVmArray(images, states, mem);
+
+    bool isolated = states[bad_vm].status == wvm::kFaulted &&
+                    states[bad_vm].fault_code == wvm::kFaultMem;
+    uint32_t bad = 0;
+    for (uint32_t i = 0; i < N; ++i) {
+      if (i == bad_vm) continue;
+      const uint32_t seed = 1000u * i + 5u;
+      const wvm::VmState& st = states[i];
+      bool good = st.vm_id == i && st.status == wvm::kHalted &&
+                  st.vregs[0 * wvm::kLanes] == seed + 7u &&
+                  mem[i][1] == seed + 7u;
+      if (!good) ++bad;
+    }
+    std::printf("  %-22s %s (vm %u -> %s/%s, %u neighbours disturbed)\n",
+                "fault_isolation", (isolated && bad == 0) ? "PASS" : "FAIL",
+                bad_vm, wvm::StatusName(states[bad_vm].status),
+                wvm::FaultName(states[bad_vm].fault_code), bad);
+    ok &= isolated && bad == 0;
+  }
+
+  std::printf(ok ? "slice3: PASS\n" : "slice3: FAIL\n");
+  return ok ? 0 : 1;
+}
+
 void Usage(const char* argv0) {
   std::printf("usage: %s <command>\n", argv0);
   std::printf("  run <file.wvm>  run a .wvm program on one warp\n");
   std::printf("  slice1          slice-1 warp arithmetic demo\n");
   std::printf("  slice2          slice-2 interpreter self-tests\n");
+  std::printf("  slice3          slice-3 multi-VM independence tests\n");
 }
 
 }  // namespace
@@ -254,6 +420,7 @@ int main(int argc, char** argv) {
   const char* cmd = argv[1];
   if (std::strcmp(cmd, "slice1") == 0) return RunSlice1();
   if (std::strcmp(cmd, "slice2") == 0) return RunSlice2();
+  if (std::strcmp(cmd, "slice3") == 0) return RunSlice3();
   if (std::strcmp(cmd, "run") == 0) {
     if (argc < 3) {
       std::fprintf(stderr, "error: run requires a .wvm file\n");

@@ -1,0 +1,9 @@
+; memory.wva — round-trip a value through VM RAM (slice 3)
+; STORE 99 at word 0, load it back, add 1. Expect r2 = 100.
+
+    MOV_I r0, 99
+    MOV_I r1, 0          ; address
+    STORE r1, r0         ; mem[0] = 99
+    LOAD  r2, r1         ; r2 = mem[0]
+    ADD_I r2, r2, 1
+    HALT

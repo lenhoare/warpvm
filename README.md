@@ -52,7 +52,7 @@ build/runtime/warpvm run hello.wvm
 | 0 | repo skeleton, ISA contract (`docs/isa.md`) | done |
 | 1 | one warp, lane-wise arithmetic + reduction to host | done |
 | 2 | interpreter (MOV/ADD/HALT), Rust assembler/disassembler | done |
-| 3 | many VMs, stable IDs, private RAM | — |
+| 3 | many VMs, stable IDs, private RAM | done |
 | 4 | warp-native ops, stride-32 loops | — |
 | 5 | persistent kernel control plane, `warpvm list` | — |
 | 6 | `warpvm attach`, live inspection | — |

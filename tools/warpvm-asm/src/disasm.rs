@@ -37,6 +37,8 @@ fn render(d: &Decoded, word: u32, literals: &[u32]) -> String {
         isa::OP_ADD => format!("ADD r{}, r{}, r{}", d.rd, d.rs1, d.rs2()),
         isa::OP_MOV_I => format!("MOV_I r{}, #{}", d.rd, d.imm()),
         isa::OP_ADD_I => format!("ADD_I r{}, r{}, #{}", d.rd, d.rs1, d.imm()),
+        isa::OP_LOAD => format!("LOAD r{}, r{}", d.rd, d.rs1),
+        isa::OP_STORE => format!("STORE r{}, r{}", d.rd, d.rs1),
         isa::OP_LDW => {
             let note = literals
                 .get(d.lo as usize)

@@ -20,6 +20,18 @@ struct VmState {
   uint32_t preds[kPredRegs];
 };
 
+// Per-VM execution descriptor: everything a warp needs to run one machine.
+// Keyed by logical VM ID (slot index into the descriptor/state arrays);
+// physical warp/SM placement never appears here.
+struct VmDesc {
+  const uint32_t* code;
+  uint32_t code_len;
+  const uint32_t* literals;
+  uint32_t literals_len;
+  uint32_t* mem;  // private RAM, word-addressed
+  uint32_t mem_size_words;
+};
+
 inline const char* StatusName(uint32_t s) {
   switch (s) {
     case kIdle: return "IDLE";
