@@ -1,9 +1,16 @@
+# ---- SDL2 (host viewer, v0.1.1) -----------------------------------------
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(SDL2 REQUIRED sdl2)
+
 add_executable(warpvm
   src/main.cu
   src/gpu/kernel.cu
+  src/host/view_sdl.cu
 )
 
-target_include_directories(warpvm PRIVATE src)
+target_include_directories(warpvm PRIVATE src ${SDL2_INCLUDE_DIRS})
+target_compile_definitions(warpvm PRIVATE ${SDL2_CFLAGS_OTHER})
+target_link_libraries(warpvm ${SDL2_LIBRARIES})
 
 target_compile_options(warpvm PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-O3 -lineinfo --Werror all-warnings>

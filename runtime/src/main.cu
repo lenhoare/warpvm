@@ -26,6 +26,7 @@
 namespace wvm {
 __global__ void Slice1Kernel(uint32_t* lane_out, uint32_t* sum_out);
 __global__ void VmArrayKernel(const VmDesc* descs, VmState* states);
+int ViewSingleVm(const char* path, uint32_t vm_index);  // host/view_sdl.cu
 }  // namespace wvm
 
 namespace {
@@ -1572,6 +1573,18 @@ int main(int argc, char** argv) {
         n_vms = static_cast<uint32_t>(std::atoi(argv[++i]));
     }
     return RunGfxCap(argv[2], n_vms);
+  }
+  if (std::strcmp(cmd, "view") == 0) {
+    if (argc < 3) {
+      std::fprintf(stderr, "error: view requires a .wvm file\n");
+      return 2;
+    }
+    uint32_t vm_index = 0;
+    for (int i = 3; i < argc; ++i) {
+      if (std::strcmp(argv[i], "--vm") == 0 && i + 1 < argc)
+        vm_index = static_cast<uint32_t>(std::atoi(argv[++i]));
+    }
+    return wvm::ViewSingleVm(argv[2], vm_index);
   }
   if (std::strcmp(cmd, "run") == 0) {
     if (argc < 3) {
