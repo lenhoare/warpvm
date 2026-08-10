@@ -43,11 +43,18 @@ enum ImmRes {
 
 impl Asm {
     fn new() -> Self {
+        // Predefined architectural display constants (v0.1.1). Seeded as
+        // constants but interned into the literal pool only on use.
+        let mut consts: HashMap<String, i64> = HashMap::new();
+        consts.insert("VIDEO_BASE".to_string(), crate::isa::VIDEO_BASE);
+        consts.insert("VIDEO_WIDTH".to_string(), crate::isa::VIDEO_WIDTH);
+        consts.insert("VIDEO_HEIGHT".to_string(), crate::isa::VIDEO_HEIGHT);
+        consts.insert("VIDEO_WORDS".to_string(), crate::isa::VIDEO_WORDS);
         Self {
             code: Vec::new(),
             literals: Vec::new(),
             lit_by_value: HashMap::new(),
-            consts: HashMap::new(),
+            consts,
             labels: HashMap::new(),
             fixups: Vec::new(),
             ldw_refs: Vec::new(),
@@ -475,6 +482,17 @@ impl Asm {
                 }
             }
 
+            // FLIP — publish the framebuffer. Unguardable, no operands.
+            "FLIP" => {
+                if guard != 0 {
+                    return Err(format!("line {line}: FLIP is unguardable"));
+                }
+                if !ops.is_empty() {
+                    return Err(format!("line {line}: FLIP takes no operands"));
+                }
+                self.emit(enc_r(OP_FLIP, 0, 0, 0, 0));
+            }
+
             // SEND rDest, rType, rPayload — lane 0 posts to VM rDest[0].
             "SEND" => {
                 let [rdest, rtype, rpayload] = ops else {
@@ -801,6 +819,33 @@ mod tests {
     #[test]
     fn roundtrip_messaging() {
         let src = "VMID r0\nCMP_EQ p0, r0, #0\nJMP_IF_ANY p0, done\nSEND r1, r2, r3\ndone:\nTRY_RECV p1, r4, r5\nHALT\n";
+        let a = assemble(src).unwrap();
+        let text = disasm::disassemble(&a.code, &a.literals);
+        let b = assemble(&text).expect("re-assemble failed");
+        assert_eq!(a.code, b.code);
+        assert_eq!(a.literals, b.literals);
+    }
+
+    #[test]
+    fn flip_encodes_and_rejects_guard() {
+        let a = assemble("FLIP\nHALT\n").unwrap();
+        assert_eq!(a.code[0], enc_r(OP_FLIP, 0, 0, 0, 0));
+        assert!(assemble("@p0 FLIP\nHALT\n").is_err());
+    }
+
+    #[test]
+    fn predefined_video_symbols() {
+        // VIDEO_BASE (0x00100000) exceeds the 13-bit immediate -> materialised.
+        let a = assemble("MOV_I r0, VIDEO_BASE\nHALT\n").unwrap();
+        assert!(a.literals.contains(&0x00100000));
+        // VIDEO_WIDTH (128) fits inline.
+        let b = assemble("MOV_I r0, VIDEO_WIDTH\nHALT\n").unwrap();
+        assert_eq!(b.code[0], enc_i(OP_MOV_I, 0, 0, 0, 128));
+    }
+
+    #[test]
+    fn roundtrip_flip() {
+        let src = "MOV_I r0, VIDEO_BASE\nFLIP\nHALT\n";
         let a = assemble(src).unwrap();
         let text = disasm::disassemble(&a.code, &a.literals);
         let b = assemble(&text).expect("re-assemble failed");

@@ -51,6 +51,7 @@ struct Control {
   volatile uint32_t pc[kMaxVms];
   volatile uint64_t instrs[kMaxVms];
   volatile uint32_t seq[kMaxVms];    // bumped by the warp on each completed step
+  volatile uint32_t frame_seq[kMaxVms];  // bumped by FLIP (frame publication)
   volatile uint32_t log_head;        // total entries appended
   LogEntry log[kLogCapacity];        // ring buffer
 };

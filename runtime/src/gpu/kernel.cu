@@ -40,12 +40,19 @@ __device__ static void InitVmCtx(VmCtx& ctx, const VmDesc& d, uint32_t vm_id,
   ctx.literals_len = d.literals_len;
   ctx.mem = d.mem;
   ctx.mem_size_words = d.mem_size_words;
+  ctx.fb = d.fb;
   ctx.vm_id = vm_id;
   ctx.lane = lane;
   ctx.mailboxes = mailboxes;
   ctx.num_vms = num_vms;
   // Deterministic per-VM rng seed; a later slice may let the host set it.
   ctx.rng_state = vm_id * 0x9E3779B9u + 0x1234567u;
+  // Reset clears only this VM's framebuffer to opaque black. All 32 lanes
+  // cooperate on the clear (reset is not a hot path).
+  if (ctx.fb != nullptr) {
+    for (uint32_t i = lane; i < kVideoWords; i += kLanes)
+      ctx.fb[i] = kVideoResetColor;
+  }
 }
 
 __global__ void VmArrayKernel(const VmDesc* descs, VmState* states) {

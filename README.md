@@ -90,6 +90,10 @@ vm-0> quit
 | 6 | `warpvm attach`, live inspection, single-step | done |
 | 7 | messaging (`SEND`/`TRY_RECV`, mailboxes) | done |
 | ★ | **v0.1 demo**: 64 resident VMs compute + ring-message + stay live | done |
+| gfx-A | framebuffer memory: memory-mapped `LOAD`/`STORE`, reset-clear, isolation | done |
+| gfx-B | `FLIP` publication + `frame_seq`, predefined `VIDEO_*` symbols | done |
+| gfx-C | headless host-copy (`gfxsmoke`), attach `frame`/`pixel` | done |
+| gfx-★ | **v0.1.1 capstone**: 64 VMs render distinct animated 128×128 images | done |
 
 ## v0.1 milestone
 

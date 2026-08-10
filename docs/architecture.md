@@ -109,6 +109,30 @@ race window (a receiver could read a slot a sender is still filling). v0.1
 accepts this for cooperative traffic; a two-phase commit or per-slot flag is a
 later hardening if messaging becomes load-bearing.
 
+## Graphics (v0.1.1)
+
+Each VM owns a 128×128×32-bit framebuffer (16,384 words). Physical storage is
+one flat device allocation (`num_vms × kVideoWords`), exposed logically
+through a fixed memory-mapped region (`VIDEO_BASE = 0x00100000`) decoded in
+`LOAD`/`STORE`. The ABI never reveals the physical layout.
+
+- **Drawing is warp-native**: per-lane addresses let one predicated `STORE`
+  write up to 32 pixels. No `DRAW`/`PIXEL` opcode exists — pixels are memory.
+- **Publication**: `FLIP` bumps the VM's `frame_seq` (in the mapped Control
+  block, like `status`/`instrs`) exactly once, non-blockingly. The host polls
+  `frame_seq` to find new frames. No double buffering in v0.1.1 — a host copy
+  may observe early next-frame writes (acceptable; tearing is a later concern).
+- **Reset clears only the reset VM's framebuffer** to opaque black; the clear
+  runs device-side in `InitVmCtx` (all 32 lanes cooperate). Pause/resume
+  preserves contents.
+- **Inspection**: `ReadFramebuffer` copies a VM's framebuffer to the host
+  (`cudaMemcpy` on the non-blocking stream, so it doesn't deadlock against the
+  resident kernel). The attach console gains `frame` (resolution/format/seq)
+  and `pixel <x> <y>`.
+- **Presentation is a host concern** (windows, scaling, grids) and stays out
+  of the ISA. The SDL window viewer is deferred; the automated path is
+  headless (assemble → `.wvm` → resident runtime → host copy → pixel checks).
+
 ## Scheduling
 
 Logical `vm_id` is stable; physical warp/SM placement is not part of VM

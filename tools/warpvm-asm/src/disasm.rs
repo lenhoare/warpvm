@@ -180,6 +180,7 @@ fn render(d: &Decoded, literals: &[u32]) -> Option<String> {
 
         isa::OP_LOG => format!("LOG {}, {}", vreg(d.rs1), vreg(d.rs2())),
         isa::OP_LOG_I => format!("LOG_I {}, #{}", vreg(d.rs1), d.imm()),
+        isa::OP_FLIP => "FLIP".to_string(),
 
         isa::OP_SEND => format!("SEND {}, {}, {}", vreg(d.rd), vreg(d.rs1), vreg(d.rs2())),
         isa::OP_TRY_RECV => {

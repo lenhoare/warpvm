@@ -189,8 +189,16 @@ the guarded write rule applies to `rd` as usual.
 
 ### 4.5 Memory
 
-Addresses are **word indices** into the VM's private RAM
-(`0 … mem_size_words − 1`). Per-lane, potentially scattered.
+Addresses are **word indices**. `LOAD`/`STORE` decode an address as:
+
+```text
+if addr < ram_size_words:                 access private RAM
+else if VIDEO_BASE <= addr < VIDEO_END:   access this VM's framebuffer
+else:                                     FAULT_MEM
+```
+
+Per-lane, potentially scattered. Private-RAM addresses are `0 …
+mem_size_words − 1`.
 
 | Op | Name | Form | Semantics |
 |---|---|---|---|
@@ -199,15 +207,41 @@ Addresses are **word indices** into the VM's private RAM
 
 Out-of-range access by any active lane faults the whole VM (`FAULT_MEM`).
 
+#### Architectural display (v0.1.1)
+
+Every VM owns one fixed framebuffer, memory-mapped into its logical address
+space and accessed with the ordinary `LOAD`/`STORE` above (no special pixel
+opcodes). One pixel is one ordinary 32-bit word `0xAARRGGBB`.
+
+```text
+VIDEO_BASE = 0x00100000   (word address)
+VIDEO_WIDTH = VIDEO_HEIGHT = 128
+VIDEO_WORDS = 16384
+VIDEO_END  = VIDEO_BASE + VIDEO_WORDS
+```
+
+Pixel `(x, y)` is at `VIDEO_BASE + y*128 + x`. Because each lane may supply a
+different address, a single predicated `STORE` writes up to 32 pixels in
+parallel. On reset the framebuffer is cleared to `0xFF000000` (opaque black);
+pause/resume preserves it. Presentation is a host concern (see `FLIP`).
+
 ### 4.6 Logging / runtime services
 
 | Op | Name | Form | Semantics |
 |---|---|---|---|
 | 0x58 | `LOG`   | R | append `{vm_id, tag=rs2[0], value=rs1[0]}` to the VM log ring |
 | 0x59 | `LOG_I` | I | append `{vm_id, tag=imm, value=rs1[0]}` to the VM log ring |
+| 0x5A | `FLIP`  | R | publish the framebuffer (v0.1.1) |
 
 The log ring lives in host-visible memory; writes are fire-and-forget and
 may drop entries when full.
+
+`FLIP` (v0.1.1) publishes the current framebuffer: all stores retired before
+it belong to the published frame, lane 0 increments the VM's `frame_seq`
+exactly once, and execution continues without blocking on the host renderer.
+`FLIP` is **unguardable** — a non-default guard faults (`FAULT_OPERAND`) — so a
+publication is always a single warp-uniform event. The host watches
+`frame_seq` to detect newer frames. There is no double buffering in v0.1.1.
 
 ### 4.7 Messaging
 

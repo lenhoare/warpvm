@@ -136,6 +136,7 @@ inline std::string DisasmWord(uint32_t word,
     }
     case kLog: body = "LOG " + vreg(rs1) + ", " + vreg(rs2); break;
     case kLogI: body = "LOG_I " + vreg(rs1) + ", #" + std::to_string(imm); break;
+    case kFlip: body = "FLIP"; break;
 
     case kSMov:
       if (!sreg_ok(rd) || !sreg_ok(rs1)) return ".word 0x" + std::to_string(word);

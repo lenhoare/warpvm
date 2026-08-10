@@ -1,0 +1,61 @@
+; graphics.wva — v0.1.1 graphics capstone (animated, warp-native).
+;
+; Each VM fills its whole 128x128 framebuffer with 32-lane stores (32 pixels
+; per STORE), computing the colour algorithmically from x, y, VMID and a frame
+; counter, then FLIPs and redraws forever. Because the colour depends on VMID,
+; every VM's display is visibly distinct in a grid.
+;
+; colour(x, y) = 0xFF000000
+;              | ((x + vmid*4) & 0xFF) << 16     ; red   (per-VM hue shift)
+;              | (y & 0xFF)          << 8        ; green (vertical gradient)
+;              | (frame & 0xFF)                  ; blue  (animates over time)
+;
+; vmid*4 spans 0..252 across 64 VMs, so every VM's red hue is distinct.
+;
+; Run:  warpvm-as graphics.wva -o graphics.wvm
+;       warpvm view/serve/attach graphics.wvm --vms 64
+
+.const ALPHA 0xFF000000
+
+start:
+    MOV_I r9, VIDEO_BASE      ; r9 = framebuffer base (materialised once)
+    MOV_I r10, ALPHA          ; r10 = opaque alpha
+    S_MOV_I s2, 0             ; s2 = frame counter
+
+frame_loop:
+    S_MOV_I s0, 0             ; s0 = iteration (0..511), 32 pixels each
+
+scanline:
+    S_BCAST r0, s0
+    SHL_I r0, r0, 5           ; r0 = iteration * 32  (pixel base)
+    LANEID r1
+    ADD r2, r0, r1            ; r2 = pixel index = base + lane
+
+    AND_I r3, r2, 127         ; r3 = x = index & 127
+    SHR_I r4, r2, 7           ; r4 = y = index >> 7
+
+    VMID r5
+    SHL_I r5, r5, 2           ; vmid * 4
+    ADD r5, r3, r5            ; x + vmid*4
+    AND_I r5, r5, 255
+    SHL_I r5, r5, 16          ; red channel
+
+    AND_I r6, r4, 255
+    SHL_I r6, r6, 8           ; green channel
+    OR r5, r5, r6
+
+    S_BCAST r6, s2
+    AND_I r6, r6, 255
+    OR r5, r5, r6             ; blue channel = frame
+    OR r5, r5, r10            ; alpha
+
+    ADD r8, r9, r2            ; r8 = VIDEO_BASE + index
+    STORE r8, r5              ; 32 lanes write 32 pixels
+
+    S_ADD_I s0, s0, 1
+    S_CMP_LT_I p0, s0, 512    ; 512 iterations * 32 = 16384 pixels
+    JMP_IF_ANY p0, scanline
+
+    FLIP                      ; publish the frame
+    S_ADD_I s2, s2, 1         ; frame++
+    JMP frame_loop            ; animate forever

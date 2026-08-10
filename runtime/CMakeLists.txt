@@ -32,6 +32,8 @@ add_test(NAME slice3_multi_vm COMMAND warpvm slice3)
 add_test(NAME slice4_warp_control COMMAND warpvm slice4)
 add_test(NAME slice5_control_plane COMMAND warpvm slice5)
 add_test(NAME slice7_messaging COMMAND warpvm slice7)
+add_test(NAME gfxa_framebuffer COMMAND warpvm gfxa)
+add_test(NAME gfxb_flip COMMAND warpvm gfxb)
 
 add_test(NAME pipeline_hello
   COMMAND bash ${CMAKE_SOURCE_DIR}/tests/pipeline.sh
@@ -63,3 +65,13 @@ add_test(NAME v01_demo
           ${WVM_AS} $<TARGET_FILE:warpvm>
           ${CMAKE_SOURCE_DIR}/programs/demo.wva
           ${CMAKE_BINARY_DIR}/demo)
+add_test(NAME gfx_viewer_smoke
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gfx_viewer_smoke.sh
+          ${WVM_AS} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/programs/graphics.wva
+          ${CMAKE_BINARY_DIR}/gfxsmoke)
+add_test(NAME gfx_capstone
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gfx_cap.sh
+          ${WVM_AS} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/programs/graphics.wva
+          ${CMAKE_BINARY_DIR}/gfxcap)

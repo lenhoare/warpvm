@@ -57,6 +57,15 @@ class PersistentRuntime {
     d_code_.assign(num_vms_, nullptr);
     d_lit_.assign(num_vms_, nullptr);
     d_mem_.assign(num_vms_, nullptr);
+    // One flat framebuffer pool; VM i owns words [i*kVideoWords, (i+1)*...).
+    if (cudaMalloc(reinterpret_cast<void**>(&d_framebuffers_),
+                   static_cast<size_t>(num_vms_) * kVideoWords *
+                       sizeof(uint32_t)) != cudaSuccess) {
+      err = "cudaMalloc framebuffers failed";
+      return false;
+    }
+    cudaMemset(d_framebuffers_, 0,
+               static_cast<size_t>(num_vms_) * kVideoWords * sizeof(uint32_t));
     std::vector<VmDesc> descs(num_vms_);
 
     for (uint32_t i = 0; i < num_vms_; ++i) {
@@ -88,7 +97,8 @@ class PersistentRuntime {
                         d_lit_[i],
                         static_cast<uint32_t>(img.literals.size()),
                         d_mem_[i],
-                        img.mem_size_words};
+                        img.mem_size_words,
+                        d_framebuffers_ + static_cast<size_t>(i) * kVideoWords};
     }
 
     if (cudaMalloc(reinterpret_cast<void**>(&d_descs_),
@@ -192,6 +202,15 @@ class PersistentRuntime {
   const std::vector<uint32_t>& Literals(uint32_t vm) const {
     return h_images_[vm].literals;
   }
+  // Copy a VM's entire framebuffer (kVideoWords words) to the host.
+  bool ReadFramebuffer(uint32_t vm, std::vector<uint32_t>& out) const {
+    if (vm >= num_vms_ || d_framebuffers_ == nullptr) return false;
+    out.resize(kVideoWords);
+    return cudaMemcpy(out.data(),
+                      d_framebuffers_ + static_cast<size_t>(vm) * kVideoWords,
+                      kVideoWords * sizeof(uint32_t),
+                      cudaMemcpyDeviceToHost) == cudaSuccess;
+  }
 
   // ---- status reads (mapped memory, no sync needed) -----------------------
   uint32_t num_vms() const { return num_vms_; }
@@ -199,6 +218,7 @@ class PersistentRuntime {
   uint32_t Fault(uint32_t vm) const { return h_ctrl_->fault[vm]; }
   uint32_t Pc(uint32_t vm) const { return h_ctrl_->pc[vm]; }
   uint64_t Instrs(uint32_t vm) const { return h_ctrl_->instrs[vm]; }
+  uint32_t FrameSeq(uint32_t vm) const { return h_ctrl_->frame_seq[vm]; }
 
   bool WaitStatus(uint32_t vm, uint32_t want, int timeout_ms) {
     for (int waited = 0; waited < timeout_ms; waited += 1) {
@@ -229,6 +249,7 @@ class PersistentRuntime {
     if (d_descs_) cudaFree(d_descs_), d_descs_ = nullptr;
     if (d_states_) cudaFree(d_states_), d_states_ = nullptr;
     if (d_mailboxes_) cudaFree(d_mailboxes_), d_mailboxes_ = nullptr;
+    if (d_framebuffers_) cudaFree(d_framebuffers_), d_framebuffers_ = nullptr;
     for (auto p : d_code_) cudaFree(p);
     for (auto p : d_lit_) cudaFree(p);
     for (auto p : d_mem_) cudaFree(p);
@@ -246,6 +267,7 @@ class PersistentRuntime {
   VmDesc* d_descs_ = nullptr;
   VmState* d_states_ = nullptr;
   Mailbox* d_mailboxes_ = nullptr;
+  uint32_t* d_framebuffers_ = nullptr;  // flat pool: num_vms_ * kVideoWords
   std::vector<uint32_t*> d_code_, d_lit_, d_mem_;
   std::vector<VmImage> h_images_;
   cudaStream_t stream_ = nullptr;

@@ -368,6 +368,8 @@ int CmdAttach(const char* path, uint32_t n_vms) {
       std::printf("  reset                reset current VM\n");
       std::printf("  regs | sregs | preds register dumps (pause first)\n");
       std::printf("  pc                   program counter + current instr\n");
+      std::printf("  frame                display resolution/format/frame_seq\n");
+      std::printf("  pixel <x> <y>        read one framebuffer word\n");
       std::printf("  disasm [start] [n]   disassemble around pc\n");
       std::printf("  mem <addr> <count>   dump VM RAM words\n");
       std::printf("  log [n]              recent log entries\n");
@@ -447,6 +449,25 @@ int CmdAttach(const char* path, uint32_t n_vms) {
           std::printf(" %10u", words[j]);
         std::printf("\n");
       }
+    } else if (c == "frame") {
+      std::printf("resolution=%ux%u\n", wvm::kVideoWidth, wvm::kVideoHeight);
+      std::printf("format=ARGB8888\n");
+      std::printf("frame_seq=%u\n", rt.FrameSeq(cur));
+    } else if (c == "pixel") {
+      if (tok.size() < 3) { std::printf("usage: pixel <x> <y>\n"); continue; }
+      const uint32_t x = static_cast<uint32_t>(std::atoi(tok[1].c_str()));
+      const uint32_t y = static_cast<uint32_t>(std::atoi(tok[2].c_str()));
+      if (x >= wvm::kVideoWidth || y >= wvm::kVideoHeight) {
+        std::printf("pixel out of range\n");
+        continue;
+      }
+      std::vector<uint32_t> fb;
+      if (!rt.ReadFramebuffer(cur, fb)) {
+        std::printf("framebuffer read failed\n");
+        continue;
+      }
+      const uint32_t v = fb[y * wvm::kVideoWidth + x];
+      std::printf("pixel(%u,%u) = 0x%08x\n", x, y, v);
     } else if (c == "log") {
       const int n = tok.size() >= 2 ? std::atoi(tok[1].c_str()) : 16;
       const wvm::LogSnapshot snap = rt.ReadLog();
@@ -957,6 +978,454 @@ int RunSlice7() {
   return ok ? 0 : 1;
 }
 
+// v0.1.1 Graphics Slice A: framebuffer memory. Verifies the memory-mapped
+// framebuffer through the extended address decoder: 32-lane + predicated
+// stores, isolation between VMs, bounds faults, RAM compatibility, reset.
+int RunSliceGfxA() {
+  using wvm::enc_i;
+  using wvm::enc_r;
+  bool ok = true;
+  auto wait_stopped = [](wvm::PersistentRuntime& rt, uint32_t n) -> bool {
+    for (int waited = 0; waited < 5000; ++waited) {
+      bool done = true;
+      for (uint32_t i = 0; i < n; ++i) {
+        const uint32_t s = rt.Status(i);
+        if (s != wvm::kHalted && s != wvm::kFaulted) {
+          done = false;
+          break;
+        }
+      }
+      if (done) return true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return false;
+  };
+
+  const uint32_t LIT_BASE = 0;  // literal 0 = VIDEO_BASE_WORD
+  const uint32_t LIT_OPAQUE = 1;
+
+  // ---- 32-lane store + isolation: each VM paints row 0 its own colour ----
+  {
+    const std::vector<uint32_t> lits = {wvm::kVideoBaseWord, 0xFF000000u};
+    const std::vector<uint32_t> prog = {
+        enc_i(wvm::kLdw, 0, 2, 0, LIT_BASE),      // r2 = VIDEO_BASE
+        enc_i(wvm::kLdw, 0, 4, 0, LIT_OPAQUE),    // r4 = 0xFF000000
+        enc_r(wvm::kVmid, 0, 0, 0, 0),            // r0 = vm_id
+        enc_r(wvm::kLaneId, 0, 1, 0, 0),          // r1 = lane
+        enc_r(wvm::kAdd, 0, 2, 2, 1),             // r2 = VIDEO_BASE + lane
+        enc_i(wvm::kMovI, 0, 3, 0, 1),            // r3 = 1
+        enc_r(wvm::kAdd, 0, 3, 3, 0),             // r3 = vm_id + 1
+        enc_r(wvm::kOr, 0, 3, 3, 4),              // r3 = 0xFF000000|(vm_id+1)
+        enc_r(wvm::kStore, 0, 2, 3, 0),           // fb[lane] = colour
+        enc_r(wvm::kHalt, 0, 0, 0, 0),
+    };
+    const uint32_t N = 4;
+    std::vector<wvm::VmImage> images(N);
+    for (uint32_t i = 0; i < N; ++i) {
+      images[i].code = prog;
+      images[i].literals = lits;
+      images[i].mem_size_words = 8;
+    }
+    wvm::PersistentRuntime rt;
+    std::string err;
+    bool pass = rt.Init(images, err) && rt.Launch(err);
+    if (pass) {
+      rt.BootAll();
+      pass = wait_stopped(rt, N);
+      for (uint32_t i = 0; i < N && pass; ++i) {
+        std::vector<uint32_t> fb;
+        if (!rt.ReadFramebuffer(i, fb)) {
+          pass = false;
+          break;
+        }
+        const uint32_t expect = 0xFF000000u | (i + 1);
+        for (uint32_t x = 0; x < 32; ++x)
+          if (fb[x] != expect) pass = false;        // 32-lane store
+        for (uint32_t p = 32; p < wvm::kVideoWords; ++p)
+          if (fb[p] != wvm::kVideoResetColor) pass = false;  // isolation/clear
+      }
+    }
+    std::printf("  %-22s %s\n", "framebuffer_isolation", pass ? "PASS" : "FAIL");
+    ok &= pass;
+    rt.ShutdownAll();
+    rt.Sync();
+  }
+
+  // ---- predicated store: only lanes 0..15 write ----
+  {
+    const std::vector<uint32_t> lits = {wvm::kVideoBaseWord, 0xFFFFFFFFu};
+    const std::vector<uint32_t> prog = {
+        enc_i(wvm::kLdw, 0, 2, 0, LIT_BASE),      // r2 = VIDEO_BASE
+        enc_i(wvm::kLdw, 0, 3, 0, LIT_OPAQUE),    // r3 = white
+        enc_r(wvm::kLaneId, 0, 1, 0, 0),          // r1 = lane
+        enc_r(wvm::kAdd, 0, 2, 2, 1),             // r2 = VIDEO_BASE + lane
+        enc_i(wvm::kCmpLtI, 0, 0, 1, 16),         // p0 = lane < 16
+        enc_r(wvm::kStore, 1, 2, 3, 0),           // @p0 STORE fb[lane]=white
+        enc_r(wvm::kHalt, 0, 0, 0, 0),
+    };
+    std::vector<wvm::VmImage> images(1);
+    images[0].code = prog;
+    images[0].literals = lits;
+    images[0].mem_size_words = 8;
+    wvm::PersistentRuntime rt;
+    std::string err;
+    bool pass = rt.Init(images, err) && rt.Launch(err);
+    if (pass) {
+      rt.BootAll();
+      pass = wait_stopped(rt, 1);
+      std::vector<uint32_t> fb;
+      if (pass && rt.ReadFramebuffer(0, fb)) {
+        for (uint32_t x = 0; x < 16; ++x)
+          if (fb[x] != 0xFFFFFFFFu) pass = false;         // active lanes wrote
+        for (uint32_t x = 16; x < 32; ++x)
+          if (fb[x] != wvm::kVideoResetColor) pass = false;  // inactive untouched
+      } else {
+        pass = false;
+      }
+    }
+    std::printf("  %-22s %s\n", "predicated_pixel_store", pass ? "PASS" : "FAIL");
+    ok &= pass;
+    rt.ShutdownAll();
+    rt.Sync();
+  }
+
+  // ---- bounds fault at VIDEO_END_WORD; neighbour unaffected ----
+  {
+    const std::vector<uint32_t> lits = {wvm::kVideoEndWord};
+    const std::vector<uint32_t> prog = {
+        enc_r(wvm::kVmid, 0, 0, 0, 0),            // r0 = vm_id
+        enc_i(wvm::kCmpEqI, 0, 0, 0, 0),          // p0 = (vm_id == 0)
+        enc_i(wvm::kJmpIfAny, 1, 0, 0, 4),        // -> dofault(4)
+        enc_r(wvm::kHalt, 0, 0, 0, 0),            // other VMs halt
+        enc_i(wvm::kLdw, 0, 2, 0, 0),             // dofault: r2 = VIDEO_END
+        enc_i(wvm::kMovI, 0, 3, 0, 0),            // r3 = 0
+        enc_r(wvm::kStore, 0, 2, 3, 0),           // STORE at VIDEO_END -> fault
+        enc_r(wvm::kHalt, 0, 0, 0, 0),
+    };
+    std::vector<wvm::VmImage> images(2);
+    for (uint32_t i = 0; i < 2; ++i) {
+      images[i].code = prog;
+      images[i].literals = lits;
+      images[i].mem_size_words = 8;
+    }
+    wvm::PersistentRuntime rt;
+    std::string err;
+    bool pass = rt.Init(images, err) && rt.Launch(err);
+    if (pass) {
+      rt.BootAll();
+      pass = wait_stopped(rt, 2);
+      pass &= rt.Status(0) == wvm::kFaulted && rt.Fault(0) == wvm::kFaultMem;
+      pass &= rt.Status(1) == wvm::kHalted;  // neighbour unaffected
+    }
+    std::printf("  %-22s %s\n", "video_bounds_fault", pass ? "PASS" : "FAIL");
+    ok &= pass;
+    rt.ShutdownAll();
+    rt.Sync();
+  }
+
+  // ---- RAM compatibility: ordinary RAM still works ----
+  {
+    const std::vector<uint32_t> prog = {
+        enc_i(wvm::kMovI, 0, 0, 0, 5),   // r0 = 5
+        enc_i(wvm::kMovI, 0, 1, 0, 0),   // r1 = addr 0
+        enc_r(wvm::kStore, 0, 1, 0, 0),  // mem[0] = 5
+        enc_r(wvm::kLoad, 0, 2, 1, 0),   // r2 = mem[0]
+        enc_r(wvm::kHalt, 0, 0, 0, 0),
+    };
+    std::vector<wvm::VmImage> images(1);
+    images[0].code = prog;
+    images[0].mem_size_words = 8;
+    wvm::PersistentRuntime rt;
+    std::string err;
+    bool pass = rt.Init(images, err) && rt.Launch(err);
+    if (pass) {
+      rt.BootAll();
+      pass = wait_stopped(rt, 1);
+      std::vector<uint32_t> mem;
+      if (pass && rt.ReadMem(0, 0, 1, mem)) pass = !mem.empty() && mem[0] == 5;
+      else pass = false;
+    }
+    std::printf("  %-22s %s\n", "ram_compatibility", pass ? "PASS" : "FAIL");
+    ok &= pass;
+    rt.ShutdownAll();
+    rt.Sync();
+  }
+
+  // ---- reset clears only the reset VM's framebuffer ----
+  {
+    const std::vector<uint32_t> lits = {wvm::kVideoBaseWord, 0xAABBCCDDu};
+    const std::vector<uint32_t> prog = {
+        enc_i(wvm::kLdw, 0, 2, 0, LIT_BASE),     // r2 = VIDEO_BASE
+        enc_i(wvm::kLdw, 0, 3, 0, LIT_OPAQUE),   // r3 = 0xAABBCCDD
+        enc_r(wvm::kLaneId, 0, 1, 0, 0),         // r1 = lane
+        enc_r(wvm::kAdd, 0, 2, 2, 1),            // r2 = VIDEO_BASE + lane
+        enc_r(wvm::kStore, 0, 2, 3, 0),          // fb[lane] = 0xAABBCCDD
+        enc_r(wvm::kHalt, 0, 0, 0, 0),
+    };
+    std::vector<wvm::VmImage> images(2);
+    for (uint32_t i = 0; i < 2; ++i) {
+      images[i].code = prog;
+      images[i].literals = lits;
+      images[i].mem_size_words = 8;
+    }
+    wvm::PersistentRuntime rt;
+    std::string err;
+    bool pass = rt.Init(images, err) && rt.Launch(err);
+    if (pass) {
+      rt.BootAll();
+      pass = wait_stopped(rt, 2);
+      // Reset VM 0 only.
+      rt.SendCmd(0, wvm::kCmdReset);
+      bool idle = false;
+      for (int w = 0; w < 2000; ++w) {
+        if (rt.Status(0) == wvm::kIdle) { idle = true; break; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      pass &= idle;
+      std::vector<uint32_t> fb0, fb1;
+      if (pass && rt.ReadFramebuffer(0, fb0) && rt.ReadFramebuffer(1, fb1)) {
+        for (uint32_t p = 0; p < wvm::kVideoWords; ++p)
+          if (fb0[p] != wvm::kVideoResetColor) pass = false;  // VM0 cleared
+        for (uint32_t x = 0; x < 32; ++x)
+          if (fb1[x] != 0xAABBCCDDu) pass = false;  // VM1 untouched
+      } else {
+        pass = false;
+      }
+    }
+    std::printf("  %-22s %s\n", "reset_clears_fb", pass ? "PASS" : "FAIL");
+    ok &= pass;
+    rt.ShutdownAll();
+    rt.Sync();
+  }
+
+  std::printf(ok ? "gfxA: PASS\n" : "gfxA: FAIL\n");
+  return ok ? 0 : 1;
+}
+
+// v0.1.1 Graphics Slice B: frame publication. FLIP bumps frame_seq exactly
+// once per retired FLIP; FLIP is unguardable.
+int RunSliceGfxB() {
+  using wvm::enc_i;
+  using wvm::enc_r;
+  bool ok = true;
+  auto wait_stopped = [](wvm::PersistentRuntime& rt, uint32_t n) -> bool {
+    for (int waited = 0; waited < 5000; ++waited) {
+      bool done = true;
+      for (uint32_t i = 0; i < n; ++i) {
+        const uint32_t s = rt.Status(i);
+        if (s != wvm::kHalted && s != wvm::kFaulted) {
+          done = false;
+          break;
+        }
+      }
+      if (done) return true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return false;
+  };
+
+  // ---- flip_sequence: frame_seq advances exactly once per FLIP ----
+  {
+    const std::vector<uint32_t> prog = {
+        enc_r(wvm::kFlip, 0, 0, 0, 0),     // frame_seq -> 1
+        enc_r(wvm::kFlip, 0, 0, 0, 0),     // -> 2
+        enc_i(wvm::kMovI, 0, 0, 0, 5),     // (work between flips)
+        enc_r(wvm::kFlip, 0, 0, 0, 0),     // -> 3
+        enc_r(wvm::kHalt, 0, 0, 0, 0),
+    };
+    std::vector<wvm::VmImage> images(1);
+    images[0].code = prog;
+    images[0].mem_size_words = 8;
+    wvm::PersistentRuntime rt;
+    std::string err;
+    bool pass = rt.Init(images, err) && rt.Launch(err);
+    if (pass) {
+      rt.BootAll();
+      pass = wait_stopped(rt, 1);
+      pass &= rt.Status(0) == wvm::kHalted && rt.FrameSeq(0) == 3;
+    }
+    std::printf("  %-22s %s (frame_seq=%u)\n", "flip_sequence",
+                pass ? "PASS" : "FAIL", rt.FrameSeq(0));
+    ok &= pass;
+    rt.ShutdownAll();
+    rt.Sync();
+  }
+
+  // ---- flip_unguardable: a guarded FLIP faults with FAULT_OPERAND ----
+  {
+    const std::vector<uint32_t> prog = {
+        enc_r(wvm::kFlip, 1, 0, 0, 0),   // @p0 FLIP -> FAULT_OPERAND
+        enc_r(wvm::kHalt, 0, 0, 0, 0),
+    };
+    std::vector<wvm::VmImage> images(1);
+    images[0].code = prog;
+    images[0].mem_size_words = 8;
+    wvm::PersistentRuntime rt;
+    std::string err;
+    bool pass = rt.Init(images, err) && rt.Launch(err);
+    if (pass) {
+      rt.BootAll();
+      pass = wait_stopped(rt, 1);
+      pass &= rt.Status(0) == wvm::kFaulted &&
+              rt.Fault(0) == wvm::kFaultOperand;
+    }
+    std::printf("  %-22s %s\n", "flip_unguardable", pass ? "PASS" : "FAIL");
+    ok &= pass;
+    rt.ShutdownAll();
+    rt.Sync();
+  }
+
+  std::printf(ok ? "gfxB: PASS\n" : "gfxB: FAIL\n");
+  return ok ? 0 : 1;
+}
+
+// v0.1.1 viewer smoke test (headless, SDL-free): run a graphics program on
+// one resident VM, wait for a published frame, copy the framebuffer to the
+// host and check sample pixels. graphics.wva paints
+// colour = 0xFF000000 | ((x+vmid*4)&0xFF)<<16 | (y&0xFF)<<8 | (frame&0xFF);
+// the red/green channels are frame-independent, so masking out blue gives a
+// deterministic check even though the image is animating.
+int RunGfxSmoke(const char* path) {
+  wvm::WvmFile file;
+  std::string err;
+  if (!wvm::LoadWvm(path, file, err)) {
+    std::fprintf(stderr, "error: %s: %s\n", path, err.c_str());
+    return 2;
+  }
+  std::vector<wvm::VmImage> images(1);
+  images[0].code = file.code;
+  images[0].literals = file.literals;
+  images[0].mem_size_words = 8;
+  wvm::PersistentRuntime rt;
+  if (!rt.Init(images, err) || !rt.Launch(err)) {
+    std::fprintf(stderr, "error: %s\n", err.c_str());
+    return 1;
+  }
+  rt.BootAll();
+
+  // Wait for at least one published frame.
+  bool published = false;
+  for (int w = 0; w < 5000; ++w) {
+    if (rt.FrameSeq(0) >= 1) {
+      published = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  bool pass = published;
+  if (pass) {
+    std::vector<uint32_t> fb;
+    pass = rt.ReadFramebuffer(0, fb);
+    if (pass) {
+      auto masked = [&](uint32_t x, uint32_t y) -> uint32_t {
+        return fb[y * wvm::kVideoWidth + x] & 0xFFFFFF00u;
+      };
+      const uint32_t vmid = 0;
+      const uint32_t e00 = 0xFF000000u | (((0 + vmid * 4) & 0xFF) << 16);
+      const uint32_t eX0 = 0xFF000000u | (((127 + vmid * 4) & 0xFF) << 16);
+      const uint32_t e0Y = 0xFF000000u | ((127 & 0xFF) << 8);
+      pass &= masked(0, 0) == e00;
+      pass &= masked(127, 0) == eX0;
+      pass &= masked(0, 127) == e0Y;
+    }
+  }
+  std::printf("viewer_smoke: %s (frame_seq=%u)\n", pass ? "PASS" : "FAIL",
+              rt.FrameSeq(0));
+  rt.ShutdownAll();
+  rt.Sync();
+  return pass ? 0 : 1;
+}
+
+// v0.1.1 graphics capstone: run N resident VMs on graphics.wvm, each
+// producing a VMID-distinct 128x128 image via 32-lane stores + FLIP, and
+// verify every framebuffer (via host copy) is correct and distinct.
+int RunGfxCap(const char* path, uint32_t n_vms) {
+  wvm::WvmFile file;
+  std::string err;
+  if (!wvm::LoadWvm(path, file, err)) {
+    std::fprintf(stderr, "error: %s: %s\n", path, err.c_str());
+    return 2;
+  }
+  if (n_vms < 2 || n_vms > wvm::kMaxVms) {
+    std::fprintf(stderr, "error: --vms must be 2..%u\n", wvm::kMaxVms);
+    return 2;
+  }
+  std::vector<wvm::VmImage> images(n_vms);
+  for (uint32_t i = 0; i < n_vms; ++i) {
+    images[i].code = file.code;
+    images[i].literals = file.literals;
+    images[i].mem_size_words = 8;
+  }
+  wvm::PersistentRuntime rt;
+  if (!rt.Init(images, err) || !rt.Launch(err)) {
+    std::fprintf(stderr, "error: %s\n", err.c_str());
+    return 1;
+  }
+  rt.BootAll();
+  std::printf("gfx_cap: %u resident VMs rendering graphics.wvm\n", n_vms);
+
+  // Wait until every VM has published at least one frame.
+  bool all_published = false;
+  for (int w = 0; w < 10000; w += 5) {
+    all_published = true;
+    for (uint32_t i = 0; i < n_vms; ++i)
+      if (rt.FrameSeq(i) < 1) { all_published = false; break; }
+    if (all_published) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  if (!all_published) {
+    std::printf("gfx_cap: FAIL (not all VMs published a frame)\n");
+    rt.ShutdownAll();
+    rt.Sync();
+    return 1;
+  }
+
+  // Verify each VM's image against the formula and check they're distinct.
+  // red(x,y) = (x + vmid*4)&0xFF, green(x,y) = y&0xFF; blue = frame (masked
+  // out). pixel(127,0): red=(127+vmid*4), green=0. pixel(0,127):
+  // red=(vmid*4), green=127.
+  uint32_t bad = 0;
+  std::vector<uint32_t> reds;
+  reds.reserve(n_vms);
+  for (uint32_t i = 0; i < n_vms; ++i) {
+    std::vector<uint32_t> fb;
+    if (!rt.ReadFramebuffer(i, fb)) { ++bad; continue; }
+    const uint32_t red_x0 = (127u + i * 4u) & 0xFFu;   // pixel (127,0)
+    const uint32_t red_0y = (0u + i * 4u) & 0xFFu;     // pixel (0,127)
+    const uint32_t expect_x0 = 0xFF000000u | (red_x0 << 16);
+    const uint32_t expect_0y = 0xFF000000u | (red_0y << 16) | (127u << 8);
+    const uint32_t px_x0 = fb[0 * wvm::kVideoWidth + 127] & 0xFFFFFF00u;
+    const uint32_t px_0y = fb[127 * wvm::kVideoWidth + 0] & 0xFFFFFF00u;
+    if (px_x0 != expect_x0 || px_0y != expect_0y) ++bad;
+    reds.push_back(red_x0);
+  }
+  // All reds must be pairwise distinct (vmid*4 spans 0..252 for 64 VMs).
+  uint32_t distinct = 0;
+  for (uint32_t i = 0; i < reds.size(); ++i) {
+    bool dup = false;
+    for (uint32_t j = 0; j < i; ++j)
+      if (reds[j] == reds[i]) { dup = true; break; }
+    if (!dup) ++distinct;
+  }
+  // Every VM should still be running (redrawing) — independently alive.
+  uint32_t running = 0;
+  for (uint32_t i = 0; i < n_vms; ++i)
+    if (rt.Status(i) == wvm::kRunning) ++running;
+
+  const bool pass = bad == 0 && distinct == n_vms && running == n_vms;
+  std::printf("gfx_cap: images correct    %s (%u/%u)\n",
+              bad == 0 ? "PASS" : "FAIL", n_vms - bad, n_vms);
+  std::printf("gfx_cap: images distinct   %s (%u/%u)\n",
+              distinct == n_vms ? "PASS" : "FAIL", distinct, n_vms);
+  std::printf("gfx_cap: still RUNNING     %s (%u/%u)\n",
+              running == n_vms ? "PASS" : "FAIL", running, n_vms);
+  std::printf(pass ? "gfx_cap: PASS\n" : "gfx_cap: FAIL\n");
+  rt.ShutdownAll();
+  rt.Sync();
+  return pass ? 0 : 1;
+}
+
 // v0.1 capstone: boot 64+ resident VMs that each do a 32-lane computation,
 // exchange a message around a ring, and keep running so they stay
 // inspectable. Verifies the whole milestone, then inspects one VM live.
@@ -1056,6 +1525,10 @@ void Usage(const char* argv0) {
   std::printf("  demo <file.wvm> [--vms N]\n");
   std::printf("                  v0.1 capstone: N VMs compute + ring-message + stay live\n");
   std::printf("  slice1..slice5,slice7  self-test suites\n");
+  std::printf("  gfxa | gfxb            v0.1.1 graphics slices A/B self-tests\n");
+  std::printf("  gfxsmoke <file.wvm>    headless framebuffer-copy smoke test\n");
+  std::printf("  gfx_cap <file.wvm> [--vms N]\n");
+  std::printf("                  v0.1.1 capstone: N VMs render distinct images\n");
 }
 
 }  // namespace
@@ -1079,6 +1552,27 @@ int main(int argc, char** argv) {
   if (std::strcmp(cmd, "slice4") == 0) return RunSlice4();
   if (std::strcmp(cmd, "slice5") == 0) return RunSlice5();
   if (std::strcmp(cmd, "slice7") == 0) return RunSlice7();
+  if (std::strcmp(cmd, "gfxa") == 0) return RunSliceGfxA();
+  if (std::strcmp(cmd, "gfxb") == 0) return RunSliceGfxB();
+  if (std::strcmp(cmd, "gfxsmoke") == 0) {
+    if (argc < 3) {
+      std::fprintf(stderr, "error: gfxsmoke requires a .wvm file\n");
+      return 2;
+    }
+    return RunGfxSmoke(argv[2]);
+  }
+  if (std::strcmp(cmd, "gfx_cap") == 0) {
+    if (argc < 3) {
+      std::fprintf(stderr, "error: gfx_cap requires a .wvm file\n");
+      return 2;
+    }
+    uint32_t n_vms = 64;
+    for (int i = 3; i < argc; ++i) {
+      if (std::strcmp(argv[i], "--vms") == 0 && i + 1 < argc)
+        n_vms = static_cast<uint32_t>(std::atoi(argv[++i]));
+    }
+    return RunGfxCap(argv[2], n_vms);
+  }
   if (std::strcmp(cmd, "run") == 0) {
     if (argc < 3) {
       std::fprintf(stderr, "error: run requires a .wvm file\n");

@@ -19,6 +19,16 @@ constexpr uint32_t kMaxCodeWords = 4096;
 constexpr uint32_t kMaxLiterals = 256;
 constexpr uint32_t kMailboxSlots = 16;
 
+// ---- Architectural display (docs/isa.md, v0.1.1) ----------------------
+// Fixed memory-mapped framebuffer, word-addressed. Pixels are ordinary u32
+// values 0xAARRGGBB accessed through LOAD/STORE.
+constexpr uint32_t kVideoBaseWord = 0x00100000u;
+constexpr uint32_t kVideoWidth = 128;
+constexpr uint32_t kVideoHeight = 128;
+constexpr uint32_t kVideoWords = kVideoWidth * kVideoHeight;  // 16384
+constexpr uint32_t kVideoEndWord = kVideoBaseWord + kVideoWords;
+constexpr uint32_t kVideoResetColor = 0xFF000000u;  // opaque black
+
 // ---- Messaging (isa.md §4.7) -------------------------------------------
 // Fixed-size 16-byte message. payload[1..2] are reserved (zero) in v0.1;
 // SEND transmits payload[0] only.
@@ -109,7 +119,7 @@ enum Opcode : uint32_t {
 
   kLoad = 0x50, kStore = 0x51,
 
-  kLog = 0x58, kLogI = 0x59,
+  kLog = 0x58, kLogI = 0x59, kFlip = 0x5A,
 
   kSend = 0x60, kTryRecv = 0x61,  // messaging (0x62-0x6F reserved)
 

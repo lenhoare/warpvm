@@ -24,6 +24,7 @@ struct VmCtx {
   uint32_t literals_len;
   uint32_t* mem;
   uint32_t mem_size_words;
+  uint32_t* fb;   // framebuffer base (kVideoWords words), nullptr if absent
   uint32_t vm_id;
   uint32_t lane;
 
@@ -394,28 +395,33 @@ __device__ StopReason VmRun(VmCtx& ctx, Control* ctrl = nullptr,
       }
 
       // ---- memory -----------------------------------------------------------
+      // Address decode (docs/isa.md §4): private RAM first, then the
+      // memory-mapped framebuffer, else FAULT_MEM. Per-lane addresses; any
+      // lane's fault faults the whole VM (resolved by the ballot below).
       case kLoad:
-        // Per-lane addresses: each lane bounds-checks and loads its own.
-        // If any lane faults, the whole VM faults (resolved below); writes
-        // already performed by other lanes in this VM are tolerated — the
-        // VM is dead at that point.
         if (active) {
           const uint32_t addr = ctx.vregs[rs1];
-          if (addr >= ctx.mem_size_words) {
+          if (addr < ctx.mem_size_words) {
+            ctx.vregs[rd] = ctx.mem[addr];
+          } else if (ctx.fb != nullptr && addr >= kVideoBaseWord &&
+                     addr < kVideoEndWord) {
+            ctx.vregs[rd] = ctx.fb[addr - kVideoBaseWord];
+          } else {
             VmFault(ctx, kFaultMem);
-            break;
           }
-          ctx.vregs[rd] = ctx.mem[addr];
         }
         break;
       case kStore:
         if (active) {
           const uint32_t addr = ctx.vregs[rd];
-          if (addr >= ctx.mem_size_words) {
+          if (addr < ctx.mem_size_words) {
+            ctx.mem[addr] = ctx.vregs[rs1];
+          } else if (ctx.fb != nullptr && addr >= kVideoBaseWord &&
+                     addr < kVideoEndWord) {
+            ctx.fb[addr - kVideoBaseWord] = ctx.vregs[rs1];
+          } else {
             VmFault(ctx, kFaultMem);
-            break;
           }
-          ctx.mem[addr] = ctx.vregs[rs1];
         }
         break;
 
@@ -435,6 +441,20 @@ __device__ StopReason VmRun(VmCtx& ctx, Control* ctrl = nullptr,
         if (active && ctrl != nullptr && ctx.lane == 0) {
           const uint32_t tag = (op == kLogI) ? imm : ctx.vregs[rs2];
           LogAppend(ctrl, ctx.vm_id, tag, ctx.vregs[rs1]);
+        }
+        break;
+
+      // ---- frame publication (v0.1.1) --------------------------------------
+      // FLIP publishes the framebuffer: lane 0 bumps frame_seq exactly once.
+      // Unguardable — a publication is a single warp-uniform event.
+      case kFlip:
+        if (guard != 0) {
+          VmFault(ctx, kFaultOperand);
+          break;
+        }
+        if (ctrl != nullptr && ctx.lane == 0) {
+          WriteOnce(&ctrl->frame_seq[ctx.vm_id],
+                    ReadOnce(&ctrl->frame_seq[ctx.vm_id]) + 1u);
         }
         break;
 

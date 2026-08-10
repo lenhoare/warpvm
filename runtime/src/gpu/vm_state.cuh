@@ -33,6 +33,7 @@ struct VmDesc {
   uint32_t literals_len;
   uint32_t* mem;  // private RAM, word-addressed
   uint32_t mem_size_words;
+  uint32_t* fb;   // framebuffer (kVideoWords words), nullptr if absent
 };
 
 inline const char* StatusName(uint32_t s) {
