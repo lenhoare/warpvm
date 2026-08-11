@@ -1,0 +1,45 @@
+char *global_greeting = "hello";
+
+int string_length(char *text)
+{
+    int length = 0;
+    while (*text != 0) {
+        ++length;
+        ++text;
+    }
+    return length;
+}
+
+int string_compare(char *left, char *right)
+{
+    while (*left == *right) {
+        if (*left == 0)
+            return 0;
+        ++left;
+        ++right;
+    }
+    return *left - *right;
+}
+
+int main(void)
+{
+    char hello[] = "hello";
+    char same[] = "hello";
+    char later[] = "help";
+    char *cursor = hello;
+    int result = string_length(hello) * 6 + sizeof(hello);
+
+    ++cursor;
+    if (*cursor == 'e')
+        result += 2;
+    if (hello[5] == 0)
+        result += 1;
+    if (string_compare(hello, same) == 0)
+        result += 1;
+    if (string_compare(hello, later) < 0)
+        result += 1;
+    if (global_greeting[4] == 'o')
+        result += 1;
+
+    return result;
+}

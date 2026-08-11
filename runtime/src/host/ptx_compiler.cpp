@@ -403,6 +403,40 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err) {
              << "    @%p1 bra L_pc_" << lo << ";\n";
         break;
       }
+      case kCall:
+        if (guard != 0) return reject("CALL cannot be guarded");
+        if (lo >= file.code.size()) return reject("call target is out of range");
+        body << "    setp.ge.u32 %p3, %cd, " << kCallDepth << ";\n"
+             << "    @%p3 sub.u64 %ic, %ic, 1;\n"
+             << "    @%p3 mov.u32 %t6, " << kFaulted << ";\n"
+             << "    @%p3 mov.u32 %t7, " << pc << ";\n"
+             << "    @%p3 mov.u32 %t4, " << kFaultStack << ";\n"
+             << "    @%p3 bra L_save_fault;\n";
+        for (uint32_t depth = 0; depth < kCallDepth; ++depth) {
+          body << "    setp.eq.u32 %p3, %cd, " << depth << ";\n"
+               << "    @%p3 mov.u32 %cs" << depth << ", " << (pc + 1)
+               << ";\n";
+        }
+        body << "    add.u32 %cd, %cd, 1;\n"
+             << "    bra.uni L_pc_" << lo << ";\n";
+        break;
+      case kRet:
+        if (guard != 0) return reject("RET cannot be guarded");
+        body << "    setp.eq.u32 %p3, %cd, 0;\n"
+             << "    @%p3 sub.u64 %ic, %ic, 1;\n"
+             << "    @%p3 mov.u32 %t6, " << kFaulted << ";\n"
+             << "    @%p3 mov.u32 %t7, " << pc << ";\n"
+             << "    @%p3 mov.u32 %t4, " << kFaultStack << ";\n"
+             << "    @%p3 bra L_save_fault;\n"
+             << "    sub.u32 %cd, %cd, 1;\n"
+             << "    mov.u32 %t8, 0;\n";
+        for (uint32_t depth = 0; depth < kCallDepth; ++depth) {
+          body << "    setp.eq.u32 %p3, %cd, " << depth << ";\n"
+               << "    @%p3 mov.u32 %t8, %cs" << depth << ";\n";
+        }
+        body << "    mov.u32 %t7, %t8;\n"
+             << "    bra.uni L_dispatch;\n";
+        break;
       case kHalt:
         found_safe_exit = true;
         body << "    mov.u32 %t6, " << kHalted << ";\n"
@@ -443,6 +477,8 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err) {
       << "    .reg .b32 %v<16>;\n"
       << "    .reg .b32 %m<4>;\n"
       << "    .reg .b32 %s<8>;\n"
+      << "    .reg .b32 %cs<8>;\n"
+      << "    .reg .b32 %cd;\n"
       << "    .reg .b32 %vid;\n"
       << "    .reg .b64 %rd<14>;\n"
       << "    .reg .b64 %ic;\n\n"
@@ -492,10 +528,18 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err) {
     out << "    ld.global.u32 %s" << scalar << ", [%rd2+" << offset
         << "];\n";
   }
+  for (uint32_t depth = 0; depth < kCallDepth; ++depth) {
+    const size_t offset = offsetof(VmState, call_stack) + depth * sizeof(uint32_t);
+    out << "    ld.global.u32 %cs" << depth << ", [%rd2+" << offset
+        << "];\n";
+  }
+  out << "    ld.global.u32 %cd, [%rd2+" << offsetof(VmState, call_depth)
+      << "];\n";
   out << "    ld.global.u64 %ic, [%rd2+"
       << offsetof(VmState, instruction_counter) << "];\n";
   out << "    ld.global.u32 %t7, [%rd2+" << offsetof(VmState, pc)
       << "];\n";
+  out << "L_dispatch:\n";
   for (uint32_t pc = 0; pc < file.code.size(); ++pc) {
     out << "    setp.eq.u32 %p1, %t7, " << pc << ";\n"
         << "    @%p1 bra L_pc_" << pc << ";\n";
@@ -530,6 +574,13 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err) {
     out << "    @%p1 st.global.u32 [%rd2+" << offset << "], %s"
         << scalar << ";\n";
   }
+  for (uint32_t depth = 0; depth < kCallDepth; ++depth) {
+    const size_t offset = offsetof(VmState, call_stack) + depth * sizeof(uint32_t);
+    out << "    @%p1 st.global.u32 [%rd2+" << offset << "], %cs" << depth
+        << ";\n";
+  }
+  out << "    @%p1 st.global.u32 [%rd2+" << offsetof(VmState, call_depth)
+      << "], %cd;\n";
 
   out << "    @%p1 st.global.u32 [%rd2+" << offsetof(VmState, vm_id)
       << "], %vid;\n"

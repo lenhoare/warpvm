@@ -5,6 +5,7 @@ pub enum TokenKind {
     Ident(String),
     Number(String),
     Char(u32),
+    String(Vec<u32>),
     Int,
     Unsigned,
     CharKw,
@@ -20,13 +21,19 @@ pub enum TokenKind {
     Switch,
     Case,
     Default,
+    Struct,
+    Sizeof,
     LParen,
     RParen,
     LBrace,
     RBrace,
+    LBracket,
+    RBracket,
     Semicolon,
     Comma,
     Colon,
+    Dot,
+    Arrow,
     Plus,
     Minus,
     Star,
@@ -108,6 +115,8 @@ impl<'a> Lexer<'a> {
                 self.number()
             } else if byte == b'\'' {
                 TokenKind::Char(self.character()?)
+            } else if byte == b'"' {
+                TokenKind::String(self.string()?)
             } else {
                 self.operator()?
             };
@@ -185,6 +194,8 @@ impl<'a> Lexer<'a> {
             "switch" => TokenKind::Switch,
             "case" => TokenKind::Case,
             "default" => TokenKind::Default,
+            "struct" => TokenKind::Struct,
+            "sizeof" => TokenKind::Sizeof,
             _ => TokenKind::Ident(text.to_string()),
         }
     }
@@ -240,6 +251,46 @@ impl<'a> Lexer<'a> {
         Ok(value)
     }
 
+    fn string(&mut self) -> Result<Vec<u32>, Diagnostic> {
+        let start = self.span();
+        self.bump();
+        let mut words = Vec::new();
+        loop {
+            let value = match self.bump() {
+                Some(b'"') => break,
+                None | Some(b'\n') => {
+                    return Err(Diagnostic::new(start, "unterminated string literal"))
+                }
+                Some(b'\\') => match self.bump() {
+                    Some(b'n') => b'\n' as u32,
+                    Some(b'r') => b'\r' as u32,
+                    Some(b't') => b'\t' as u32,
+                    Some(b'0') => 0,
+                    Some(b'\\') => b'\\' as u32,
+                    Some(b'\'') => b'\'' as u32,
+                    Some(b'"') => b'"' as u32,
+                    Some(other) => {
+                        return Err(Diagnostic::new(
+                            start,
+                            format!("unsupported string escape '\\{}'", other as char),
+                        ))
+                    }
+                    None => return Err(Diagnostic::new(start, "unterminated string escape")),
+                },
+                Some(byte) if byte.is_ascii() => byte as u32,
+                Some(_) => {
+                    return Err(Diagnostic::new(
+                        start,
+                        "non-ASCII string literal is not yet supported",
+                    ))
+                }
+            };
+            words.push(value);
+        }
+        words.push(0);
+        Ok(words)
+    }
+
     fn operator(&mut self) -> Result<TokenKind, Diagnostic> {
         use TokenKind::*;
         let span = self.span();
@@ -260,6 +311,7 @@ impl<'a> Lexer<'a> {
             (b'>', Some(b'>'), Some(b'=')) => three(self, ShrEqual),
             (b'+', Some(b'+'), _) => two(self, PlusPlus),
             (b'-', Some(b'-'), _) => two(self, MinusMinus),
+            (b'-', Some(b'>'), _) => two(self, Arrow),
             (b'+', Some(b'='), _) => two(self, PlusEqual),
             (b'-', Some(b'='), _) => two(self, MinusEqual),
             (b'*', Some(b'='), _) => two(self, StarEqual),
@@ -280,9 +332,12 @@ impl<'a> Lexer<'a> {
             (b')', _, _) => RParen,
             (b'{', _, _) => LBrace,
             (b'}', _, _) => RBrace,
+            (b'[', _, _) => LBracket,
+            (b']', _, _) => RBracket,
             (b';', _, _) => Semicolon,
             (b',', _, _) => Comma,
             (b':', _, _) => Colon,
+            (b'.', _, _) => Dot,
             (b'+', _, _) => Plus,
             (b'-', _, _) => Minus,
             (b'*', _, _) => Star,
@@ -353,5 +408,16 @@ mod tests {
         ] {
             assert!(tokens.iter().any(|token| token.kind == kind));
         }
+    }
+
+    #[test]
+    fn strings_members_and_subscripts() {
+        let tokens = lex("struct P { char s[3]; }; sizeof(p->s[0]); char *q = \"hi\\n\";").unwrap();
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Struct));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Arrow));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::LBracket));
+        assert!(tokens
+            .iter()
+            .any(|t| t.kind == TokenKind::String(vec![104, 105, 10, 0])));
     }
 }

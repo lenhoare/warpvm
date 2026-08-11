@@ -1,23 +1,67 @@
 use crate::span::Span;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TypeName {
     Int,
     Unsigned,
     Char,
     Void,
+    Struct(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct Declarator {
+    pub name: Option<String>,
+    pub pointers: usize,
+    pub array_len: Option<Option<Expr>>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub struct DeclType {
+    pub base: TypeName,
+    pub declarator: Declarator,
 }
 
 #[derive(Clone, Debug)]
 pub struct Program {
-    pub function: Function,
+    pub structs: Vec<StructDecl>,
+    pub globals: Vec<Global>,
+    pub functions: Vec<Function>,
+}
+
+#[derive(Clone, Debug)]
+pub struct StructDecl {
+    pub name: String,
+    pub fields: Vec<FieldDecl>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub struct FieldDecl {
+    pub ty: DeclType,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub struct Global {
+    pub ty: DeclType,
+    pub init: Option<Expr>,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug)]
 pub struct Function {
-    pub return_type: TypeName,
+    pub return_type: DeclType,
     pub name: String,
-    pub body: Block,
+    pub params: Vec<Parameter>,
+    pub body: Option<Block>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub struct Parameter {
+    pub ty: DeclType,
     pub span: Span,
 }
 
@@ -30,8 +74,7 @@ pub struct Block {
 #[derive(Clone, Debug)]
 pub enum Stmt {
     Decl {
-        ty: TypeName,
-        name: String,
+        ty: DeclType,
         init: Option<Expr>,
         span: Span,
     },
@@ -82,8 +125,7 @@ pub enum Stmt {
 #[derive(Clone, Debug)]
 pub enum ForInit {
     Decl {
-        ty: TypeName,
-        name: String,
+        ty: DeclType,
         init: Option<Expr>,
         span: Span,
     },
@@ -100,10 +142,23 @@ pub struct Expr {
 pub enum ExprKind {
     Number(String),
     Char(u32),
+    String(Vec<u32>),
     Name(String),
+    Call {
+        callee: String,
+        args: Vec<Expr>,
+    },
     Unary(UnaryOp, Box<Expr>),
     Binary(BinaryOp, Box<Expr>, Box<Expr>),
     Assign(AssignOp, Box<Expr>, Box<Expr>),
+    Index(Box<Expr>, Box<Expr>),
+    Member {
+        base: Box<Expr>,
+        field: String,
+        through_pointer: bool,
+    },
+    SizeofExpr(Box<Expr>),
+    SizeofType(Box<DeclType>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,6 +167,8 @@ pub enum UnaryOp {
     Minus,
     BitNot,
     LogicalNot,
+    AddressOf,
+    Deref,
     PreInc,
     PreDec,
     PostInc,

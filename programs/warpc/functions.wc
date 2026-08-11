@@ -1,0 +1,40 @@
+/* Warp C v0.1.4 Slice C: prototypes, parameters and nested calls. */
+int add(int a, int b);
+int square(int value);
+int mix(int a, int b, int c);
+void consume(int a, int b, int c, int d);
+
+int main(void)
+{
+    int keep = 7;
+    int result = mix(2, 3, 4);             /* 25 + 7 = 32 */
+    consume(result, keep, 3, 4);           /* exercises void and four args */
+    int nested = add(square(3), add(4, 5)); /* 9 + 9 = 18 */
+    return result + nested + keep - 15;     /* 32 + 18 + 7 - 15 = 42 */
+}
+
+int add(int a, int b)
+{
+    int result = a + b;
+    return result;
+}
+
+int square(int value)
+{
+    return value * value;
+}
+
+void consume(int a, int b, int c, int d)
+{
+    int checksum = a + b + c + d;
+    if (checksum == 46)
+        return;
+    return;
+}
+
+int mix(int a, int b, int c)
+{
+    int left = square(a + b);
+    int right = add(b, c);
+    return left + right;
+}

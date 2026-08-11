@@ -417,6 +417,85 @@ int RunCompiledSlice1() {
                   control_states[0].instruction_counter));
   ok &= control_equal;
 
+  // Nested CALL/RET uses the architectural eight-entry continuation stack.
+  // Compare the retained (popped) stack words as well as registers and depth.
+  wvm::WvmFile calls;
+  calls.code = {
+      wvm::enc_i(wvm::kMovI, 0, 0, 0, 5),
+      wvm::enc_i(wvm::kCall, 0, 0, 0, 4),
+      wvm::enc_i(wvm::kAddI, 0, 0, 0, 1),
+      wvm::enc_r(wvm::kHalt, 0, 0, 0, 0),
+      wvm::enc_i(wvm::kCall, 0, 0, 0, 7),
+      wvm::enc_i(wvm::kAddI, 0, 0, 0, 2),
+      wvm::enc_r(wvm::kRet, 0, 0, 0, 0),
+      wvm::enc_i(wvm::kMulI, 0, 0, 0, 3),
+      wvm::enc_r(wvm::kRet, 0, 0, 0, 0),
+  };
+  wvm::CpuVm calls_cpu;
+  calls_cpu.Init(0, calls);
+  calls_cpu.RunQuantum();
+  if (!compiled.Compile(calls, err)) {
+    std::printf("compiled slice C: CALL/RET PTX compile FAIL: %s\n",
+                err.c_str());
+    return 1;
+  }
+  std::vector<wvm::VmState> call_states(1);
+  call_states[0].status = wvm::kRunning;
+  call_states[0].rng_state = 0x1234567u;
+  if (!compiled.Launch(call_states, err)) {
+    std::printf("compiled slice C: CALL/RET launch FAIL: %s\n", err.c_str());
+    return 1;
+  }
+  difference.clear();
+  const bool calls_equal = SameArchitecturalState(
+      StateFromCpu(calls_cpu), call_states[0], difference);
+  std::printf("compiled slice C: nested CALL/RET state %s (r0=%u depth=%u)",
+              calls_equal ? "PASS" : "FAIL", call_states[0].vregs[0],
+              call_states[0].call_depth);
+  if (!calls_equal) std::printf(" (%s)", difference.c_str());
+  std::printf("\n");
+  ok &= calls_equal;
+
+  auto check_compiled_stack_fault = [&](const char* name,
+                                        const wvm::WvmFile& program) {
+    wvm::CpuVm reference;
+    reference.Init(0, program);
+    reference.RunQuantum();
+    if (!compiled.Compile(program, err)) {
+      std::printf("compiled slice C: %s compile FAIL: %s\n", name,
+                  err.c_str());
+      return false;
+    }
+    std::vector<wvm::VmState> states(1);
+    states[0].status = wvm::kRunning;
+    states[0].rng_state = 0x1234567u;
+    if (!compiled.Launch(states, err)) {
+      std::printf("compiled slice C: %s launch FAIL: %s\n", name,
+                  err.c_str());
+      return false;
+    }
+    difference.clear();
+    const bool equal = SameArchitecturalState(
+        StateFromCpu(reference), states[0], difference);
+    std::printf("compiled slice C: %s %s", name,
+                equal ? "PASS" : "FAIL");
+    if (!equal) std::printf(" (%s)", difference.c_str());
+    std::printf("\n");
+    return equal;
+  };
+  wvm::WvmFile ret_underflow;
+  ret_underflow.code = {
+      wvm::enc_r(wvm::kRet, 0, 0, 0, 0),
+      wvm::enc_r(wvm::kHalt, 0, 0, 0, 0),
+  };
+  ok &= check_compiled_stack_fault("RET underflow", ret_underflow);
+  wvm::WvmFile call_overflow;
+  call_overflow.code = {
+      wvm::enc_i(wvm::kCall, 0, 0, 0, 0),
+      wvm::enc_r(wvm::kHalt, 0, 0, 0, 0),
+  };
+  ok &= check_compiled_stack_fault("CALL overflow", call_overflow);
+
   // A compact loop32 form exercises scalar loop control, guarded vector
   // execution, private RAM, and a backward loop.
   wvm::WvmFile loop32;

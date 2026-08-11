@@ -67,6 +67,21 @@ add_test(NAME warpc_switch
           ${WVM_WARPC} $<TARGET_FILE:warpvm>
           ${CMAKE_SOURCE_DIR}/programs/warpc/switch.wc
           ${CMAKE_BINARY_DIR}/warpc_switch warpc_switch)
+add_test(NAME warpc_functions
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_acceptance.sh
+          ${WVM_WARPC} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/programs/warpc/functions.wc
+          ${CMAKE_BINARY_DIR}/warpc_functions warpc_functions)
+add_test(NAME warpc_memory
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_acceptance.sh
+          ${WVM_WARPC} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/programs/warpc/memory.wc
+          ${CMAKE_BINARY_DIR}/warpc_memory warpc_memory)
+add_test(NAME warpc_strings
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_acceptance.sh
+          ${WVM_WARPC} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/programs/warpc/strings.wc
+          ${CMAKE_BINARY_DIR}/warpc_strings warpc_strings)
 
 add_test(NAME pipeline_hello
   COMMAND bash ${CMAKE_SOURCE_DIR}/tests/pipeline.sh

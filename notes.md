@@ -503,7 +503,7 @@ three existing instructions absent from the minimal compiled backend:
 `DIV`, `MOD`, and `ABS`, plus the `NOTMASK` used by short-circuit control flow.
 All four now have direct PTX lowering.
 
-The comprehensive 40-condition smoke program is 421 words with five literals.
+The comprehensive 40-condition smoke program is 424 words with six literals.
 That is intentionally not treated as an optimization baseline: the current
 register-only allocator and explicit signed sequences favour transparent
 semantics. If signed-heavy real programs later show a measured material cost,
@@ -525,10 +525,79 @@ switches for the nearest loop and enters a `for` at its step expression.
 jump to the matching source-order label. The body is then emitted in source
 order, so fall-through needs no special instruction. Constant-expression
 evaluation rejects non-constant and duplicate case values before assembly.
-The control-flow and switch acceptance programs are 140 and 105 words and
+The control-flow and switch acceptance programs are 143 and 108 words and
 both return 42 with exact interpreter/PTX architectural equivalence.
 
 This linear switch strategy is deliberately inspectable and adequate for the
 first language slice. Jump tables or a dedicated multi-way branch should only
 be considered if real programs show large switches to be important. The
 current results provide no reason to change the ISA.
+
+## 18. The existing call stack plus ordinary RAM supports a C ABI
+
+**Discovered by:** Warp C v0.1.4 Slice C
+
+**Classification:** compiler and compiled-backend implementation; no ISA
+change
+
+Warp C now passes up to four arguments in `r0`–`r3`, returns a value in `r0`,
+and uses the architectural `CALL` / `RET` stack for continuations. Live caller
+registers are preserved in private RAM through a uniform `s7` stack pointer.
+Each vector spill occupies 32 adjacent words, one per lane, so the ABI already
+preserves future divergent values rather than relying on Slice C's currently
+uniform programs.
+
+The 441-word acceptance program covers prototypes, two- and four-argument
+functions, void returns, calls nested inside argument expressions, and calls
+from one non-main function to another. It returns 42 in the interpreter and
+matches complete state, RAM, framebuffer, and frame sequence in compiled
+execution. A focused backend program also ends with the same retained call
+stack words, zero call depth, and `r0 = 18` in both engines.
+
+Direct PTX execution previously lacked `CALL` and `RET` because the compiled
+WarpLife programs had inlined their only subroutine. The backend now keeps the
+eight architectural continuation words and depth in native registers and
+returns through a common PC dispatcher. Stack overflow and underflow retain
+the existing `FAULT_STACK` contract.
+
+The conservative caller-save lowering emits substantial code and RAM traffic;
+that is visible in the 441-word result. It is a correctness-first baseline,
+not evidence for `PUSH`, `POP`, or a C-specific call opcode. Liveness-aware
+preservation, scalar placement for uniform values, and selective inlining are
+compiler optimizations to measure before proposing any ISA addition.
+
+## 19. Word-addressed C aggregates fit ordinary RAM instructions
+
+**Discovered by:** Warp C v0.1.4 Slice D
+
+**Classification:** compiler memory-layout implementation; no ISA or WVM
+format change
+
+Warp C pointers now address logical VM words directly. Arrays and structures
+are consecutive words with one-word alignment, so `int *`, `char *`, and
+structure pointer arithmetic lower to ordinary integer address arithmetic.
+The memory acceptance program covers global storage, address-of, dereference,
+pointer increment, indexing, two-word structure layout, and both `.` and `->`.
+It is 130 words and returns 42 with exact interpreter/PTX RAM equivalence.
+
+Automatic aggregates and address-taken scalars need lane-private identity even
+though Slice D programs remain logically uniform. Their stack frames therefore
+use a lane-major physical layout: one lane's complete C frame is contiguous.
+This preserves both per-lane isolation and the required `p + 1` physical word
+increment. Register-only scalar locals are unchanged. Existing caller-save
+spills retain their separate word-major layout because C pointers cannot refer
+to them.
+
+Strings use one 32-bit word per character and a zero terminator. A Warp C
+`strlen`/`strcmp` acceptance program checks `"hello"` as six words, pointer
+iteration, comparison, and a globally initialized string pointer. It is 401
+words, returns 42 in both engines, and their complete RAM images match.
+Nonzero global and literal data is emitted as lane-0 startup stores, so static
+data required neither byte-addressing nor an extension to the WVM file.
+
+The generated automatic-object address sequence currently broadcasts `s7`,
+multiplies the lane ID by the per-lane frame size, and adds the object offset.
+That is transparent and correct but intentionally not treated as optimized.
+Future compiler work can retain frame bases or common addresses in registers;
+these results provide no evidence for byte loads/stores, `PUSH`/`POP`, string
+instructions, or another memory opcode.

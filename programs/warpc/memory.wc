@@ -1,0 +1,29 @@
+struct Pair {
+    int left;
+    int right;
+};
+
+int global_bias = 7;
+int global_numbers[2];
+
+int main(void)
+{
+    int value = 10;
+    int *value_pointer = &value;
+    int numbers[4];
+    int *cursor = numbers;
+    struct Pair pair;
+    struct Pair *pair_pointer = &pair;
+
+    *value_pointer += 2;
+    numbers[0] = 3;
+    cursor++;
+    *cursor = 5;
+
+    pair.left = *value_pointer;
+    global_numbers[0] = global_bias;
+    pair.right = numbers[0] + numbers[1] + global_numbers[0];
+
+    return sizeof(pair) + sizeof(numbers)
+        + pair_pointer->left + pair_pointer->right + 9;
+}

@@ -15,24 +15,143 @@ struct Parser<'a> {
 
 impl<'a> Parser<'a> {
     fn program(&mut self) -> Result<Program, Diagnostic> {
-        let return_type = self.type_name()?;
-        let (name, span) = self.identifier("expected function name")?;
-        self.expect(TokenKind::LParen, "expected '(' after function name")?;
-        if self.at(&TokenKind::Void) {
+        let mut structs = Vec::new();
+        let mut globals = Vec::new();
+        let mut functions = Vec::new();
+        while !self.at(&TokenKind::Eof) {
+            if self.is_struct_definition() {
+                structs.push(self.struct_definition()?);
+                continue;
+            }
+            let base = self.type_name()?;
+            let decl = self.declarator(true)?;
+            let Some(name) = decl.name.clone() else {
+                unreachable!()
+            };
+            if self.at(&TokenKind::LParen) && decl.array_len.is_none() {
+                functions.push(self.function(base, decl, name)?);
+            } else {
+                let span = decl.span;
+                let init = if self.at(&TokenKind::Equal) {
+                    self.bump();
+                    Some(self.assignment()?)
+                } else {
+                    None
+                };
+                self.expect(
+                    TokenKind::Semicolon,
+                    "expected ';' after global declaration",
+                )?;
+                globals.push(Global {
+                    ty: DeclType {
+                        base,
+                        declarator: decl,
+                    },
+                    init,
+                    span,
+                });
+            }
+        }
+        if functions.is_empty() {
+            return Err(self.error("expected a function declaration"));
+        }
+        Ok(Program {
+            structs,
+            globals,
+            functions,
+        })
+    }
+
+    fn is_struct_definition(&self) -> bool {
+        self.at(&TokenKind::Struct)
+            && matches!(
+                self.tokens.get(self.current + 1).map(|t| &t.kind),
+                Some(TokenKind::Ident(_))
+            )
+            && matches!(
+                self.tokens.get(self.current + 2).map(|t| &t.kind),
+                Some(TokenKind::LBrace)
+            )
+    }
+
+    fn struct_definition(&mut self) -> Result<StructDecl, Diagnostic> {
+        let span = self.bump().span;
+        let (name, _) = self.identifier("expected structure name")?;
+        self.expect(TokenKind::LBrace, "expected '{' after structure name")?;
+        let mut fields = Vec::new();
+        while !self.at(&TokenKind::RBrace) {
+            let field_span = self.peek().span;
+            let base = self.type_name()?;
+            let declarator = self.declarator(true)?;
+            self.expect(TokenKind::Semicolon, "expected ';' after structure field")?;
+            fields.push(FieldDecl {
+                ty: DeclType { base, declarator },
+                span: field_span,
+            });
+        }
+        self.bump();
+        self.expect(
+            TokenKind::Semicolon,
+            "expected ';' after structure definition",
+        )?;
+        Ok(StructDecl { name, fields, span })
+    }
+
+    fn function(
+        &mut self,
+        base: TypeName,
+        decl: Declarator,
+        name: String,
+    ) -> Result<Function, Diagnostic> {
+        let span = decl.span;
+        self.bump();
+        let mut params = Vec::new();
+        if self.at(&TokenKind::Void)
+            && self
+                .tokens
+                .get(self.current + 1)
+                .is_some_and(|t| matches!(t.kind, TokenKind::RParen))
+        {
             self.bump();
-        } else if !self.at(&TokenKind::RParen) {
-            return Err(self.error("the current frontend supports only a void parameter list"));
+        } else {
+            while !self.at(&TokenKind::RParen) {
+                let param_span = self.peek().span;
+                let param_base = self.type_name()?;
+                let param_decl = self.declarator(false)?;
+                params.push(Parameter {
+                    ty: DeclType {
+                        base: param_base,
+                        declarator: param_decl,
+                    },
+                    span: param_span,
+                });
+                if !self.at(&TokenKind::Comma) {
+                    break;
+                }
+                self.bump();
+            }
         }
         self.expect(TokenKind::RParen, "expected ')' after parameter list")?;
-        let body = self.block()?;
-        self.expect(TokenKind::Eof, "only one function is currently supported")?;
-        Ok(Program {
-            function: Function {
-                return_type,
-                name,
-                body,
-                span,
+        let body = if self.at(&TokenKind::Semicolon) {
+            self.bump();
+            None
+        } else {
+            Some(self.block()?)
+        };
+        Ok(Function {
+            return_type: DeclType {
+                base,
+                declarator: Declarator {
+                    name: None,
+                    pointers: decl.pointers,
+                    array_len: None,
+                    span,
+                },
             },
+            name,
+            params,
+            body,
+            span,
         })
     }
 
@@ -82,14 +201,19 @@ impl<'a> Parser<'a> {
             let span = self.bump().span;
             let value = self.expression()?;
             self.expect(TokenKind::Colon, "expected ':' after case value")?;
-            let body = Box::new(self.statement()?);
-            return Ok(Stmt::Case { value, body, span });
+            return Ok(Stmt::Case {
+                value,
+                body: Box::new(self.statement()?),
+                span,
+            });
         }
         if self.at(&TokenKind::Default) {
             let span = self.bump().span;
             self.expect(TokenKind::Colon, "expected ':' after default")?;
-            let body = Box::new(self.statement()?);
-            return Ok(Stmt::Default { body, span });
+            return Ok(Stmt::Default {
+                body: Box::new(self.statement()?),
+                span,
+            });
         }
         if self.at(&TokenKind::Return) {
             let span = self.bump().span;
@@ -116,9 +240,9 @@ impl<'a> Parser<'a> {
 
     fn parenthesized_condition(&mut self, keyword: &str) -> Result<Expr, Diagnostic> {
         self.expect(TokenKind::LParen, &format!("expected '(' after {keyword}"))?;
-        let condition = self.expression()?;
+        let value = self.expression()?;
         self.expect(TokenKind::RParen, "expected ')' after condition")?;
-        Ok(condition)
+        Ok(value)
     }
 
     fn if_statement(&mut self) -> Result<Stmt, Diagnostic> {
@@ -142,10 +266,9 @@ impl<'a> Parser<'a> {
     fn while_statement(&mut self) -> Result<Stmt, Diagnostic> {
         let span = self.bump().span;
         let condition = self.parenthesized_condition("while")?;
-        let body = Box::new(self.statement()?);
         Ok(Stmt::While {
             condition,
-            body,
+            body: Box::new(self.statement()?),
             span,
         })
     }
@@ -171,8 +294,8 @@ impl<'a> Parser<'a> {
             None
         } else if self.starts_type() {
             let decl_span = self.peek().span;
-            let ty = self.type_name()?;
-            let (name, _) = self.identifier("expected variable name")?;
+            let base = self.type_name()?;
+            let declarator = self.declarator(true)?;
             let init = if self.at(&TokenKind::Equal) {
                 self.bump();
                 Some(self.assignment()?)
@@ -181,8 +304,7 @@ impl<'a> Parser<'a> {
             };
             self.expect(TokenKind::Semicolon, "expected ';' after for initializer")?;
             Some(ForInit::Decl {
-                ty,
-                name,
+                ty: DeclType { base, declarator },
                 init,
                 span: decl_span,
             })
@@ -203,12 +325,11 @@ impl<'a> Parser<'a> {
             Some(self.expression()?)
         };
         self.expect(TokenKind::RParen, "expected ')' after for clauses")?;
-        let body = Box::new(self.statement()?);
         Ok(Stmt::For {
             init,
             condition,
             step,
-            body,
+            body: Box::new(self.statement()?),
             span,
         })
     }
@@ -216,18 +337,17 @@ impl<'a> Parser<'a> {
     fn switch_statement(&mut self) -> Result<Stmt, Diagnostic> {
         let span = self.bump().span;
         let expression = self.parenthesized_condition("switch")?;
-        let body = Box::new(self.statement()?);
         Ok(Stmt::Switch {
             expression,
-            body,
+            body: Box::new(self.statement()?),
             span,
         })
     }
 
     fn declaration(&mut self) -> Result<Stmt, Diagnostic> {
         let span = self.peek().span;
-        let ty = self.type_name()?;
-        let (name, _) = self.identifier("expected variable name")?;
+        let base = self.type_name()?;
+        let declarator = self.declarator(true)?;
         let init = if self.at(&TokenKind::Equal) {
             self.bump();
             Some(self.assignment()?)
@@ -236,8 +356,7 @@ impl<'a> Parser<'a> {
         };
         self.expect(TokenKind::Semicolon, "expected ';' after declaration")?;
         Ok(Stmt::Decl {
-            ty,
-            name,
+            ty: DeclType { base, declarator },
             init,
             span,
         })
@@ -255,8 +374,45 @@ impl<'a> Parser<'a> {
             }
             TokenKind::CharKw => Ok(TypeName::Char),
             TokenKind::Void => Ok(TypeName::Void),
+            TokenKind::Struct => Ok(TypeName::Struct(
+                self.identifier("expected structure name")?.0,
+            )),
             _ => Err(Diagnostic::new(token.span, "expected Warp C type")),
         }
+    }
+
+    fn declarator(&mut self, require_name: bool) -> Result<Declarator, Diagnostic> {
+        let span = self.peek().span;
+        let mut pointers = 0;
+        while self.at(&TokenKind::Star) {
+            self.bump();
+            pointers += 1;
+        }
+        let name = if matches!(self.peek().kind, TokenKind::Ident(_)) {
+            Some(self.identifier("expected name")?.0)
+        } else if require_name {
+            return Err(self.error("expected declaration name"));
+        } else {
+            None
+        };
+        let array_len = if self.at(&TokenKind::LBracket) {
+            self.bump();
+            let length = if self.at(&TokenKind::RBracket) {
+                None
+            } else {
+                Some(self.assignment()?)
+            };
+            self.expect(TokenKind::RBracket, "expected ']' after array size")?;
+            Some(length)
+        } else {
+            None
+        };
+        Ok(Declarator {
+            name,
+            pointers,
+            array_len,
+            span,
+        })
     }
 
     fn expression(&mut self) -> Result<Expr, Diagnostic> {
@@ -299,23 +455,18 @@ impl<'a> Parser<'a> {
     fn logical_or(&mut self) -> Result<Expr, Diagnostic> {
         self.left_assoc(Self::logical_and, &[(TokenKind::OrOr, BinaryOp::LogicalOr)])
     }
-
     fn logical_and(&mut self) -> Result<Expr, Diagnostic> {
         self.left_assoc(Self::bit_or, &[(TokenKind::AndAnd, BinaryOp::LogicalAnd)])
     }
-
     fn bit_or(&mut self) -> Result<Expr, Diagnostic> {
         self.left_assoc(Self::bit_xor, &[(TokenKind::Pipe, BinaryOp::BitOr)])
     }
-
     fn bit_xor(&mut self) -> Result<Expr, Diagnostic> {
         self.left_assoc(Self::bit_and, &[(TokenKind::Caret, BinaryOp::BitXor)])
     }
-
     fn bit_and(&mut self) -> Result<Expr, Diagnostic> {
         self.left_assoc(Self::equality, &[(TokenKind::Amp, BinaryOp::BitAnd)])
     }
-
     fn equality(&mut self) -> Result<Expr, Diagnostic> {
         self.left_assoc(
             Self::relational,
@@ -325,7 +476,6 @@ impl<'a> Parser<'a> {
             ],
         )
     }
-
     fn relational(&mut self) -> Result<Expr, Diagnostic> {
         self.left_assoc(
             Self::shift,
@@ -337,7 +487,6 @@ impl<'a> Parser<'a> {
             ],
         )
     }
-
     fn shift(&mut self) -> Result<Expr, Diagnostic> {
         self.left_assoc(
             Self::additive,
@@ -347,7 +496,6 @@ impl<'a> Parser<'a> {
             ],
         )
     }
-
     fn additive(&mut self) -> Result<Expr, Diagnostic> {
         self.left_assoc(
             Self::multiplicative,
@@ -357,7 +505,6 @@ impl<'a> Parser<'a> {
             ],
         )
     }
-
     fn multiplicative(&mut self) -> Result<Expr, Diagnostic> {
         self.left_assoc(
             Self::unary,
@@ -372,11 +519,11 @@ impl<'a> Parser<'a> {
     fn left_assoc(
         &mut self,
         next: fn(&mut Self) -> Result<Expr, Diagnostic>,
-        operators: &[(TokenKind, BinaryOp)],
+        ops: &[(TokenKind, BinaryOp)],
     ) -> Result<Expr, Diagnostic> {
         let mut expr = next(self)?;
         loop {
-            let Some((_, op)) = operators.iter().find(|(token, _)| self.at(token)) else {
+            let Some((_, op)) = ops.iter().find(|(token, _)| self.at(token)) else {
                 return Ok(expr);
             };
             let op = *op;
@@ -390,19 +537,42 @@ impl<'a> Parser<'a> {
     }
 
     fn unary(&mut self) -> Result<Expr, Diagnostic> {
+        if self.at(&TokenKind::Sizeof) {
+            let span = self.bump().span;
+            if self.at(&TokenKind::LParen)
+                && self
+                    .tokens
+                    .get(self.current + 1)
+                    .is_some_and(|t| Self::kind_starts_type(&t.kind))
+            {
+                self.bump();
+                let base = self.type_name()?;
+                let declarator = self.declarator(false)?;
+                self.expect(TokenKind::RParen, "expected ')' after sizeof type")?;
+                return Ok(Expr {
+                    kind: ExprKind::SizeofType(Box::new(DeclType { base, declarator })),
+                    span,
+                });
+            }
+            return Ok(Expr {
+                kind: ExprKind::SizeofExpr(Box::new(self.unary()?)),
+                span,
+            });
+        }
         let op = match self.peek().kind {
             TokenKind::Plus => UnaryOp::Plus,
             TokenKind::Minus => UnaryOp::Minus,
             TokenKind::Tilde => UnaryOp::BitNot,
             TokenKind::Bang => UnaryOp::LogicalNot,
+            TokenKind::Amp => UnaryOp::AddressOf,
+            TokenKind::Star => UnaryOp::Deref,
             TokenKind::PlusPlus => UnaryOp::PreInc,
             TokenKind::MinusMinus => UnaryOp::PreDec,
             _ => return self.postfix(),
         };
         let span = self.bump().span;
-        let operand = self.unary()?;
         Ok(Expr {
-            kind: ExprKind::Unary(op, Box::new(operand)),
+            kind: ExprKind::Unary(op, Box::new(self.unary()?)),
             span,
         })
     }
@@ -410,27 +580,72 @@ impl<'a> Parser<'a> {
     fn postfix(&mut self) -> Result<Expr, Diagnostic> {
         let mut expr = self.primary()?;
         loop {
-            let op = if self.at(&TokenKind::PlusPlus) {
-                UnaryOp::PostInc
-            } else if self.at(&TokenKind::MinusMinus) {
-                UnaryOp::PostDec
+            if self.at(&TokenKind::LParen) {
+                let span = self.bump().span;
+                let mut args = Vec::new();
+                while !self.at(&TokenKind::RParen) {
+                    args.push(self.assignment()?);
+                    if !self.at(&TokenKind::Comma) {
+                        break;
+                    }
+                    self.bump();
+                }
+                self.expect(TokenKind::RParen, "expected ')' after arguments")?;
+                let ExprKind::Name(callee) = expr.kind else {
+                    return Err(Diagnostic::new(
+                        expr.span,
+                        "call target must be a function name",
+                    ));
+                };
+                expr = Expr {
+                    kind: ExprKind::Call { callee, args },
+                    span,
+                };
+            } else if self.at(&TokenKind::LBracket) {
+                let span = self.bump().span;
+                let index = self.expression()?;
+                self.expect(TokenKind::RBracket, "expected ']' after index")?;
+                expr = Expr {
+                    kind: ExprKind::Index(Box::new(expr), Box::new(index)),
+                    span,
+                };
+            } else if self.at(&TokenKind::Dot) || self.at(&TokenKind::Arrow) {
+                let token = self.bump();
+                let through_pointer = token.kind == TokenKind::Arrow;
+                let (field, _) = self.identifier("expected member name")?;
+                expr = Expr {
+                    kind: ExprKind::Member {
+                        base: Box::new(expr),
+                        field,
+                        through_pointer,
+                    },
+                    span: token.span,
+                };
             } else {
-                return Ok(expr);
-            };
-            let span = self.bump().span;
-            expr = Expr {
-                kind: ExprKind::Unary(op, Box::new(expr)),
-                span,
-            };
+                let op = if self.at(&TokenKind::PlusPlus) {
+                    Some(UnaryOp::PostInc)
+                } else if self.at(&TokenKind::MinusMinus) {
+                    Some(UnaryOp::PostDec)
+                } else {
+                    None
+                };
+                let Some(op) = op else { return Ok(expr) };
+                let span = self.bump().span;
+                expr = Expr {
+                    kind: ExprKind::Unary(op, Box::new(expr)),
+                    span,
+                };
+            }
         }
     }
 
     fn primary(&mut self) -> Result<Expr, Diagnostic> {
         let token = self.bump();
         let kind = match token.kind {
-            TokenKind::Number(value) => ExprKind::Number(value),
-            TokenKind::Char(value) => ExprKind::Char(value),
-            TokenKind::Ident(name) => ExprKind::Name(name),
+            TokenKind::Number(v) => ExprKind::Number(v),
+            TokenKind::Char(v) => ExprKind::Char(v),
+            TokenKind::String(v) => ExprKind::String(v),
+            TokenKind::Ident(v) => ExprKind::Name(v),
             TokenKind::LParen => {
                 let expr = self.expression()?;
                 self.expect(TokenKind::RParen, "expected ')' after expression")?;
@@ -444,21 +659,27 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn starts_type(&self) -> bool {
-        self.at(&TokenKind::Int)
-            || self.at(&TokenKind::Unsigned)
-            || self.at(&TokenKind::CharKw)
-            || self.at(&TokenKind::Void)
+    fn kind_starts_type(kind: &TokenKind) -> bool {
+        matches!(
+            kind,
+            TokenKind::Int
+                | TokenKind::Unsigned
+                | TokenKind::CharKw
+                | TokenKind::Void
+                | TokenKind::Struct
+        )
     }
-
+    fn starts_type(&self) -> bool {
+        Self::kind_starts_type(&self.peek().kind)
+    }
     fn identifier(&mut self, message: &str) -> Result<(String, Span), Diagnostic> {
-        let token = self.bump();
-        match token.kind {
-            TokenKind::Ident(name) => Ok((name, token.span)),
-            _ => Err(Diagnostic::new(token.span, message)),
+        let t = self.bump();
+        if let TokenKind::Ident(n) = t.kind {
+            Ok((n, t.span))
+        } else {
+            Err(Diagnostic::new(t.span, message))
         }
     }
-
     fn expect(&mut self, kind: TokenKind, message: &str) -> Result<Span, Diagnostic> {
         if self.at(&kind) {
             Ok(self.bump().span)
@@ -466,23 +687,19 @@ impl<'a> Parser<'a> {
             Err(self.error(message))
         }
     }
-
     fn at(&self, kind: &TokenKind) -> bool {
         discriminant(&self.peek().kind) == discriminant(kind)
     }
-
     fn peek(&self) -> &Token {
         &self.tokens[self.current]
     }
-
     fn bump(&mut self) -> Token {
-        let token = self.tokens[self.current].clone();
-        if !matches!(token.kind, TokenKind::Eof) {
+        let t = self.tokens[self.current].clone();
+        if !matches!(t.kind, TokenKind::Eof) {
             self.current += 1;
         }
-        token
+        t
     }
-
     fn error(&self, message: impl Into<String>) -> Diagnostic {
         Diagnostic::new(self.peek().span, message)
     }
@@ -492,54 +709,37 @@ impl<'a> Parser<'a> {
 mod tests {
     use super::*;
     use crate::lexer::lex;
-
-    fn parse_source(source: &str) -> Program {
-        parse(&lex(source).unwrap()).unwrap()
+    fn source(text: &str) -> Program {
+        parse(&lex(text).unwrap()).unwrap()
     }
 
     #[test]
     fn precedence_and_associativity() {
-        let program =
-            parse_source("int main(void) { int x = 1 + 2 * 3; x = x - 1 - 1; return x; }");
+        let p = source("int main(void) { int x = 1 + 2 * 3; return x; }");
         let Stmt::Decl {
             init: Some(init), ..
-        } = &program.function.body.statements[0]
+        } = &p.functions[0].body.as_ref().unwrap().statements[0]
         else {
-            panic!("missing declaration")
+            panic!()
         };
         let ExprKind::Binary(BinaryOp::Add, _, right) = &init.kind else {
-            panic!("add is not expression root")
+            panic!()
         };
         assert!(matches!(right.kind, ExprKind::Binary(BinaryOp::Mul, _, _)));
     }
 
     #[test]
-    fn compound_and_increment_parse() {
-        parse_source("int main(void) { unsigned x = 1u; x <<= 3; ++x; x--; return x; }");
+    fn parses_struct_pointer_array_and_string() {
+        let p = source("struct Pair { int x; char text[3]; }; int main(void) { struct Pair a; struct Pair *p = &a; char s[] = \"hi\"; p->x = s[1]; return sizeof(a); }");
+        assert_eq!(p.structs.len(), 1);
+        assert_eq!(p.structs[0].fields.len(), 2);
     }
 
     #[test]
-    fn parses_all_structured_control_forms() {
-        let program = parse_source(
-            "int main(void) { int x = 0; if (x) x++; else x--; while (x) break; do continue; while (x); for (int i = 0; i < 2; ++i) { x += i; } switch (x) { case 1: x++; break; default: x--; } return x; }",
-        );
-        assert!(program
-            .function
-            .body
-            .statements
-            .iter()
-            .any(|statement| matches!(statement, Stmt::If { .. })));
-        assert!(program
-            .function
-            .body
-            .statements
-            .iter()
-            .any(|statement| matches!(statement, Stmt::For { .. })));
-        assert!(program
-            .function
-            .body
-            .statements
-            .iter()
-            .any(|statement| matches!(statement, Stmt::Switch { .. })));
+    fn parses_prototypes_definitions_and_calls() {
+        let p = source("int add(int, int); int main(void) { return add(20, 22); } int add(int a, int b) { return a + b; }");
+        assert_eq!(p.functions.len(), 3);
+        assert!(p.functions[0].body.is_none());
+        assert!(p.functions[0].params[0].ty.declarator.name.is_none());
     }
 }
