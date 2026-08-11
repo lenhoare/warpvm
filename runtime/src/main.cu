@@ -1436,6 +1436,147 @@ int RunGfxCap(const char* path, uint32_t n_vms) {
   return pass ? 0 : 1;
 }
 
+// Program 01 correctness test. VM 0 starts as a blinker spanning packed words
+// at x=63/64; VM 1 starts as a toroidal 2x2 block across all four corners.
+// Pause after publication so both packed RAM and rendered pixels are stable.
+int RunLifeTest(const char* path) {
+  wvm::WvmFile file;
+  std::string err;
+  if (!wvm::LoadWvm(path, file, err)) {
+    std::fprintf(stderr, "error: %s: %s\n", path, err.c_str());
+    return 2;
+  }
+
+  constexpr uint32_t kLifeVms = 2;
+  constexpr uint32_t kWorldWords = 512;
+  std::vector<wvm::VmImage> images(kLifeVms);
+  for (wvm::VmImage& image : images) {
+    image.code = file.code;
+    image.literals = file.literals;
+    image.mem_size_words = 16384;
+  }
+
+  wvm::PersistentRuntime rt;
+  if (!rt.Init(images, err) || !rt.Launch(err)) {
+    std::fprintf(stderr, "error: %s\n", err.c_str());
+    return 1;
+  }
+  rt.BootAll();
+
+  bool published = false;
+  for (int waited = 0; waited < 10000; ++waited) {
+    if (rt.FrameSeq(0) >= 2 && rt.FrameSeq(1) >= 2) {
+      published = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  bool paused = published;
+  for (uint32_t vm = 0; vm < kLifeVms && paused; ++vm)
+    paused &= rt.Pause(vm);
+
+  bool packed_state = paused;
+  bool life_step = paused;
+  bool toroidal = paused;
+  bool buffer_separation = paused;
+  bool render_mapping = paused;
+  bool isolation = paused;
+  uint32_t stopped_seq[kLifeVms] = {rt.FrameSeq(0), rt.FrameSeq(1)};
+
+  std::vector<uint32_t> worlds[kLifeVms];
+  std::vector<uint32_t> frames[kLifeVms];
+  wvm::VmState states[kLifeVms]{};
+  for (uint32_t vm = 0; vm < kLifeVms && paused; ++vm) {
+    packed_state &= rt.ReadState(vm, states[vm]);
+    const uint32_t current_base = states[vm].sregs[0];
+    buffer_separation &=
+        (current_base == 0 || current_base == kWorldWords) &&
+        states[vm].sregs[1] != current_base;
+    packed_state &=
+        rt.ReadMem(vm, current_base, kWorldWords, worlds[vm]);
+    render_mapping &= rt.ReadFramebuffer(vm, frames[vm]);
+  }
+
+  std::vector<uint32_t> expected0(kWorldWords, 0);
+  const bool horizontal = (stopped_seq[0] & 1u) == 0;
+  if (horizontal) {
+    expected0[257] = 0x80000000u;  // (63,64)
+    expected0[258] = 0x00000003u;  // (64,64), (65,64)
+  } else {
+    expected0[254] = 0x00000001u;  // (64,63)
+    expected0[258] = 0x00000001u;  // (64,64)
+    expected0[262] = 0x00000001u;  // (64,65)
+  }
+
+  std::vector<uint32_t> expected1(kWorldWords, 0);
+  expected1[0] = 0x00000001u;     // (0,0)
+  expected1[3] = 0x80000000u;     // (127,0)
+  expected1[508] = 0x00000001u;   // (0,127)
+  expected1[511] = 0x80000000u;   // (127,127)
+
+  if (worlds[0].size() == kWorldWords) life_step &= worlds[0] == expected0;
+  else life_step = false;
+  if (worlds[1].size() == kWorldWords) toroidal &= worlds[1] == expected1;
+  else toroidal = false;
+  packed_state &= life_step && toroidal;
+  isolation &= worlds[0] != worlds[1];
+
+  auto pixel_matches = [](const std::vector<uint32_t>& frame,
+                          const std::vector<uint32_t>& world) {
+    if (frame.size() != wvm::kVideoWords || world.size() != kWorldWords)
+      return false;
+    for (uint32_t y = 0; y < wvm::kVideoHeight; ++y) {
+      for (uint32_t x = 0; x < wvm::kVideoWidth; ++x) {
+        const uint32_t word = world[y * 4 + (x >> 5)];
+        const bool alive = ((word >> (x & 31)) & 1u) != 0;
+        const uint32_t expected = alive ? 0xFFFFFFFFu : 0xFF000000u;
+        if (frame[y * wvm::kVideoWidth + x] != expected) return false;
+      }
+    }
+    return true;
+  };
+  render_mapping &= pixel_matches(frames[0], expected0);
+  render_mapping &= pixel_matches(frames[1], expected1);
+
+  // Resume both universes and require another independently published frame.
+  for (uint32_t vm = 0; vm < kLifeVms; ++vm) rt.SendCmd(vm, wvm::kCmdRun);
+  bool persistent = false;
+  for (int waited = 0; waited < 10000; ++waited) {
+    if (rt.FrameSeq(0) > stopped_seq[0] &&
+        rt.FrameSeq(1) > stopped_seq[1] &&
+        rt.Status(0) == wvm::kRunning && rt.Status(1) == wvm::kRunning) {
+      persistent = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  const bool pass = packed_state && life_step && toroidal &&
+                    buffer_separation && render_mapping && isolation &&
+                    persistent;
+  std::printf("warplife: packed_state       %s\n",
+              packed_state ? "PASS" : "FAIL");
+  std::printf("warplife: life_step          %s (VM 0 seq=%u, %s)\n",
+              life_step ? "PASS" : "FAIL", stopped_seq[0],
+              horizontal ? "horizontal" : "vertical");
+  std::printf("warplife: toroidal_stilllife %s\n",
+              toroidal ? "PASS" : "FAIL");
+  std::printf("warplife: buffer_separation  %s\n",
+              buffer_separation ? "PASS" : "FAIL");
+  std::printf("warplife: render_mapping     %s\n",
+              render_mapping ? "PASS" : "FAIL");
+  std::printf("warplife: vm_isolation       %s\n",
+              isolation ? "PASS" : "FAIL");
+  std::printf("warplife: persistent         %s\n",
+              persistent ? "PASS" : "FAIL");
+  std::printf(pass ? "warplife: PASS\n" : "warplife: FAIL\n");
+
+  rt.ShutdownAll();
+  const cudaError_t shutdown = rt.Sync();
+  return pass && shutdown == cudaSuccess ? 0 : 1;
+}
+
 // v0.1 capstone: boot 64+ resident VMs that each do a 32-lane computation,
 // exchange a message around a ring, and keep running so they stay
 // inspectable. Verifies the whole milestone, then inspects one VM live.
@@ -1541,6 +1682,7 @@ void Usage(const char* argv0) {
   std::printf("                  v0.1.1 capstone: N VMs render distinct images\n");
   std::printf("  view <file.wvm> [--vm N | --vms N]\n");
   std::printf("                  show one VM or a tiled grid of N resident VMs\n");
+  std::printf("  life_test <file.wvm> Program 01 packed-Life correctness test\n");
 }
 
 }  // namespace
@@ -1629,6 +1771,13 @@ int main(int argc, char** argv) {
     }
     if (select_grid) return wvm::ViewVmGrid(argv[2], n_vms);
     return wvm::ViewSingleVm(argv[2], vm_index);
+  }
+  if (std::strcmp(cmd, "life_test") == 0) {
+    if (argc < 3) {
+      std::fprintf(stderr, "error: life_test requires a .wvm file\n");
+      return 2;
+    }
+    return RunLifeTest(argv[2]);
   }
   if (std::strcmp(cmd, "run") == 0) {
     if (argc < 3) {

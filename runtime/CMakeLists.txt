@@ -82,3 +82,8 @@ add_test(NAME gfx_capstone
           ${WVM_AS} $<TARGET_FILE:warpvm>
           ${CMAKE_SOURCE_DIR}/programs/graphics.wva
           ${CMAKE_BINARY_DIR}/gfxcap)
+add_test(NAME program01_warplife
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warplife.sh
+          ${WVM_AS} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/programs/warplife.wva
+          ${CMAKE_BINARY_DIR}/warplife)

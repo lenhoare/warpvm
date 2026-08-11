@@ -1,0 +1,236 @@
+; WarpLife — Program 01.
+;
+; One VM owns one independent 128x128 toroidal Conway's Life world. Worlds are
+; bit-packed in two 512-word RAM buffers. Each warp batch evolves 32 adjacent
+; cells, BALLOT forms the next-state predicate, and REDUCE_OR extracts that
+; otherwise numerically opaque predicate into the packed destination word.
+;
+; Deterministic seeds:
+;   VM 0: horizontal blinker across the x=63/64 packed-word boundary
+;   VM 1: 2x2 still life across all four toroidal corners
+;   VM 2+: deterministic VMID/word-index xorshift pattern
+;
+; RAM (word addresses):
+;   0x000..0x1ff  world A
+;   0x200..0x3ff  world B
+;
+; Run:
+;   warpvm-as programs/warplife.wva -o build/warplife.wvm
+;   warpvm view build/warplife.wvm --vms 64
+
+.const BLACK            0xFF000000
+.const WHITE            0xFFFFFFFF
+.const HIGH_BIT         0x80000000
+
+.const WORLD_WORDS      512
+.const WORLD_B_BASE     512
+
+start:
+    VMID r0
+    LANEID r1
+
+    ; Initialise 32 packed words per iteration. Known-pattern VMs are cleared;
+    ; all other VMs receive a deterministic xorshift-derived word pattern.
+    S_MOV_I s2, 0
+init_words:
+    S_BCAST r2, s2
+    ADD r2, r2, r1              ; packed word index, 0..511
+
+    MUL_I r3, r0, 521
+    ADD r3, r3, r2
+    ADD_I r3, r3, 1             ; non-zero VMID/word-derived seed
+    MOV r4, r3
+    SHL_I r4, r4, 13
+    XOR r3, r3, r4
+    MOV r4, r3
+    SHR_I r4, r4, 17
+    XOR r3, r3, r4
+    MOV r4, r3
+    SHL_I r4, r4, 5
+    XOR r3, r3, r4
+
+    CMP_LT p0, r0, 2
+    @p0 MOV_I r3, 0             ; VM 0/1 start from a cleared world
+    STORE r2, r3                ; world A
+
+    ADD_I r5, r2, WORLD_B_BASE
+    MOV_I r6, 0
+    STORE r5, r6                ; world B
+
+    S_ADD_I s2, s2, 32
+    S_CMP_LT_I p0, s2, WORLD_WORDS
+    JMP_IF_ANY p0, init_words
+
+    ; Seed known patterns with lane 0 only.
+    CMP_EQ p0, r0, 0            ; VM 0
+    CMP_EQ p1, r0, 1            ; VM 1
+    CMP_EQ p2, r1, 0            ; lane 0
+
+    ANDMASK p3, p0, p2
+    MOV_I r2, 257               ; y=64, group=1: x=63
+    MOV_I r3, HIGH_BIT
+    @p3 STORE r2, r3
+    MOV_I r2, 258               ; y=64, group=2: x=64,65
+    MOV_I r3, 3
+    @p3 STORE r2, r3
+
+    ANDMASK p3, p1, p2
+    MOV_I r3, 1
+    MOV_I r2, 0                 ; (0,0)
+    @p3 STORE r2, r3
+    MOV_I r2, 508               ; (0,127)
+    @p3 STORE r2, r3
+    MOV_I r3, HIGH_BIT
+    MOV_I r2, 3                 ; (127,0)
+    @p3 STORE r2, r3
+    MOV_I r2, 511               ; (127,127)
+    @p3 STORE r2, r3
+
+    S_MOV_I s0, 0               ; current world base
+    S_MOV_I s1, WORLD_B_BASE    ; next world base
+
+generation:
+    S_MOV_I s2, 0               ; packed batch, 0..511
+
+evolve_batch:
+    S_BCAST r0, s2              ; packed word index (uniform)
+    AND_I r1, r0, 3
+    SHL_I r1, r1, 5             ; x base for this group
+    LANEID r3
+    ADD r1, r1, r3              ; lane cell x
+    SHR_I r2, r0, 2             ; lane cell y
+    S_BCAST r6, s0              ; current world base
+
+    ; Current cell.
+    MOV r4, r1
+    MOV r5, r2
+    CALL load_cell
+    MOV r12, r7
+
+    MOV_I r11, 0                ; neighbour count
+
+    ; (-1,-1)
+    ADD_I r4, r1, -1
+    ADD_I r5, r2, -1
+    CALL load_cell
+    ADD r11, r11, r7
+
+    ; (0,-1)
+    MOV r4, r1
+    ADD_I r5, r2, -1
+    CALL load_cell
+    ADD r11, r11, r7
+
+    ; (+1,-1)
+    ADD_I r4, r1, 1
+    ADD_I r5, r2, -1
+    CALL load_cell
+    ADD r11, r11, r7
+
+    ; (-1,0)
+    ADD_I r4, r1, -1
+    MOV r5, r2
+    CALL load_cell
+    ADD r11, r11, r7
+
+    ; (+1,0)
+    ADD_I r4, r1, 1
+    MOV r5, r2
+    CALL load_cell
+    ADD r11, r11, r7
+
+    ; (-1,+1)
+    ADD_I r4, r1, -1
+    ADD_I r5, r2, 1
+    CALL load_cell
+    ADD r11, r11, r7
+
+    ; (0,+1)
+    MOV r4, r1
+    ADD_I r5, r2, 1
+    CALL load_cell
+    ADD r11, r11, r7
+
+    ; (+1,+1)
+    ADD_I r4, r1, 1
+    ADD_I r5, r2, 1
+    CALL load_cell
+    ADD r11, r11, r7
+
+    ; next = neighbours==3 || (current && neighbours==2)
+    CMP_EQ p0, r11, 3
+    CMP_EQ p1, r11, 2
+    CMP_NE p2, r12, 0
+    ANDMASK p1, p1, p2
+    ORMASK p0, p0, p1
+
+    ; BALLOT produces p0 but predicate masks are not numerically readable.
+    ; Reify each predicate bit in its lane, shift it into position, then OR
+    ; reduce to the uniform packed word. See notes.md finding 1.
+    MOV_I r13, 0
+    @p0 MOV_I r13, 1
+    BALLOT p0, r13
+    SHL r13, r13, r3
+    REDUCE_OR r14, r13
+
+    S_BCAST r8, s1
+    ADD r8, r8, r0              ; destination packed-word address
+    CMP_EQ p1, r3, 0
+    @p1 STORE r8, r14           ; exactly lane 0 stores the packed result
+
+    S_ADD_I s2, s2, 1
+    S_CMP_LT_I p3, s2, WORLD_WORDS
+    JMP_IF_ANY p3, evolve_batch
+
+    ; Render the completed next world. One packed word becomes 32 pixels.
+    MOV_I r12, VIDEO_BASE
+    MOV_I r13, BLACK
+    MOV_I r14, WHITE
+    S_MOV_I s2, 0
+
+render_batch:
+    S_BCAST r0, s2
+    S_BCAST r1, s1
+    ADD r1, r1, r0
+    LOAD r2, r1                 ; all lanes read the same packed word
+    LANEID r3
+    SHR r4, r2, r3
+    AND_I r4, r4, 1
+
+    MOV r5, r13
+    CMP_NE p0, r4, 0
+    @p0 MOV r5, r14
+
+    SHL_I r6, r0, 5
+    ADD r6, r6, r3
+    ADD r6, r6, r12
+    STORE r6, r5                ; 32 distinct framebuffer pixels
+
+    S_ADD_I s2, s2, 1
+    S_CMP_LT_I p0, s2, WORLD_WORDS
+    JMP_IF_ANY p0, render_batch
+
+    ; Make the just-rendered generation current before publication. A host
+    ; observing frame_seq can therefore inspect s0 as the published source.
+    S_MOV s3, s0
+    S_MOV s0, s1
+    S_MOV s1, s3
+    FLIP
+    YIELD
+    JMP generation
+
+; Load one packed cell.
+;   input:  r4=x, r5=y, r6=current world base
+;   output: r7=0/1
+;   clobber: r4,r5,r8,r9
+load_cell:
+    AND_I r4, r4, 127           ; toroidal x wrap
+    AND_I r5, r5, 127           ; toroidal y wrap
+    SHR_I r8, r4, 5             ; horizontal packed-word group
+    SHL_I r9, r5, 2             ; row * 4 packed words
+    ADD r8, r8, r9
+    ADD r8, r8, r6
+    LOAD r7, r8
+    SHR r7, r7, r4              ; SHR masks shift count to x & 31
+    AND_I r7, r7, 1
+    RET

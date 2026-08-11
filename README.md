@@ -90,6 +90,25 @@ build/runtime/warpvm view build/graphics.wvm --vm 0
 build/runtime/warpvm view build/graphics.wvm --vms 64
 ```
 
+## Program 01: WarpLife
+
+`programs/warplife.wva` is a complete 128×128 toroidal Conway's Life program
+written directly in WarpVM assembly. Each VM keeps two bit-packed 512-word
+worlds, evolves 32 cells per warp batch, renders through ordinary framebuffer
+stores, and runs independently forever.
+
+VM 0 is a deterministic blinker, VM 1 is a toroidal four-corner still life,
+and the remaining VMs use deterministic `VMID`-derived worlds:
+
+```sh
+build/tools-rust/release/warpvm-as programs/warplife.wva -o build/warplife.wvm
+build/runtime/warpvm life_test build/warplife.wvm
+build/runtime/warpvm view build/warplife.wvm --vms 64
+```
+
+Concrete architectural issues discovered while writing applications are
+recorded in [`notes.md`](notes.md).
+
 ## Slice status
 
 | Slice | Content | Status |
@@ -108,6 +127,7 @@ build/runtime/warpvm view build/graphics.wvm --vms 64
 | gfx-C | SDL single-VM viewer, host-copy (`gfxsmoke`), attach `frame`/`pixel` | done |
 | gfx-D | SDL multi-VM tiled viewer | done |
 | gfx-★ | **v0.1.1 capstone**: 64 VMs render distinct animated 128×128 images | done |
+| program-01 | **WarpLife**: packed toroidal Life, deterministic tests, 64-world grid | done |
 
 ## v0.1 milestone
 
