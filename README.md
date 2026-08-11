@@ -77,6 +77,19 @@ vm-0> resume
 vm-0> quit
 ```
 
+## Graphics viewer (v0.1.1)
+
+The SDL viewer keeps the persistent kernel running while it presents either
+one enlarged VM or a tiled set of resident VMs. The 64-VM demo uses an 8×8
+grid. Sequence counters trigger a single batched framebuffer-pool transfer and
+one atlas upload, avoiding per-VM copy and texture-update overhead:
+
+```sh
+build/tools-rust/release/warpvm-as programs/graphics.wva -o build/graphics.wvm
+build/runtime/warpvm view build/graphics.wvm --vm 0
+build/runtime/warpvm view build/graphics.wvm --vms 64
+```
+
 ## Slice status
 
 | Slice | Content | Status |
@@ -92,7 +105,8 @@ vm-0> quit
 | ★ | **v0.1 demo**: 64 resident VMs compute + ring-message + stay live | done |
 | gfx-A | framebuffer memory: memory-mapped `LOAD`/`STORE`, reset-clear, isolation | done |
 | gfx-B | `FLIP` publication + `frame_seq`, predefined `VIDEO_*` symbols | done |
-| gfx-C | headless host-copy (`gfxsmoke`), attach `frame`/`pixel` | done |
+| gfx-C | SDL single-VM viewer, host-copy (`gfxsmoke`), attach `frame`/`pixel` | done |
+| gfx-D | SDL multi-VM tiled viewer | done |
 | gfx-★ | **v0.1.1 capstone**: 64 VMs render distinct animated 128×128 images | done |
 
 ## v0.1 milestone

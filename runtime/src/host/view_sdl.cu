@@ -1,12 +1,12 @@
-// SDL2 single-VM framebuffer viewer (v0.1.1, headless-tested copy path).
+// SDL2 framebuffer viewer (v0.1.1).
 //
-// Boots the persistent kernel with the given program, then opens a window
-// showing one VM's 128x128 framebuffer enlarged with nearest-neighbour
-// sampling. The VM keeps running; the texture refreshes whenever the VM
-// publishes a new frame (frame_seq advances). Close the window (or press
-// Esc) to shut the kernel down.
+// Boots the persistent kernel with the given program, then opens either an
+// enlarged single-VM view or a tiled view of every resident VM. VMs keep
+// running while the host updates only tiles whose frame_seq has advanced.
+// Close the window (or press Esc) to shut the kernel down.
 #include <SDL2/SDL.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -17,8 +17,46 @@
 #include "host/wvm_file.h"
 
 namespace wvm {
+namespace {
 
-int ViewSingleVm(const char* path, uint32_t vm_index) {
+struct ViewerLayout {
+  uint32_t displayed_vms;
+  uint32_t columns;
+  uint32_t rows;
+  uint32_t texture_width;
+  uint32_t texture_height;
+};
+
+ViewerLayout MakeGridLayout(uint32_t n_vms) {
+  uint32_t columns = 1;
+  while (columns * columns < n_vms) ++columns;
+  const uint32_t rows = (n_vms + columns - 1) / columns;
+  return ViewerLayout{n_vms, columns, rows, columns * kVideoWidth,
+                      rows * kVideoHeight};
+}
+
+ViewerLayout MakeSingleLayout() {
+  return ViewerLayout{1, 1, 1, kVideoWidth, kVideoHeight};
+}
+
+SDL_Rect FitToWindow(SDL_Renderer* renderer, const ViewerLayout& layout) {
+  int output_width = 0;
+  int output_height = 0;
+  SDL_GetRendererOutputSize(renderer, &output_width, &output_height);
+
+  const double x_scale =
+      static_cast<double>(output_width) / layout.texture_width;
+  const double y_scale =
+      static_cast<double>(output_height) / layout.texture_height;
+  const double scale = std::min(x_scale, y_scale);
+  const int width = static_cast<int>(layout.texture_width * scale);
+  const int height = static_cast<int>(layout.texture_height * scale);
+  return SDL_Rect{(output_width - width) / 2, (output_height - height) / 2,
+                  width, height};
+}
+
+int RunViewer(const char* path, uint32_t resident_vms, uint32_t first_vm,
+              const ViewerLayout& layout) {
   WvmFile file;
   std::string err;
   if (!LoadWvm(path, file, err)) {
@@ -26,13 +64,11 @@ int ViewSingleVm(const char* path, uint32_t vm_index) {
     return 2;
   }
 
-  // Boot enough VMs that `vm_index` exists (others run too, harmlessly).
-  const uint32_t n_vms = vm_index + 1;
-  std::vector<VmImage> images(n_vms);
-  for (uint32_t i = 0; i < n_vms; ++i) {
-    images[i].code = file.code;
-    images[i].literals = file.literals;
-    images[i].mem_size_words = 8;
+  std::vector<VmImage> images(resident_vms);
+  for (VmImage& image : images) {
+    image.code = file.code;
+    image.literals = file.literals;
+    image.mem_size_words = 8;
   }
   PersistentRuntime rt;
   if (!rt.Init(images, err) || !rt.Launch(err)) {
@@ -48,10 +84,37 @@ int ViewSingleVm(const char* path, uint32_t vm_index) {
     return 1;
   }
 
-  const int scale = 4;
+  const bool grid = layout.displayed_vms > 1;
+  const int single_scale = 4;
+  int window_width =
+      grid ? static_cast<int>(layout.texture_width)
+           : static_cast<int>(layout.texture_width) * single_scale;
+  int window_height =
+      grid ? static_cast<int>(layout.texture_height)
+           : static_cast<int>(layout.texture_height) * single_scale;
+  // Keep large grids wholly inside the current desktop. The texture remains
+  // at architectural resolution and SDL performs nearest-neighbour scaling.
+  SDL_Rect usable_bounds{};
+  if (SDL_GetDisplayUsableBounds(0, &usable_bounds) == 0) {
+    const int max_width = std::max(320, usable_bounds.w - 64);
+    const int max_height = std::max(240, usable_bounds.h - 64);
+    const double fit =
+        std::min({1.0, static_cast<double>(max_width) / window_width,
+                  static_cast<double>(max_height) / window_height});
+    window_width = static_cast<int>(window_width * fit);
+    window_height = static_cast<int>(window_height * fit);
+  }
+  char title[128];
+  if (grid) {
+    std::snprintf(title, sizeof(title), "WarpVM - %u VMs (%ux%u)",
+                  layout.displayed_vms, layout.columns, layout.rows);
+  } else {
+    std::snprintf(title, sizeof(title), "WarpVM - VM %u", first_vm);
+  }
+
   SDL_Window* win = SDL_CreateWindow(
-      "WarpVM", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-      kVideoWidth * scale, kVideoHeight * scale, SDL_WINDOW_RESIZABLE);
+      title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, window_width,
+      window_height, SDL_WINDOW_RESIZABLE);
   if (!win) {
     std::fprintf(stderr, "error: SDL_CreateWindow: %s\n", SDL_GetError());
     SDL_Quit();
@@ -69,9 +132,10 @@ int ViewSingleVm(const char* path, uint32_t vm_index) {
     rt.Sync();
     return 1;
   }
-  SDL_Texture* tex =
-      SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888,
-                        SDL_TEXTUREACCESS_STREAMING, kVideoWidth, kVideoHeight);
+  SDL_Texture* tex = SDL_CreateTexture(
+      ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,
+      static_cast<int>(layout.texture_width),
+      static_cast<int>(layout.texture_height));
   if (!tex) {
     std::fprintf(stderr, "error: SDL_CreateTexture: %s\n", SDL_GetError());
     SDL_DestroyRenderer(ren);
@@ -82,12 +146,37 @@ int ViewSingleVm(const char* path, uint32_t vm_index) {
     return 1;
   }
   SDL_SetTextureScaleMode(tex, SDL_ScaleModeNearest);
+  SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
 
-  std::printf("view: VM %u from %s (close window or Esc to exit)\n", vm_index,
-              path);
+  // Streaming texture contents are initially undefined. Black also fills the
+  // unused cells in a non-square final row until VMs publish their first frame.
+  std::vector<uint32_t> atlas(
+      static_cast<size_t>(layout.texture_width) * layout.texture_height,
+      kVideoResetColor);
+  if (SDL_UpdateTexture(tex, nullptr, atlas.data(),
+                        layout.texture_width * sizeof(uint32_t)) != 0) {
+    std::fprintf(stderr, "error: SDL_UpdateTexture: %s\n", SDL_GetError());
+    SDL_DestroyTexture(tex);
+    SDL_DestroyRenderer(ren);
+    SDL_DestroyWindow(win);
+    SDL_Quit();
+    rt.ShutdownAll();
+    rt.Sync();
+    return 1;
+  }
 
-  std::vector<uint32_t> fb;
-  uint32_t last_seq = 0;
+  if (grid) {
+    std::printf("view: %u VMs from %s in a %ux%u grid "
+                "(close window or Esc to exit)\n",
+                layout.displayed_vms, path, layout.columns, layout.rows);
+  } else {
+    std::printf("view: VM %u from %s (close window or Esc to exit)\n",
+                first_vm, path);
+  }
+
+  std::vector<uint32_t> framebuffers;
+  std::vector<uint32_t> last_seq(layout.displayed_vms, 0);
+  std::vector<uint32_t> current_seq(layout.displayed_vms, 0);
   bool running = true;
   while (running) {
     SDL_Event e;
@@ -97,28 +186,72 @@ int ViewSingleVm(const char* path, uint32_t vm_index) {
         running = false;
     }
 
-    // Refresh the texture only when the VM published a new frame.
-    const uint32_t seq = rt.FrameSeq(vm_index);
-    if (seq != last_seq) {
-      last_seq = seq;
-      if (rt.ReadFramebuffer(vm_index, fb))
-        SDL_UpdateTexture(tex, nullptr, fb.data(),
-                          kVideoWidth * sizeof(uint32_t));
+    bool refresh = false;
+    for (uint32_t tile = 0; tile < layout.displayed_vms; ++tile) {
+      current_seq[tile] = rt.FrameSeq(first_vm + tile);
+      refresh |= current_seq[tile] != last_seq[tile];
+    }
+
+    if (refresh &&
+        rt.ReadFramebuffers(first_vm, layout.displayed_vms, framebuffers)) {
+      if (grid) {
+        // Device storage is VM-major; the SDL texture is a row-major atlas.
+        // Compose changed tiles on the CPU, then upload the atlas once.
+        for (uint32_t tile = 0; tile < layout.displayed_vms; ++tile) {
+          if (current_seq[tile] == last_seq[tile]) continue;
+          const uint32_t tile_x = (tile % layout.columns) * kVideoWidth;
+          const uint32_t tile_y = (tile / layout.columns) * kVideoHeight;
+          const uint32_t* source =
+              framebuffers.data() + static_cast<size_t>(tile) * kVideoWords;
+          for (uint32_t y = 0; y < kVideoHeight; ++y) {
+            uint32_t* destination =
+                atlas.data() + static_cast<size_t>(tile_y + y) *
+                                   layout.texture_width +
+                tile_x;
+            std::copy_n(source + static_cast<size_t>(y) * kVideoWidth,
+                        kVideoWidth, destination);
+          }
+        }
+        if (SDL_UpdateTexture(tex, nullptr, atlas.data(),
+                              layout.texture_width * sizeof(uint32_t)) == 0) {
+          last_seq = current_seq;
+        }
+      } else if (SDL_UpdateTexture(tex, nullptr, framebuffers.data(),
+                                   kVideoWidth * sizeof(uint32_t)) == 0) {
+        last_seq = current_seq;
+      }
     }
 
     SDL_RenderClear(ren);
-    SDL_RenderCopy(ren, tex, nullptr, nullptr);
+    const SDL_Rect destination = FitToWindow(ren, layout);
+    SDL_RenderCopy(ren, tex, nullptr, &destination);
     SDL_RenderPresent(ren);
     SDL_Delay(16);  // ~60 fps cap; keeps the display GPU responsive
   }
 
   rt.ShutdownAll();
-  rt.Sync();
+  const cudaError_t sync_result = rt.Sync();
   SDL_DestroyTexture(tex);
   SDL_DestroyRenderer(ren);
   SDL_DestroyWindow(win);
   SDL_Quit();
+  if (sync_result != cudaSuccess) {
+    std::fprintf(stderr, "error: kernel shutdown: %s\n",
+                 cudaGetErrorString(sync_result));
+    return 1;
+  }
   return 0;
+}
+
+}  // namespace
+
+int ViewSingleVm(const char* path, uint32_t vm_index) {
+  // Boot enough VMs that the selected logical VM exists.
+  return RunViewer(path, vm_index + 1, vm_index, MakeSingleLayout());
+}
+
+int ViewVmGrid(const char* path, uint32_t n_vms) {
+  return RunViewer(path, n_vms, 0, MakeGridLayout(n_vms));
 }
 
 }  // namespace wvm

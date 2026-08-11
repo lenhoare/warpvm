@@ -130,8 +130,12 @@ through a fixed memory-mapped region (`VIDEO_BASE = 0x00100000`) decoded in
   resident kernel). The attach console gains `frame` (resolution/format/seq)
   and `pixel <x> <y>`.
 - **Presentation is a host concern** (windows, scaling, grids) and stays out
-  of the ISA. The SDL window viewer is deferred; the automated path is
-  headless (assemble → `.wvm` → resident runtime → host copy → pixel checks).
+  of the ISA. The SDL viewer supports an enlarged single-VM view and a tiled
+  multi-VM view. Per-VM `frame_seq` changes trigger one contiguous pool copy
+  and one composed-atlas upload, rather than separate device and SDL transfers
+  for every VM. Nearest-neighbour sampling and the framebuffer aspect ratio
+  are preserved as the window is resized. Automated pixel validation remains headless
+  (assemble → `.wvm` → resident runtime → host copy → pixel checks).
 
 ## Scheduling
 

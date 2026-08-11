@@ -27,6 +27,7 @@ namespace wvm {
 __global__ void Slice1Kernel(uint32_t* lane_out, uint32_t* sum_out);
 __global__ void VmArrayKernel(const VmDesc* descs, VmState* states);
 int ViewSingleVm(const char* path, uint32_t vm_index);  // host/view_sdl.cu
+int ViewVmGrid(const char* path, uint32_t n_vms);       // host/view_sdl.cu
 }  // namespace wvm
 
 namespace {
@@ -1386,18 +1387,26 @@ int RunGfxCap(const char* path, uint32_t n_vms) {
   // red(x,y) = (x + vmid*4)&0xFF, green(x,y) = y&0xFF; blue = frame (masked
   // out). pixel(127,0): red=(127+vmid*4), green=0. pixel(0,127):
   // red=(vmid*4), green=127.
+  std::vector<uint32_t> framebuffers;
+  if (!rt.ReadFramebuffers(0, n_vms, framebuffers)) {
+    std::printf("gfx_cap: FAIL (bulk framebuffer copy failed)\n");
+    rt.ShutdownAll();
+    rt.Sync();
+    return 1;
+  }
+
   uint32_t bad = 0;
   std::vector<uint32_t> reds;
   reds.reserve(n_vms);
   for (uint32_t i = 0; i < n_vms; ++i) {
-    std::vector<uint32_t> fb;
-    if (!rt.ReadFramebuffer(i, fb)) { ++bad; continue; }
+    const uint32_t* fb =
+        framebuffers.data() + static_cast<size_t>(i) * wvm::kVideoWords;
     const uint32_t red_x0 = (127u + i * 4u) & 0xFFu;   // pixel (127,0)
     const uint32_t red_0y = (0u + i * 4u) & 0xFFu;     // pixel (0,127)
     const uint32_t expect_x0 = 0xFF000000u | (red_x0 << 16);
     const uint32_t expect_0y = 0xFF000000u | (red_0y << 16) | (127u << 8);
-    const uint32_t px_x0 = fb[0 * wvm::kVideoWidth + 127] & 0xFFFFFF00u;
-    const uint32_t px_0y = fb[127 * wvm::kVideoWidth + 0] & 0xFFFFFF00u;
+    const uint32_t px_x0 = fb[127] & 0xFFFFFF00u;
+    const uint32_t px_0y = fb[127 * wvm::kVideoWidth] & 0xFFFFFF00u;
     if (px_x0 != expect_x0 || px_0y != expect_0y) ++bad;
     reds.push_back(red_x0);
   }
@@ -1530,6 +1539,8 @@ void Usage(const char* argv0) {
   std::printf("  gfxsmoke <file.wvm>    headless framebuffer-copy smoke test\n");
   std::printf("  gfx_cap <file.wvm> [--vms N]\n");
   std::printf("                  v0.1.1 capstone: N VMs render distinct images\n");
+  std::printf("  view <file.wvm> [--vm N | --vms N]\n");
+  std::printf("                  show one VM or a tiled grid of N resident VMs\n");
 }
 
 }  // namespace
@@ -1580,10 +1591,43 @@ int main(int argc, char** argv) {
       return 2;
     }
     uint32_t vm_index = 0;
+    uint32_t n_vms = 0;
+    bool select_vm = false;
+    bool select_grid = false;
     for (int i = 3; i < argc; ++i) {
-      if (std::strcmp(argv[i], "--vm") == 0 && i + 1 < argc)
-        vm_index = static_cast<uint32_t>(std::atoi(argv[++i]));
+      const bool is_vm = std::strcmp(argv[i], "--vm") == 0;
+      const bool is_vms = std::strcmp(argv[i], "--vms") == 0;
+      if ((is_vm || is_vms) && i + 1 >= argc) {
+        std::fprintf(stderr, "error: %s requires a value\n", argv[i]);
+        return 2;
+      }
+      if ((is_vm || is_vms) && i + 1 < argc) {
+        char* end = nullptr;
+        const unsigned long value = std::strtoul(argv[++i], &end, 10);
+        if (end == argv[i] || *end != '\0' || value > wvm::kMaxVms ||
+            (is_vms && value == 0) || (is_vm && value >= wvm::kMaxVms)) {
+          std::fprintf(stderr, "error: %s must be %s..%u\n",
+                       is_vm ? "--vm" : "--vms", is_vm ? "0" : "1",
+                       is_vm ? wvm::kMaxVms - 1 : wvm::kMaxVms);
+          return 2;
+        }
+        if (is_vm) {
+          vm_index = static_cast<uint32_t>(value);
+          select_vm = true;
+        } else {
+          n_vms = static_cast<uint32_t>(value);
+          select_grid = true;
+        }
+      } else {
+        std::fprintf(stderr, "error: unknown view option '%s'\n", argv[i]);
+        return 2;
+      }
     }
+    if (select_vm && select_grid) {
+      std::fprintf(stderr, "error: --vm and --vms are mutually exclusive\n");
+      return 2;
+    }
+    if (select_grid) return wvm::ViewVmGrid(argv[2], n_vms);
     return wvm::ViewSingleVm(argv[2], vm_index);
   }
   if (std::strcmp(cmd, "run") == 0) {

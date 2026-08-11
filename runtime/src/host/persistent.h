@@ -211,6 +211,23 @@ class PersistentRuntime {
                       kVideoWords * sizeof(uint32_t),
                       cudaMemcpyDeviceToHost) == cudaSuccess;
   }
+  // Copy a contiguous range of VM framebuffers with one device transfer.
+  // This is the efficient presentation path for the tiled viewer: the
+  // physical pool remains a runtime detail and VM logical addressing is
+  // unchanged.
+  bool ReadFramebuffers(uint32_t first_vm, uint32_t count,
+                        std::vector<uint32_t>& out) const {
+    if (d_framebuffers_ == nullptr || first_vm >= num_vms_ || count == 0 ||
+        count > num_vms_ - first_vm)
+      return false;
+    const size_t words = static_cast<size_t>(count) * kVideoWords;
+    out.resize(words);
+    return cudaMemcpy(
+               out.data(),
+               d_framebuffers_ + static_cast<size_t>(first_vm) * kVideoWords,
+               words * sizeof(uint32_t), cudaMemcpyDeviceToHost) ==
+           cudaSuccess;
+  }
 
   // ---- status reads (mapped memory, no sync needed) -----------------------
   uint32_t num_vms() const { return num_vms_; }
