@@ -49,8 +49,9 @@ Warp C currently supports signed `int`, `unsigned`, word-sized unsigned
 `char`, local variables, integer expressions, structured conditionals and
 loops, `switch`, named functions, prototypes, up to four parameters,
 assignment, pointers, fixed arrays, structs, word-per-character strings,
-globals, `sizeof`, `return`, and the `warp_lane_id()` / `warp_vm_id()`
-intrinsics, including nested divergent `if` / `else`. It emits inspectable
+globals, `sizeof`, `return`, the `warp_lane_id()` / `warp_vm_id()` intrinsics,
+and the built-in `<warp.h>` framebuffer API, including nested divergent
+`if` / `else`. It emits inspectable
 WarpVM assembly and assembles it in-process to canonical `.wvm`:
 
 ```sh
@@ -58,6 +59,10 @@ build/tools-rust/release/warpc programs/warpc/integer_smoke.wc \
   -o build/warpc_integer_smoke.wvm --emit-asm --dump-uniformity
 build/runtime/warpvm run build/warpc_integer_smoke.wvm
 build/runtime/warpvm compiled_run build/warpc_integer_smoke.wvm
+
+build/tools-rust/release/warpc programs/warpc/hello_pixels.wc \
+  -o build/hello_pixels.wvm
+build/runtime/warpvm view build/hello_pixels.wvm --vm 0
 ```
 
 The current subset and integer semantics are documented in
@@ -169,6 +174,7 @@ control-poll, and memory breakdown is in
 | v0.1.4-C | function prototypes/calls, parameters, returns, and lane-private stack ABI | done |
 | v0.1.4-D | word-addressed pointers, arrays, structs, strings, globals, and automatic memory frames | done |
 | v0.1.4-E | uniformity propagation, lane/VM intrinsics, and masked divergent `if` / `else` | done |
+| v0.1.4-F | built-in `warp.h`, ARGB/framebuffer helpers, and `FLIP` | done |
 
 ## v0.1 milestone
 

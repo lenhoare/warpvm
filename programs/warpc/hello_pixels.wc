@@ -1,0 +1,59 @@
+#include <warp.h>
+
+int main(void)
+{
+    unsigned *framebuffer = warp_framebuffer();
+    unsigned red = warp_argb(255, 255, 0, 0);
+    unsigned green = warp_argb(255, 0, 255, 0);
+    unsigned blue = warp_argb(255, 0, 0, 255);
+    unsigned white = warp_argb(255, 255, 255, 255);
+
+    for (int y = 0; y < WARP_VIDEO_HEIGHT; ++y) {
+        for (int x = 0; x < WARP_VIDEO_WIDTH; ++x) {
+            unsigned colour = 0;
+            switch ((x >> 4) & 3) {
+            case 0:
+                colour = red;
+                break;
+            case 1:
+                colour = green;
+                break;
+            case 2:
+                colour = blue;
+                break;
+            default:
+                colour = white;
+                break;
+            }
+            warp_set_pixel(x, y, colour);
+        }
+    }
+
+    /* Check every word through the ordinary framebuffer pointer. This makes
+     * the acceptance test prove a complete image, not just sampled pixels. */
+    int result = 42;
+    for (int y = 0; y < WARP_VIDEO_HEIGHT; ++y) {
+        for (int x = 0; x < WARP_VIDEO_WIDTH; ++x) {
+            unsigned expected = 0;
+            switch ((x >> 4) & 3) {
+            case 0:
+                expected = red;
+                break;
+            case 1:
+                expected = green;
+                break;
+            case 2:
+                expected = blue;
+                break;
+            default:
+                expected = white;
+                break;
+            }
+            if (framebuffer[y * WARP_VIDEO_WIDTH + x] != expected)
+                result = 0;
+        }
+    }
+
+    warp_flip();
+    return result;
+}

@@ -5,8 +5,7 @@ a lexer, parser, typed semantic tree, uniformity analysis, and direct WarpVM
 assembly lowering. The generated assembly is passed to the existing Rust
 assembler library in-process, producing a canonical `.wvm` file.
 
-This document describes the implemented v0.1.4 Slice A through E checkpoints.
-Later slices in `project_spec_01_04.md` will add graphics support.
+This document describes the implemented v0.1.4 Slice A through F checkpoints.
 
 ## Command line
 
@@ -70,15 +69,31 @@ Slice E relaxes that restriction specifically for structured `if` / `else`.
 The deliberately small declarator subset currently supports one array suffix,
 ordinary pointer stars, and top-level named structure definitions. Brace
 initializers, structure assignment/return, casts, conditional expressions,
-variadic functions, and graphics intrinsics are not yet accepted. Character
+and variadic functions are not yet accepted. Character
 arrays may be initialized directly from strings; scalar globals require
 constant integer or string-pointer initializers.
 
-The compiler injects two zero-argument Warp intrinsics directly, without a
-preprocessor or header dependency:
+The compiler injects the Warp intrinsics directly:
 
 - `warp_lane_id()` returns lane 0–31 and is divergent;
 - `warp_vm_id()` returns the current VM ID and is uniform within a VM.
+
+Slice F also accepts `#include <warp.h>` as its one built-in include. This is
+deliberately not a general preprocessor: other `#` directives are diagnosed.
+The interface and its matching documentation header at `include/warp.h`
+provide:
+
+- `WARP_VIDEO_WIDTH`, `WARP_VIDEO_HEIGHT`, `WARP_VIDEO_WORDS`, and
+  `WARP_VIDEO_BASE` as unsigned constant expressions;
+- `warp_framebuffer()` returning the ordinary word-addressed ARGB8888 buffer;
+- `warp_argb(a, r, g, b)` masking and packing four 8-bit components;
+- `warp_set_pixel(x, y, colour)` lowering to address arithmetic and `STORE`;
+- `warp_flip()` lowering to the existing unguarded `FLIP` instruction.
+
+No implicit clipping or bounds check is added to `warp_set_pixel`; invalid
+coordinates retain the architecture's normal memory-fault behaviour.
+`warp_flip()` is rejected inside divergent control because publication is one
+VM-wide event, while framebuffer stores may be lane-predicated normally.
 
 ## Integer semantics
 
@@ -199,3 +214,10 @@ normal jump, and a divergent branch that becomes a ballot mask.
 each half, masked lane-private RAM stores/loads, complementary else masks, and
 reconvergence to `r0 = 42` in all lanes. Both match complete interpreter/PTX
 state, predicate masks, and RAM.
+
+`warpc_graphics` compiles `programs/warpc/hello_pixels.wc`, fills and reads back
+all 16,384 framebuffer words, and publishes exactly one frame. The one-shot
+GPU interpreter and PTX backend must both halt with `r0 = 42` and exact state,
+RAM, framebuffer, and frame-sequence equivalence. A persistent-runtime check
+then verifies the 128x128 ARGB8888 format, `frame_seq = 1`, and known red,
+green, blue, and white pixels through the attach inspection path.

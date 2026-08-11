@@ -92,6 +92,11 @@ add_test(NAME warpc_divergent_if
           ${WVM_WARPC} $<TARGET_FILE:warpvm>
           ${CMAKE_SOURCE_DIR}/programs/warpc/divergent_if.wc
           ${CMAKE_BINARY_DIR}/warpc_divergent_if warpc_divergent_if)
+add_test(NAME warpc_graphics
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_graphics.sh
+          ${WVM_WARPC} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/programs/warpc/hello_pixels.wc
+          ${CMAKE_BINARY_DIR}/warpc_graphics)
 
 add_test(NAME pipeline_hello
   COMMAND bash ${CMAKE_SOURCE_DIR}/tests/pipeline.sh

@@ -2,7 +2,7 @@ use crate::ast::{AssignOp, BinaryOp, UnaryOp};
 use crate::sema::{
     type_size, FunctionId, GlobalInfo, Intrinsic, LValue, LocalId, LocalInfo, StructInfo,
     SwitchLabel, Type, TypedBlock, TypedExpr, TypedExprKind, TypedForInit, TypedFunction,
-    TypedInitializer, TypedProgram, TypedStmt, Uniformity,
+    TypedInitializer, TypedProgram, TypedStmt, Uniformity, WARP_VIDEO_BASE, WARP_VIDEO_WIDTH,
 };
 use crate::span::{Diagnostic, Span};
 
@@ -559,14 +559,8 @@ impl<'a> Generator<'a> {
                 self.instr(&format!("MOV r{reg}, {address}"));
                 Ok(Value { reg, owned: true })
             }
-            TypedExprKind::Intrinsic(Intrinsic::LaneId) => Ok(Value {
-                reg: LANE_REG,
-                owned: false,
-            }),
-            TypedExprKind::Intrinsic(Intrinsic::VmId) => {
-                let reg = self.alloc_reg(expr.span)?;
-                self.instr(&format!("VMID r{reg}"));
-                Ok(Value { reg, owned: true })
+            TypedExprKind::Intrinsic { intrinsic, args } => {
+                self.intrinsic(*intrinsic, args, expr.span)
             }
             TypedExprKind::LValue(lvalue) => {
                 if expr.ty.is_array() || expr.ty.is_struct() {
@@ -680,6 +674,82 @@ impl<'a> Generator<'a> {
                         owned: true,
                     })
                 }
+            }
+        }
+    }
+
+    fn intrinsic(
+        &mut self,
+        intrinsic: Intrinsic,
+        args: &[TypedExpr],
+        span: Span,
+    ) -> Result<Value, Diagnostic> {
+        match intrinsic {
+            Intrinsic::LaneId => Ok(Value {
+                reg: LANE_REG,
+                owned: false,
+            }),
+            Intrinsic::VmId => {
+                let reg = self.alloc_reg(span)?;
+                self.instr(&format!("VMID r{reg}"));
+                Ok(Value { reg, owned: true })
+            }
+            Intrinsic::Framebuffer => {
+                let reg = self.alloc_reg(span)?;
+                self.instr(&format!("MOV r{reg}, {WARP_VIDEO_BASE}"));
+                Ok(Value { reg, owned: true })
+            }
+            Intrinsic::Flip => {
+                // FLIP has VM-wide semantics and cannot carry a lane predicate.
+                // Semantic analysis guarantees this is outside divergence.
+                self.raw_instr("FLIP");
+                Ok(Value {
+                    reg: 0,
+                    owned: false,
+                })
+            }
+            Intrinsic::Argb => {
+                let mut values = Vec::with_capacity(args.len());
+                for arg in args {
+                    values.push(self.expr(arg)?);
+                }
+                let out = self.alloc_reg(span)?;
+                self.instr(&format!("AND r{out}, r{}, 255", values[0].reg));
+                self.release(values[0]);
+                self.instr(&format!("SHL r{out}, r{out}, 24"));
+
+                let component = self.alloc_reg(span)?;
+                for (value, shift) in values[1..].iter().copied().zip([16, 8, 0]) {
+                    self.instr(&format!("AND r{component}, r{}, 255", value.reg));
+                    self.release(value);
+                    if shift != 0 {
+                        self.instr(&format!("SHL r{component}, r{component}, {shift}"));
+                    }
+                    self.instr(&format!("OR r{out}, r{out}, r{component}"));
+                }
+                self.free_reg(component);
+                Ok(Value {
+                    reg: out,
+                    owned: true,
+                })
+            }
+            Intrinsic::SetPixel => {
+                let x = self.expr(&args[0])?;
+                let y = self.expr(&args[1])?;
+                let colour = self.expr(&args[2])?;
+                let address = self.alloc_reg(span)?;
+                self.instr(&format!("MUL r{address}, r{}, {WARP_VIDEO_WIDTH}", y.reg));
+                self.release(y);
+                self.instr(&format!("ADD r{address}, r{address}, r{}", x.reg));
+                self.release(x);
+                self.instr(&format!("ADD r{address}, r{address}, {WARP_VIDEO_BASE}"));
+                self.instr(&format!("STORE r{address}, r{}", colour.reg));
+                self.release(colour);
+                self.free_reg(address);
+                Ok(Value {
+                    reg: 0,
+                    owned: false,
+                })
             }
         }
     }

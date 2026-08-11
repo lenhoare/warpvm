@@ -636,3 +636,29 @@ constructs may motivate predicate spilling or a compiler-managed mask stack,
 but the current programs do not justify an opcode. Two-level structured
 divergence already works using `BALLOT`, `NOTMASK`, `ANDMASK`, and ordinary
 instruction guards.
+
+## 21. The graphics C API is a lowering layer, not a new instruction family
+
+**Discovered by:** Warp C v0.1.4 Slice F
+
+**Classification:** compiler and one-shot runtime integration; no ISA change
+
+The four useful source operations map cleanly onto facilities already present.
+`warp_framebuffer()` is the constant memory-mapped base, `warp_set_pixel()` is
+ordinary `y * 128 + x` address arithmetic plus `STORE`, and `warp_argb()` is
+mask/shift/or arithmetic. Only `warp_flip()` is intrinsically VM-wide, and it
+lowers directly to the existing unguarded `FLIP`. The compiler rejects a flip
+inside divergent control rather than assigning ambiguous per-lane publication
+semantics; divergent pixel stores remain naturally expressible.
+
+The 188-word `hello_pixels.wc` acceptance program fills a 128x128 four-colour
+image, reads back every framebuffer word, publishes exactly one frame, and
+returns 42. The GPU interpreter, logical CPU interpreter, and direct PTX
+backend agree on execution and the full framebuffer; persistent inspection
+also confirms exact sampled ARGB values and `frame_seq = 1`.
+
+This test exposed one host-path omission: the old one-shot GPU `run` wrapper
+created `VmDesc` records without framebuffer storage even though persistent
+VMs and the compiled path already supplied it. Allocating the canonical
+framebuffer in that wrapper made the architectural memory map consistent. No
+opcode, WVM format, or interpreter address-decoding change was needed.

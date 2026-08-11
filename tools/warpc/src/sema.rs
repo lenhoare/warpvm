@@ -286,6 +286,10 @@ pub struct TypedExpr {
 pub enum Intrinsic {
     LaneId,
     VmId,
+    Framebuffer,
+    Flip,
+    Argb,
+    SetPixel,
 }
 
 #[derive(Clone, Debug)]
@@ -308,7 +312,10 @@ pub enum LValue {
 pub enum TypedExprKind {
     Literal(u32),
     StringAddress(usize),
-    Intrinsic(Intrinsic),
+    Intrinsic {
+        intrinsic: Intrinsic,
+        args: Vec<TypedExpr>,
+    },
     LValue(LValue),
     AddressOf(LValue),
     Unary(ast::UnaryOp, Box<TypedExpr>),
@@ -655,7 +662,15 @@ impl Analyzer {
     }
 
     fn register_function(&mut self, function: &ast::Function) -> Result<(), Diagnostic> {
-        if matches!(function.name.as_str(), "warp_lane_id" | "warp_vm_id") {
+        if matches!(
+            function.name.as_str(),
+            "warp_lane_id"
+                | "warp_vm_id"
+                | "warp_framebuffer"
+                | "warp_flip"
+                | "warp_argb"
+                | "warp_set_pixel"
+        ) {
             return Err(Diagnostic::new(
                 function.span,
                 format!("'{}' is a reserved Warp C intrinsic", function.name),
@@ -1190,7 +1205,14 @@ impl Analyzer {
                 })
             }
             ast::ExprKind::Name(name) => {
-                if let Some(local) = self.lookup(&name) {
+                if let Some(value) = builtin_constant(&name) {
+                    Ok(TypedExpr {
+                        kind: TypedExprKind::Literal(value),
+                        ty: Type::U32,
+                        uniformity: Uniformity::Uniform,
+                        span,
+                    })
+                } else if let Some(local) = self.lookup(&name) {
                     let info = &self.locals[local];
                     Ok(TypedExpr {
                         kind: TypedExprKind::LValue(LValue::Local(local)),
@@ -1254,21 +1276,50 @@ impl Analyzer {
         args: Vec<ast::Expr>,
         span: Span,
     ) -> Result<TypedExpr, Diagnostic> {
-        let intrinsic = match callee.as_str() {
-            "warp_lane_id" => Some((Intrinsic::LaneId, Uniformity::Divergent)),
-            "warp_vm_id" => Some((Intrinsic::VmId, Uniformity::Uniform)),
+        let signature = match callee.as_str() {
+            "warp_lane_id" => Some((Intrinsic::LaneId, 0, Type::I32, Uniformity::Divergent)),
+            "warp_vm_id" => Some((Intrinsic::VmId, 0, Type::U32, Uniformity::Uniform)),
+            "warp_framebuffer" => Some((
+                Intrinsic::Framebuffer,
+                0,
+                Type::U32.pointer_to(),
+                Uniformity::Uniform,
+            )),
+            "warp_flip" => Some((Intrinsic::Flip, 0, Type::VOID, Uniformity::Uniform)),
+            "warp_argb" => Some((Intrinsic::Argb, 4, Type::U32, Uniformity::Uniform)),
+            "warp_set_pixel" => Some((Intrinsic::SetPixel, 3, Type::VOID, Uniformity::Uniform)),
             _ => None,
         };
-        if let Some((intrinsic, uniformity)) = intrinsic {
-            if !args.is_empty() {
+        if let Some((intrinsic, arity, ty, base_uniformity)) = signature {
+            if args.len() != arity {
                 return Err(Diagnostic::new(
                     span,
-                    format!("intrinsic '{callee}' takes no arguments"),
+                    format!(
+                        "intrinsic '{callee}' expects {arity} arguments but received {}",
+                        args.len()
+                    ),
                 ));
             }
+            if intrinsic == Intrinsic::Flip && self.divergent_depth != 0 {
+                return Err(Diagnostic::new(
+                    span,
+                    "warp_flip() is not allowed inside divergent control flow",
+                ));
+            }
+            let mut uniformity = base_uniformity;
+            let mut typed_args = Vec::with_capacity(args.len());
+            for arg in args {
+                let arg = self.expr(arg)?;
+                require_integer(&arg, "graphics intrinsic argument")?;
+                uniformity = uniformity.join(arg.uniformity);
+                typed_args.push(arg);
+            }
             return Ok(TypedExpr {
-                kind: TypedExprKind::Intrinsic(intrinsic),
-                ty: Type::U32,
+                kind: TypedExprKind::Intrinsic {
+                    intrinsic,
+                    args: typed_args,
+                },
+                ty,
                 uniformity,
                 span,
             });
@@ -1990,10 +2041,27 @@ fn require_integer(expr: &TypedExpr, role: &str) -> Result<(), Diagnostic> {
     }
 }
 
+pub const WARP_VIDEO_WIDTH: u32 = 128;
+pub const WARP_VIDEO_HEIGHT: u32 = 128;
+pub const WARP_VIDEO_WORDS: u32 = WARP_VIDEO_WIDTH * WARP_VIDEO_HEIGHT;
+pub const WARP_VIDEO_BASE: u32 = 0x0010_0000;
+
+fn builtin_constant(name: &str) -> Option<u32> {
+    match name {
+        "WARP_VIDEO_WIDTH" => Some(WARP_VIDEO_WIDTH),
+        "WARP_VIDEO_HEIGHT" => Some(WARP_VIDEO_HEIGHT),
+        "WARP_VIDEO_WORDS" => Some(WARP_VIDEO_WORDS),
+        "WARP_VIDEO_BASE" => Some(WARP_VIDEO_BASE),
+        _ => None,
+    }
+}
+
 fn constant_ast(expr: &ast::Expr) -> Result<u32, Diagnostic> {
     match &expr.kind {
         ast::ExprKind::Number(text) => Ok(parse_integer(text, expr.span)?.0),
         ast::ExprKind::Char(value) => Ok(*value),
+        ast::ExprKind::Name(name) => builtin_constant(name)
+            .ok_or_else(|| Diagnostic::new(expr.span, "not a constant integer expression")),
         ast::ExprKind::Unary(op, operand) => {
             let value = constant_ast(operand)?;
             match op {

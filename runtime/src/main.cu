@@ -114,7 +114,8 @@ bool ExecVmArray(const std::vector<wvm::VmImage>& images,
                  std::vector<std::vector<uint32_t>>& mem_out) {
   const size_t n = images.size();
   std::vector<uint32_t*> d_code(n, nullptr), d_lit(n, nullptr), d_mem(n,
-                                                                      nullptr);
+                                                                      nullptr),
+      d_fb(n, nullptr);
   std::vector<wvm::VmDesc> descs(n);
 
   for (size_t i = 0; i < n; ++i) {
@@ -142,12 +143,14 @@ bool ExecVmArray(const std::vector<wvm::VmImage>& images,
                               seed_words * sizeof(uint32_t),
                               cudaMemcpyHostToDevice));
     }
+    CUDA_CHECK(cudaMalloc(&d_fb[i], wvm::kVideoWords * sizeof(uint32_t)));
     descs[i] = wvm::VmDesc{d_code[i],
                            static_cast<uint32_t>(img.code.size()),
                            d_lit[i],
                            static_cast<uint32_t>(img.literals.size()),
                            d_mem[i],
-                           img.mem_size_words};
+                           img.mem_size_words,
+                           d_fb[i]};
   }
 
   wvm::VmDesc* d_descs = nullptr;
@@ -184,6 +187,7 @@ bool ExecVmArray(const std::vector<wvm::VmImage>& images,
     CUDA_CHECK(cudaFree(d_code[i]));
     CUDA_CHECK(cudaFree(d_lit[i]));
     CUDA_CHECK(cudaFree(d_mem[i]));
+    CUDA_CHECK(cudaFree(d_fb[i]));
   }
   return true;
 }
