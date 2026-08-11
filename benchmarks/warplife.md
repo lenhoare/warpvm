@@ -84,9 +84,11 @@ representation is present in the interpreter.
 
 Before timing, the harness compared all 512 packed world words between CPU
 and GPU at the same generation for VM IDs 0, 1, 2, and 37. All four full
-comparisons passed. The native CPU checks the blinker and toroidal still-life
-seeds after every timed run. Evolution and complete ARGB rendering are timed
-for every implementation; SDL and host framebuffer copies are not.
+comparisons passed. The native CPU now also passes a full 512-word world and
+16,384-pixel ARGB framebuffer comparison for VM IDs 0, 1, 2, and 37; its
+known-seed checks still run after every timed sample. Evolution and complete
+ARGB rendering are timed for every implementation; SDL and host framebuffer
+copies are not.
 
 Two-second requested samples produced the following final run. `s` is actual
 elapsed time, and each rate cell is `average gen/s/VM (min–max); aggregate

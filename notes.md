@@ -392,3 +392,40 @@ model's available parallelism. Before changing the ISA, inspect compiled SASS
 and separate instruction/addressing cost from the deliberate per-VM
 parallelism limit. Generic higher-granularity warp operations remain a
 plausible later experiment; no Life-specific opcode is proposed.
+
+## 14. Compiled WarpVM crosses the handwritten CPU at population scale
+
+**Discovered by:** full-world native CPU equivalence and unified five-engine
+benchmark
+
+**Classification:** positive architecture result; CPU reference remains a
+straightforward scalar baseline
+
+The handwritten native CPU implementation is now an exact semantic gate, not
+only a timing reference. At generation 3, all 512 packed world words and all
+16,384 ARGB framebuffer pixels match canonical WarpLife for VM IDs 0, 1, 2,
+and 37. The independent packed-world hashes match in every case.
+
+At one VM, the scalar native CPU is 53.3x faster than compiled WarpVM: one GPU
+warp has too little parallel work to compete with a CPU core running a direct
+cell loop. The result reverses as the population grows. At 64 VMs, compiled
+WarpVM is 1.82x the one-worker native CPU throughput. At 256 VMs it is 4.82x
+one worker and 1.91x the four-worker run on the two-core/four-thread WSL guest.
+Aggregate compiled throughput reaches 1,175 Mcell/s versus 617 Mcell/s for the
+four-worker native CPU.
+
+This is the intended WarpVM scaling shape: poor single-VM CPU competition but
+strong many-independent-VM throughput. It is a confidence-building result,
+not a claim against optimized CPU Life generally. Host disassembly confirms
+the current native CPU inner loop is scalar; it uses a clear byte-per-cell
+implementation and was built without architecture-specific AVX2 intrinsics.
+An optimized SIMD or bit-parallel CPU reference would be a useful later bar.
+
+Compiled SASS and controlled phase bypasses locate the remaining GPU time.
+The full kernel uses 54 registers and zero local spills; dynamic virtual
+register traffic has disappeared. One generation measures 1.782 ms: evolution
+is 1.573 ms (88.2%), rendering 0.208 ms (11.7%), and launch/YIELD/state
+materialization only 0.007 ms (0.4%). Actual framebuffer writes contribute
+about 0.078 ms. Replacing all nine static evolution RAM loads gives only a
+0.319 ms upper bound, so most remaining cost is the real serialized
+neighbour/address/arithmetic chain across 512 packed batches.

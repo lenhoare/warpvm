@@ -21,11 +21,13 @@
 #include "gpu/warpvm.cuh"
 #include "host/cpu_interpreter.h"
 #include "host/persistent.h"
+#include "host/ptx_compiler.h"
 #include "host/vm_image.h"
 #include "host/wvm_file.h"
 
 namespace wvm {
 int RunCpuGpuLifeEquivalence(const char* path);
+int RunNativeCpuLifeEquivalence(const char* path);
 int RunCpuGpuLifeEquivalenceMode(const char* path,
                                  PersistentKernelMode mode,
                                  const char* label);
@@ -451,6 +453,91 @@ WarpMeasurement MeasureNativeCpu(uint32_t n_vms, uint32_t requested_workers,
   result.max_generations_per_second = max_generations / result.seconds;
   result.aggregate_cells_per_second =
       static_cast<double>(total_generations) * kLifeCells / result.seconds;
+  result.ok = true;
+  return result;
+}
+
+bool CompiledKnownPatternsMatch(const std::vector<VmState>& states,
+                                const std::vector<uint32_t>& memory,
+                                uint32_t memory_words) {
+  auto alive = [&](uint32_t vm, uint32_t x, uint32_t y) {
+    const uint32_t base = states[vm].sregs[0];
+    const uint32_t word = y * 4 + (x >> 5);
+    const uint32_t packed =
+        memory[static_cast<size_t>(vm) * memory_words + base + word];
+    return ((packed >> (x & 31u)) & 1u) != 0;
+  };
+  uint32_t alive0 = 0;
+  for (uint32_t y = 0; y < kLifeHeight; ++y)
+    for (uint32_t x = 0; x < kLifeWidth; ++x)
+      alive0 += alive(0, x, y);
+  if (alive0 != 3) return false;
+  // frame_seq is not part of VmState, but the current blinker orientation is
+  // enough to accept either parity while still rejecting every wrong shape.
+  const bool horizontal = alive(0, 63, 64) && alive(0, 64, 64) &&
+                          alive(0, 65, 64);
+  const bool vertical = alive(0, 64, 63) && alive(0, 64, 64) &&
+                        alive(0, 64, 65);
+  if (!horizontal && !vertical) return false;
+  if (states.size() == 1) return true;
+  uint32_t alive1 = 0;
+  for (uint32_t y = 0; y < kLifeHeight; ++y)
+    for (uint32_t x = 0; x < kLifeWidth; ++x)
+      alive1 += alive(1, x, y);
+  return alive1 == 4 && alive(1, 0, 0) && alive(1, 127, 0) &&
+         alive(1, 0, 127) && alive(1, 127, 127);
+}
+
+WarpMeasurement MeasureCompiledWarpVm(PtxCompiledProgram& compiled,
+                                       uint32_t n_vms, int duration_ms,
+                                       std::string& err) {
+  constexpr uint32_t kMemoryWords = 16384;
+  WarpMeasurement result;
+  std::vector<VmState> states(n_vms);
+  std::vector<uint32_t> memory(static_cast<size_t>(n_vms) * kMemoryWords, 0);
+  std::vector<uint32_t> framebuffers(
+      static_cast<size_t>(n_vms) * kVideoWords, kVideoResetColor);
+  std::vector<uint32_t> frame_seq(n_vms, 0);
+  for (uint32_t vm = 0; vm < n_vms; ++vm) {
+    states[vm].vm_id = vm;
+    states[vm].status = kRunning;
+    states[vm].rng_state = vm * 0x9E3779B9u + 0x1234567u;
+  }
+  if (!compiled.Launch(states, memory, kMemoryWords, framebuffers, frame_seq,
+                       err))
+    return result;
+
+  constexpr uint32_t kCalibrationCheckpoints = 20;
+  double calibration_ms = 0.0;
+  if (!compiled.LaunchCheckpoints(
+          states, memory, kMemoryWords, framebuffers, frame_seq,
+          kCalibrationCheckpoints, calibration_ms, err) ||
+      calibration_ms <= 0.0)
+    return result;
+  const double estimated = kCalibrationCheckpoints * duration_ms /
+                           calibration_ms;
+  const uint32_t checkpoints = static_cast<uint32_t>(
+      std::clamp(estimated, 50.0, 10000.0));
+  const std::vector<uint32_t> before = frame_seq;
+  double elapsed_ms = 0.0;
+  if (!compiled.LaunchCheckpoints(states, memory, kMemoryWords, framebuffers,
+                                  frame_seq, checkpoints, elapsed_ms, err))
+    return result;
+
+  bool frames_ok = true;
+  for (uint32_t vm = 0; vm < n_vms; ++vm)
+    frames_ok &= frame_seq[vm] - before[vm] == checkpoints;
+  if (!frames_ok || !CompiledKnownPatternsMatch(states, memory, kMemoryWords)) {
+    err = !frames_ok ? "compiled frame count mismatch"
+                     : "compiled known-pattern validation failed";
+    return result;
+  }
+  result.seconds = elapsed_ms / 1000.0;
+  result.avg_generations_per_second = checkpoints / result.seconds;
+  result.min_generations_per_second = result.avg_generations_per_second;
+  result.max_generations_per_second = result.avg_generations_per_second;
+  result.aggregate_cells_per_second =
+      static_cast<double>(checkpoints) * n_vms * kLifeCells / result.seconds;
   result.ok = true;
   return result;
 }
@@ -1115,12 +1202,23 @@ int RunLifeBenchmark(const char* path, const std::vector<uint32_t>& vm_counts,
                  "error: refusing to benchmark non-equivalent CPU/GPU state\n");
     return 1;
   }
+  if (RunNativeCpuLifeEquivalence(path) != 0) {
+    std::fprintf(stderr,
+                 "error: refusing to benchmark non-equivalent native CPU "
+                 "state\n");
+    return 1;
+  }
 
   WvmFile file;
   std::string err;
   if (!LoadWvm(path, file, err)) {
     std::fprintf(stderr, "error: %s: %s\n", path, err.c_str());
     return 2;
+  }
+  PtxCompiledProgram compiled_program;
+  if (!compiled_program.Compile(file, err)) {
+    std::fprintf(stderr, "error: compiled WarpLife: %s\n", err.c_str());
+    return 1;
   }
 
   std::vector<uint32_t> counts = vm_counts;
@@ -1144,6 +1242,9 @@ int RunLifeBenchmark(const char* path, const std::vector<uint32_t>& vm_counts,
   std::printf("  CPU WarpVM scheduling quantum: %u instructions\n",
               kCpuVmQuantum);
   std::printf("  workload: toroidal Life evolution + 128x128 ARGB render\n\n");
+  std::printf("  compiled artifact: %zu PTX bytes, JIT %.3f ms\n\n",
+              compiled_program.ptx().size(),
+              compiled_program.jit_milliseconds());
   if (resident_slots > 0) {
     std::printf("  CUDA occupancy estimate: %u resident VM-warp slots\n",
                 resident_slots);
@@ -1161,6 +1262,16 @@ int RunLifeBenchmark(const char* path, const std::vector<uint32_t>& vm_counts,
     if (!warp.ok) {
       std::fprintf(stderr, "error: %u-VM WarpVM benchmark: %s\n", n_vms,
                    err.c_str());
+      pass = false;
+      continue;
+    }
+
+    err.clear();
+    const WarpMeasurement compiled = MeasureCompiledWarpVm(
+        compiled_program, n_vms, duration_ms, err);
+    if (!compiled.ok) {
+      std::fprintf(stderr, "error: %u-VM compiled WarpVM benchmark: %s\n",
+                   n_vms, err.c_str());
       pass = false;
       continue;
     }
@@ -1233,6 +1344,7 @@ int RunLifeBenchmark(const char* path, const std::vector<uint32_t>& vm_counts,
     std::printf("  implementation      workers  seconds   "
                 "gen/s/VM (min..max)       Mcell/s\n");
     print_vm("GPU WarpVM", 0, warp);
+    print_vm("compiled WarpVM", 0, compiled);
     print_vm("CPU WarpVM", 1, cpu_warp_1);
     if (parallel_workers > 1)
       print_vm("CPU WarpVM", parallel_workers, cpu_warp_parallel);
@@ -1257,6 +1369,25 @@ int RunLifeBenchmark(const char* path, const std::vector<uint32_t>& vm_counts,
         cpu_warp_parallel.aggregate_cells_per_second;
     const double native_cuda_vs_warp_gpu =
         native.aggregate_cells_per_second / warp.aggregate_cells_per_second;
+    const double compiled_vs_interpreted =
+        compiled.aggregate_cells_per_second / warp.aggregate_cells_per_second;
+    const double compiled_vs_native_cpu_1 =
+        compiled.aggregate_cells_per_second /
+        native_cpu_1.aggregate_cells_per_second;
+    const double compiled_vs_native_cpu_parallel =
+        compiled.aggregate_cells_per_second /
+        native_cpu_parallel.aggregate_cells_per_second;
+    const double native_cuda_vs_compiled =
+        native.aggregate_cells_per_second /
+        compiled.aggregate_cells_per_second;
+    std::printf("  ratios: compiled WarpVM / GPU WarpVM = %.1fx\n",
+                compiled_vs_interpreted);
+    std::printf("          compiled WarpVM / native CPU(1) = %.3fx",
+                compiled_vs_native_cpu_1);
+    if (parallel_workers > 1)
+      std::printf(", compiled WarpVM / native CPU(%u) = %.3fx",
+                  parallel_workers, compiled_vs_native_cpu_parallel);
+    std::printf("\n");
     std::printf("  ratios: GPU WarpVM / CPU WarpVM(1) = %.3fx", gpu_vs_cpu1);
     if (parallel_workers > 1)
       std::printf(", GPU WarpVM / CPU WarpVM(%u) = %.3fx",
@@ -1271,6 +1402,8 @@ int RunLifeBenchmark(const char* path, const std::vector<uint32_t>& vm_counts,
     std::printf("\n");
     std::printf("          native CUDA / GPU WarpVM = %.1fx\n",
                 native_cuda_vs_warp_gpu);
+    std::printf("          native CUDA / compiled WarpVM = %.1fx\n",
+                native_cuda_vs_compiled);
   }
   std::printf("\nlife_benchmark: %s\n", pass ? "PASS" : "FAIL");
   return pass ? 0 : 1;
@@ -1823,6 +1956,84 @@ int RunCpuGpuLifeEquivalenceMode(const char* path,
 int RunCpuGpuLifeEquivalence(const char* path) {
   return RunCpuGpuLifeEquivalenceMode(path, PersistentKernelMode::kNormal,
                                       "cpu_gpu");
+}
+
+int RunNativeCpuLifeEquivalence(const char* path) {
+  WvmFile file;
+  std::string err;
+  if (!LoadWvm(path, file, err)) {
+    std::fprintf(stderr, "error: %s: %s\n", path, err.c_str());
+    return 2;
+  }
+
+  constexpr std::array<uint32_t, 4> kSelected{0, 1, 2, 37};
+  constexpr uint32_t kNativeVms = 38;
+  constexpr uint32_t kTargetGeneration = 3;
+  constexpr uint32_t kWorldWords = kLifeCells / 32;
+  NativeCpuState native = MakeNativeCpuState(kNativeVms);
+  for (uint32_t generation = 0; generation < kTargetGeneration; ++generation)
+    for (uint32_t vm : kSelected) NativeCpuStepVm(native, vm);
+
+  auto checksum = [](const std::vector<uint32_t>& words) {
+    uint64_t hash = 1469598103934665603ull;
+    for (uint32_t word : words) {
+      hash ^= word;
+      hash *= 1099511628211ull;
+    }
+    return hash;
+  };
+
+  bool equivalent = true;
+  for (uint32_t vm_id : kSelected) {
+    CpuVm interpreted;
+    interpreted.Init(vm_id, file, 16384);
+    const uint64_t budget =
+        static_cast<uint64_t>(kTargetGeneration + 2) * 200000u;
+    while (interpreted.status == kRunning &&
+           interpreted.frame_seq < kTargetGeneration &&
+           interpreted.instruction_counter < budget)
+      interpreted.RunQuantum(kCpuVmQuantum);
+
+    const size_t native_base = static_cast<size_t>(vm_id) * kLifeCells;
+    const uint8_t* native_world =
+        (native.current_is_b[vm_id] ? native.b.data() : native.a.data()) +
+        native_base;
+    std::vector<uint32_t> packed_native(kWorldWords, 0);
+    for (uint32_t word = 0; word < kWorldWords; ++word)
+      for (uint32_t bit = 0; bit < 32; ++bit)
+        packed_native[word] |=
+            static_cast<uint32_t>(native_world[word * 32 + bit] != 0) << bit;
+
+    std::vector<uint32_t> packed_warpvm;
+    const uint32_t world_base = interpreted.sregs[0];
+    if ((world_base == 0 || world_base == kWorldWords) &&
+        interpreted.memory.size() >= world_base + kWorldWords) {
+      packed_warpvm.assign(interpreted.memory.begin() + world_base,
+                           interpreted.memory.begin() + world_base +
+                               kWorldWords);
+    }
+    const uint32_t* native_framebuffer =
+        native.framebuffer.data() + native_base;
+    const bool framebuffer_equal = std::equal(
+        interpreted.framebuffer.begin(), interpreted.framebuffer.end(),
+        native_framebuffer);
+    const bool match = interpreted.status == kRunning &&
+                       interpreted.frame_seq == kTargetGeneration &&
+                       native.generations[vm_id] == kTargetGeneration &&
+                       packed_warpvm == packed_native && framebuffer_equal;
+    equivalent &= match;
+    std::printf(
+        "native_cpu_equivalence: vm=%u generation=%u warpvm=%016llx "
+        "native=%016llx world=%s framebuffer=%s\n",
+        vm_id, kTargetGeneration,
+        static_cast<unsigned long long>(checksum(packed_warpvm)),
+        static_cast<unsigned long long>(checksum(packed_native)),
+        packed_warpvm == packed_native ? "PASS" : "FAIL",
+        framebuffer_equal ? "PASS" : "FAIL");
+  }
+  std::printf("native_cpu_equivalence: %s\n",
+              equivalent ? "PASS" : "FAIL");
+  return equivalent ? 0 : 1;
 }
 
 }  // namespace wvm

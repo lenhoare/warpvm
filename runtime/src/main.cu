@@ -6,6 +6,7 @@
 //   run <file.wvm>  load a .wvm program, run it on one warp, print state
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -38,6 +39,7 @@ int RunLifeBenchmark(const char* path,
                      uint32_t cpu_workers);             // host/life_bench.cu
 int RunLifeProfile(const char* path, int duration_ms);  // host/life_bench.cu
 int RunCpuGpuLifeEquivalence(const char* path);         // host/life_bench.cu
+int RunNativeCpuLifeEquivalence(const char* path);      // host/life_bench.cu
 }  // namespace wvm
 
 namespace {
@@ -855,6 +857,151 @@ int RunCompiledLifeBenchmark(const char* path) {
                 elapsed_ms / benchmark.checkpoints, generations_per_vm,
                 aggregate_mcells);
   }
+  return 0;
+}
+
+struct CompiledProfileResult {
+  double milliseconds = 0.0;
+  size_t ptx_bytes = 0;
+  double jit_milliseconds = 0.0;
+};
+
+bool MeasureCompiledVariant(const wvm::WvmFile& file,
+                            CompiledProfileResult& measurement,
+                            std::string& err) {
+  constexpr uint32_t kMemoryWords = 16384;
+  constexpr uint32_t kCheckpoints = 500;
+  wvm::PtxCompiledProgram compiled;
+  if (!compiled.Compile(file, err)) return false;
+  measurement.ptx_bytes = compiled.ptx().size();
+  measurement.jit_milliseconds = compiled.jit_milliseconds();
+
+  std::array<double, 3> samples{};
+  for (double& sample : samples) {
+    std::vector<wvm::VmState> states(1);
+    states[0].status = wvm::kRunning;
+    states[0].rng_state = 0x1234567u;
+    std::vector<uint32_t> memory(kMemoryWords, 0);
+    std::vector<uint32_t> framebuffer(wvm::kVideoWords,
+                                       wvm::kVideoResetColor);
+    std::vector<uint32_t> frame_seq(1, 0);
+    if (!compiled.Launch(states, memory, kMemoryWords, framebuffer, frame_seq,
+                         err))
+      return false;
+    double elapsed_ms = 0.0;
+    if (!compiled.LaunchCheckpoints(states, memory, kMemoryWords, framebuffer,
+                                    frame_seq, kCheckpoints, elapsed_ms, err))
+      return false;
+    if (frame_seq[0] != kCheckpoints + 1) {
+      err = "compiled profile frame count mismatch";
+      return false;
+    }
+    sample = elapsed_ms / kCheckpoints;
+  }
+  std::sort(samples.begin(), samples.end());
+  measurement.milliseconds = samples[1];
+  return true;
+}
+
+int RunCompiledLifeProfile(const char* path) {
+  wvm::WvmFile file;
+  std::string err;
+  if (!wvm::LoadWvm(path, file, err)) {
+    std::fprintf(stderr, "error: %s: %s\n", path, err.c_str());
+    return 2;
+  }
+  constexpr uint32_t kEvolvePc = 51;
+  constexpr uint32_t kRenderPc = 185;
+  constexpr uint32_t kFramebufferStorePc = 205;
+  constexpr uint32_t kPublishPc = 209;
+  if (file.code.size() != 215 ||
+      ((file.code[kEvolvePc] >> wvm::kOpcodeShift) & wvm::kOpcodeMask) !=
+          wvm::kSMovI ||
+      ((file.code[kRenderPc] >> wvm::kOpcodeShift) & wvm::kOpcodeMask) !=
+          wvm::kLdw ||
+      ((file.code[kFramebufferStorePc] >> wvm::kOpcodeShift) &
+       wvm::kOpcodeMask) != wvm::kStore) {
+    std::fprintf(stderr,
+                 "error: compiled profile PCs do not match WarpLife\n");
+    return 1;
+  }
+
+  wvm::WvmFile evolve_publish = file;
+  evolve_publish.code[kRenderPc] =
+      wvm::enc_i(wvm::kJmp, 0, 0, 0, kPublishPc);
+  wvm::WvmFile render_publish = file;
+  render_publish.code[kEvolvePc] =
+      wvm::enc_i(wvm::kJmp, 0, 0, 0, kRenderPc);
+  wvm::WvmFile publish_only = file;
+  publish_only.code[kEvolvePc] =
+      wvm::enc_i(wvm::kJmp, 0, 0, 0, kPublishPc);
+  wvm::WvmFile no_framebuffer_write = file;
+  no_framebuffer_write.code[kFramebufferStorePc] =
+      wvm::enc_r(wvm::kNop, 0, 0, 0, 0);
+  wvm::WvmFile no_evolution_loads = file;
+  uint32_t removed_loads = 0;
+  for (uint32_t pc = kEvolvePc; pc < kRenderPc; ++pc) {
+    const uint32_t instruction = no_evolution_loads.code[pc];
+    const uint32_t op =
+        (instruction >> wvm::kOpcodeShift) & wvm::kOpcodeMask;
+    if (op != wvm::kLoad) continue;
+    const uint32_t guard =
+        (instruction >> wvm::kGuardShift) & wvm::kGuardMask;
+    const uint32_t rd =
+        (instruction >> wvm::kRdShift) & wvm::kRegFieldMask;
+    no_evolution_loads.code[pc] =
+        wvm::enc_i(wvm::kMovI, guard, rd, 0, 0);
+    ++removed_loads;
+  }
+
+  struct Variant {
+    const char* name;
+    const wvm::WvmFile* file;
+    CompiledProfileResult result;
+  };
+  std::array<Variant, 6> variants{{
+      {"full", &file, {}},
+      {"evolution + publish", &evolve_publish, {}},
+      {"render + publish", &render_publish, {}},
+      {"publish/checkpoint only", &publish_only, {}},
+      {"framebuffer STORE -> NOP", &no_framebuffer_write, {}},
+      {"evolution LOAD -> MOV_I", &no_evolution_loads, {}},
+  }};
+  for (Variant& variant : variants) {
+    if (!MeasureCompiledVariant(*variant.file, variant.result, err)) {
+      std::fprintf(stderr, "error: %s: %s\n", variant.name, err.c_str());
+      return 1;
+    }
+  }
+
+  const double full = variants[0].result.milliseconds;
+  const double evolve_publish_ms = variants[1].result.milliseconds;
+  const double render_publish_ms = variants[2].result.milliseconds;
+  const double publish_ms = variants[3].result.milliseconds;
+  const double evolve_ms = evolve_publish_ms - publish_ms;
+  const double render_ms = render_publish_ms - publish_ms;
+  std::printf("compiled WarpLife one-VM profile\n");
+  std::printf("  median of 3, 500 YIELD checkpoints per sample\n");
+  std::printf("  static evolution LOAD sites replaced: %u\n\n",
+              removed_loads);
+  std::printf("  variant                       ms/generation  PTX bytes\n");
+  for (const Variant& variant : variants)
+    std::printf("  %-29s %13.4f  %9zu\n", variant.name,
+                variant.result.milliseconds, variant.result.ptx_bytes);
+  std::printf("\n  differential attribution\n");
+  std::printf("    evolution:             %8.4f ms  (%5.1f%%)\n",
+              evolve_ms, 100.0 * evolve_ms / full);
+  std::printf("    rendering:             %8.4f ms  (%5.1f%%)\n",
+              render_ms, 100.0 * render_ms / full);
+  std::printf("    checkpoint/launch:     %8.4f ms  (%5.1f%%)\n",
+              publish_ms, 100.0 * publish_ms / full);
+  std::printf("    phase sum residual:    %+8.4f ms\n",
+              full - evolve_ms - render_ms - publish_ms);
+  std::printf("    framebuffer STORE delta:%7.4f ms\n",
+              full - variants[4].result.milliseconds);
+  std::printf("    evolution LOAD upper bound:%6.4f ms\n",
+              full - variants[5].result.milliseconds);
+  std::printf("compiled WarpLife profile: PASS\n");
   return 0;
 }
 
@@ -2388,11 +2535,15 @@ void Usage(const char* argv0) {
   std::printf("                  one-VM opcode, phase, and matched-cost profile\n");
   std::printf("  cpu_tests             v0.1.2 CPU interpreter self-tests\n");
   std::printf("  life_equiv <file.wvm> v0.1.2 CPU/GPU WarpLife equivalence\n");
+  std::printf("  life_native_cpu_equiv <file.wvm>\n");
+  std::printf("                  full-world WarpVM/native CPU equivalence\n");
   std::printf("  compiled_tests        v0.1.3 minimal PTX backend tests\n");
   std::printf("  compiled_life <file.wvm>\n");
   std::printf("                  compiled WarpLife checkpoints and mode transitions\n");
   std::printf("  compiled_life_bench <file.wvm>\n");
   std::printf("                  resident compiled WarpLife benchmark matrix\n");
+  std::printf("  compiled_life_profile <file.wvm>\n");
+  std::printf("                  compiled phase and safe-point attribution\n");
   std::printf("  emit_ptx <file.wvm> -o <file.ptx>\n");
   std::printf("                  translate the supported bytecode subset to PTX\n");
 }
@@ -2430,6 +2581,14 @@ int main(int argc, char** argv) {
       return 2;
     }
     return RunCompiledLifeBenchmark(argv[2]);
+  }
+  if (std::strcmp(cmd, "compiled_life_profile") == 0) {
+    if (argc != 3) {
+      std::fprintf(stderr,
+                   "error: compiled_life_profile requires a .wvm file\n");
+      return 2;
+    }
+    return RunCompiledLifeProfile(argv[2]);
   }
   // The compiled backend uses the CUDA driver API directly, so its semantic
   // tests do not depend on the separately versioned CUDA runtime.
@@ -2527,6 +2686,14 @@ int main(int argc, char** argv) {
       return 2;
     }
     return wvm::RunCpuGpuLifeEquivalence(argv[2]);
+  }
+  if (std::strcmp(cmd, "life_native_cpu_equiv") == 0) {
+    if (argc < 3) {
+      std::fprintf(stderr,
+                   "error: life_native_cpu_equiv requires a .wvm file\n");
+      return 2;
+    }
+    return wvm::RunNativeCpuLifeEquivalence(argv[2]);
   }
   if (std::strcmp(cmd, "life_profile") == 0) {
     if (argc < 3) {

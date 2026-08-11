@@ -109,3 +109,8 @@ add_test(NAME v013_compiled_warplife
           ${WVM_AS} $<TARGET_FILE:warpvm>
           ${CMAKE_SOURCE_DIR}/programs/warplife.wva
           ${CMAKE_BINARY_DIR}/compiled_warplife)
+add_test(NAME program01_native_cpu_equivalence
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warplife_native_cpu.sh
+          ${WVM_AS} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/programs/warplife.wva
+          ${CMAKE_BINARY_DIR}/warplife_native_cpu)
