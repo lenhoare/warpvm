@@ -24,6 +24,31 @@ namespace wvm {
 __global__ void PersistentKernel(const VmDesc* descs, VmState* states,
                                  Control* ctrl, uint32_t num_vms,
                                  Mailbox* mailboxes);
+__global__ void PersistentScalarRegsKernel(const VmDesc*, VmState*, Control*,
+                                           uint32_t, Mailbox*);
+__global__ void PersistentDenseDispatchKernel(const VmDesc*, VmState*,
+                                              Control*, uint32_t, Mailbox*);
+__global__ void PersistentHotDispatchKernel(const VmDesc*, VmState*, Control*,
+                                            uint32_t, Mailbox*);
+__global__ void PersistentHot4DispatchKernel(const VmDesc*, VmState*, Control*,
+                                             uint32_t, Mailbox*);
+__global__ void PersistentCycleProfileKernel(const VmDesc*, VmState*, Control*,
+                                             uint32_t, Mailbox*);
+__global__ void PersistentHotCycleProfileKernel(const VmDesc*, VmState*,
+                                                Control*, uint32_t, Mailbox*);
+__global__ void PersistentHot4CycleProfileKernel(const VmDesc*, VmState*,
+                                                 Control*, uint32_t,
+                                                 Mailbox*);
+__global__ void PersistentScalarDenseKernel(const VmDesc*, VmState*, Control*,
+                                            uint32_t, Mailbox*);
+__global__ void PersistentSharedRegsKernel(const VmDesc*, VmState*, Control*,
+                                           uint32_t, Mailbox*);
+__global__ void PersistentSharedRegsThreeBlockKernel(const VmDesc*, VmState*,
+                                                     Control*, uint32_t,
+                                                     Mailbox*);
+__global__ void PersistentSharedDenseThreeBlockKernel(const VmDesc*, VmState*,
+                                                      Control*, uint32_t,
+                                                      Mailbox*);
 __global__ void PersistentNoFaultVoteKernel(const VmDesc*, VmState*, Control*,
                                             uint32_t, Mailbox*);
 __global__ void PersistentYieldPollKernel(const VmDesc*, VmState*, Control*,
@@ -33,6 +58,17 @@ __global__ void PersistentMinimalProfileKernel(const VmDesc*, VmState*,
 
 enum class PersistentKernelMode {
   kNormal,
+  kScalarRegs,
+  kDenseDispatch,
+  kHotDispatch,
+  kHot4Dispatch,
+  kCycleProfile,
+  kHotCycleProfile,
+  kHot4CycleProfile,
+  kScalarRegsDenseDispatch,
+  kSharedRegs,
+  kSharedRegsThreeBlock,
+  kSharedRegsDenseThreeBlock,
   kNoFaultVotes,
   kYieldOnlyPolling,
   kNoFaultVotesYieldOnlyPolling,
@@ -147,11 +183,55 @@ class PersistentRuntime {
       err = "cudaStreamCreate failed";
       return false;
     }
-    const int block = 256;
+    const int block = kPersistentBlockThreads;
     const int grid = static_cast<int>((num_vms_ * kLanes + block - 1) / block);
     switch (mode) {
       case PersistentKernelMode::kNormal:
         PersistentKernel<<<grid, block, 0, stream_>>>(
+            d_descs_, d_states_, d_ctrl_, num_vms_, d_mailboxes_);
+        break;
+      case PersistentKernelMode::kScalarRegs:
+        PersistentScalarRegsKernel<<<grid, block, 0, stream_>>>(
+            d_descs_, d_states_, d_ctrl_, num_vms_, d_mailboxes_);
+        break;
+      case PersistentKernelMode::kDenseDispatch:
+        PersistentDenseDispatchKernel<<<grid, block, 0, stream_>>>(
+            d_descs_, d_states_, d_ctrl_, num_vms_, d_mailboxes_);
+        break;
+      case PersistentKernelMode::kHotDispatch:
+        PersistentHotDispatchKernel<<<grid, block, 0, stream_>>>(
+            d_descs_, d_states_, d_ctrl_, num_vms_, d_mailboxes_);
+        break;
+      case PersistentKernelMode::kHot4Dispatch:
+        PersistentHot4DispatchKernel<<<grid, block, 0, stream_>>>(
+            d_descs_, d_states_, d_ctrl_, num_vms_, d_mailboxes_);
+        break;
+      case PersistentKernelMode::kCycleProfile:
+        PersistentCycleProfileKernel<<<grid, block, 0, stream_>>>(
+            d_descs_, d_states_, d_ctrl_, num_vms_, d_mailboxes_);
+        break;
+      case PersistentKernelMode::kHotCycleProfile:
+        PersistentHotCycleProfileKernel<<<grid, block, 0, stream_>>>(
+            d_descs_, d_states_, d_ctrl_, num_vms_, d_mailboxes_);
+        break;
+      case PersistentKernelMode::kHot4CycleProfile:
+        PersistentHot4CycleProfileKernel<<<grid, block, 0, stream_>>>(
+            d_descs_, d_states_, d_ctrl_, num_vms_, d_mailboxes_);
+        break;
+      case PersistentKernelMode::kScalarRegsDenseDispatch:
+        PersistentScalarDenseKernel<<<grid, block, 0, stream_>>>(
+            d_descs_, d_states_, d_ctrl_, num_vms_, d_mailboxes_);
+        break;
+      case PersistentKernelMode::kSharedRegs:
+        PersistentSharedRegsKernel<<<grid, block, 0, stream_>>>(
+            d_descs_, d_states_, d_ctrl_, num_vms_, d_mailboxes_);
+        break;
+      case PersistentKernelMode::kSharedRegsThreeBlock:
+        PersistentSharedRegsThreeBlockKernel<<<grid, block, 0, stream_>>>(
+            d_descs_, d_states_, d_ctrl_, num_vms_, d_mailboxes_);
+        break;
+      case PersistentKernelMode::kSharedRegsDenseThreeBlock:
+        PersistentSharedDenseThreeBlockKernel<<<grid, block, 0, stream_>>>(
             d_descs_, d_states_, d_ctrl_, num_vms_, d_mailboxes_);
         break;
       case PersistentKernelMode::kNoFaultVotes:
@@ -178,6 +258,9 @@ class PersistentRuntime {
 
   // ---- host commands -----------------------------------------------------
   void SendCmd(uint32_t vm, VmCmd cmd) { h_ctrl_->cmd[vm] = cmd; }
+  uint64_t ProfileFrameCycles(uint32_t vm) const {
+    return h_ctrl_->profile_frame_cycles[vm];
+  }
   void BootAll() {
     for (uint32_t i = 0; i < num_vms_; ++i) SendCmd(i, kCmdRun);
   }

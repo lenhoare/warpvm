@@ -14,6 +14,9 @@ namespace wvm {
 
 constexpr uint32_t kMaxVms = 256;
 constexpr uint32_t kLogCapacity = 1024;
+// Persistent kernels use this width so the shared register-file layout,
+// launch bounds, occupancy queries, and host launch geometry stay identical.
+constexpr int kPersistentBlockThreads = 256;
 
 // Host → GPU commands, one per VM. The warp consumes its command word
 // (writes it back to kCmdNone) exactly once via ConsumeCmd.
@@ -52,6 +55,9 @@ struct Control {
   volatile uint64_t instrs[kMaxVms];
   volatile uint32_t seq[kMaxVms];    // bumped by the warp on each completed step
   volatile uint32_t frame_seq[kMaxVms];  // bumped by FLIP (frame publication)
+  // Benchmark-only frame timestamps. Normal kernels leave these zero.
+  volatile uint64_t profile_frame_clock[kMaxVms];
+  volatile uint64_t profile_frame_cycles[kMaxVms];
   volatile uint32_t log_head;        // total entries appended
   LogEntry log[kLogCapacity];        // ring buffer
 };

@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -22,6 +23,7 @@
 #include "host/disasm.h"
 #include "host/cpu_interpreter.h"
 #include "host/persistent.h"
+#include "host/ptx_compiler.h"
 #include "host/vm_image.h"
 #include "host/wvm_file.h"
 
@@ -195,6 +197,665 @@ bool ExecProgram(const std::vector<uint32_t>& code,
   if (!ExecVmArray({img}, states, mem)) return false;
   out = states[0];
   return true;
+}
+
+wvm::VmState StateFromCpu(const wvm::CpuVm& cpu) {
+  wvm::VmState state{};
+  state.vm_id = cpu.vm_id;
+  state.status = cpu.status;
+  state.pc = cpu.pc;
+  state.fault_code = cpu.fault;
+  state.instruction_counter = cpu.instruction_counter;
+  for (uint32_t reg = 0; reg < wvm::kVectorRegs; ++reg)
+    for (uint32_t lane = 0; lane < wvm::kLanes; ++lane)
+      state.vregs[reg * wvm::kLanes + lane] = cpu.vregs[reg][lane];
+  std::copy(cpu.sregs.begin(), cpu.sregs.end(), state.sregs);
+  std::copy(cpu.preds.begin(), cpu.preds.end(), state.preds);
+  std::copy(cpu.call_stack.begin(), cpu.call_stack.end(), state.call_stack);
+  state.call_depth = cpu.call_depth;
+  state.rng_state = cpu.rng_state;
+  return state;
+}
+
+bool SameArchitecturalState(const wvm::VmState& left,
+                            const wvm::VmState& right,
+                            std::string& difference) {
+  auto mismatch = [&](const std::string& field) {
+    difference = field;
+    return false;
+  };
+  if (left.vm_id != right.vm_id) return mismatch("vm_id");
+  if (left.status != right.status) return mismatch("status");
+  if (left.pc != right.pc) return mismatch("pc");
+  if (left.fault_code != right.fault_code) return mismatch("fault_code");
+  if (left.instruction_counter != right.instruction_counter)
+    return mismatch("instruction_counter");
+  for (uint32_t reg = 0; reg < wvm::kVectorRegs; ++reg)
+    for (uint32_t lane = 0; lane < wvm::kLanes; ++lane)
+      if (left.vregs[reg * wvm::kLanes + lane] !=
+          right.vregs[reg * wvm::kLanes + lane])
+        return mismatch("r" + std::to_string(reg) + " lane " +
+                        std::to_string(lane));
+  for (uint32_t reg = 0; reg < wvm::kScalarRegs; ++reg)
+    if (left.sregs[reg] != right.sregs[reg])
+      return mismatch("s" + std::to_string(reg));
+  for (uint32_t reg = 0; reg < wvm::kPredRegs; ++reg)
+    if (left.preds[reg] != right.preds[reg])
+      return mismatch("p" + std::to_string(reg));
+  for (uint32_t index = 0; index < wvm::kCallDepth; ++index)
+    if (left.call_stack[index] != right.call_stack[index])
+      return mismatch("call_stack[" + std::to_string(index) + "]");
+  if (left.call_depth != right.call_depth) return mismatch("call_depth");
+  if (left.rng_state != right.rng_state) return mismatch("rng_state");
+  return true;
+}
+
+bool RunCpuToNextYield(wvm::CpuVm& vm) {
+  const uint32_t target_frame = vm.frame_seq + 1;
+  uint64_t steps = 0;
+  while (vm.status == wvm::kRunning && vm.frame_seq < target_frame &&
+         steps < 1000000) {
+    vm.Step();
+    ++steps;
+  }
+  if (vm.status != wvm::kRunning || vm.frame_seq != target_frame ||
+      vm.pc >= vm.code.size())
+    return false;
+  const uint32_t op =
+      (vm.code[vm.pc] >> wvm::kOpcodeShift) & wvm::kOpcodeMask;
+  return op == wvm::kYield && vm.Step();
+}
+
+void RestoreCpuAtCheckpoint(wvm::CpuVm& cpu, const wvm::VmState& state,
+                            const uint32_t* memory,
+                            const uint32_t* framebuffer,
+                            uint32_t frame_seq) {
+  cpu.vm_id = state.vm_id;
+  cpu.status = wvm::kRunning;
+  cpu.pc = state.pc;
+  cpu.fault = state.fault_code;
+  cpu.instruction_counter = state.instruction_counter;
+  for (uint32_t reg = 0; reg < wvm::kVectorRegs; ++reg)
+    for (uint32_t lane = 0; lane < wvm::kLanes; ++lane)
+      cpu.vregs[reg][lane] =
+          state.vregs[reg * wvm::kLanes + lane];
+  std::copy_n(state.sregs, wvm::kScalarRegs, cpu.sregs.begin());
+  std::copy_n(state.preds, wvm::kPredRegs, cpu.preds.begin());
+  std::copy_n(state.call_stack, wvm::kCallDepth, cpu.call_stack.begin());
+  cpu.call_depth = state.call_depth;
+  cpu.rng_state = state.rng_state;
+  std::copy_n(memory, cpu.memory.size(), cpu.memory.begin());
+  std::copy_n(framebuffer, cpu.framebuffer.size(), cpu.framebuffer.begin());
+  cpu.frame_seq = frame_seq;
+}
+
+int RunCompiledSlice1() {
+  bool ok = true;
+  std::string err;
+  std::string difference;
+
+  // Fresh power-on state: compare the exact state produced by the reference
+  // CPU bytecode interpreter with the PTX-compiled form of the same program.
+  wvm::WvmFile arithmetic;
+  arithmetic.code = {
+      wvm::enc_r(wvm::kLaneId, 0, 0, 0, 0),
+      wvm::enc_i(wvm::kMovI, 0, 1, 0, 7),
+      wvm::enc_r(wvm::kAdd, 0, 2, 0, 1),
+      wvm::enc_i(wvm::kMulI, 0, 3, 2, 3),
+      wvm::enc_i(wvm::kXorI, 0, 4, 3, -1),
+      wvm::enc_r(wvm::kHalt, 0, 0, 0, 0),
+  };
+  wvm::CpuVm arithmetic_cpu;
+  arithmetic_cpu.Init(0, arithmetic);
+  arithmetic_cpu.RunQuantum();
+  const wvm::VmState interpreted = StateFromCpu(arithmetic_cpu);
+
+  wvm::PtxCompiledProgram compiled;
+  if (!compiled.Compile(arithmetic, err)) {
+    std::printf("compiled slice 1: PTX compile FAIL: %s\n", err.c_str());
+    return 1;
+  }
+  std::vector<wvm::VmState> compiled_states(1);
+  compiled_states[0].status = wvm::kRunning;
+  compiled_states[0].rng_state = 0x1234567u;
+  if (!compiled.Launch(compiled_states, err)) {
+    std::printf("compiled slice 1: launch FAIL: %s\n", err.c_str());
+    return 1;
+  }
+  const bool fresh_equal =
+      SameArchitecturalState(interpreted, compiled_states[0], difference);
+  std::printf("compiled slice 1: CPU interpreted/compiled state %s",
+              fresh_equal ? "PASS" : "FAIL");
+  if (!fresh_equal) std::printf(" (%s)", difference.c_str());
+  std::printf("\n");
+  ok &= fresh_equal;
+  std::printf("compiled slice 1: PTX %zu bytes, JIT %.3f ms\n",
+              compiled.ptx().size(), compiled.jit_milliseconds());
+
+  // Seeded canonical state: prove that compiled execution consumes existing
+  // VM state rather than assuming every architectural register starts zero.
+  wvm::WvmFile resumed;
+  resumed.code = {
+      wvm::enc_i(wvm::kAddI, 0, 5, 5, 9),
+      wvm::enc_i(wvm::kXorI, 0, 6, 5, 0x55),
+      wvm::enc_r(wvm::kHalt, 0, 0, 0, 0),
+  };
+  wvm::CpuVm cpu;
+  cpu.Init(0, resumed);
+  for (uint32_t lane = 0; lane < wvm::kLanes; ++lane)
+    cpu.vregs[5][lane] = 1000u + lane * 17u;
+  cpu.RunQuantum();
+  const wvm::VmState cpu_state = StateFromCpu(cpu);
+
+  if (!compiled.Compile(resumed, err)) {
+    std::printf("compiled slice 1: seeded PTX compile FAIL: %s\n",
+                err.c_str());
+    return 1;
+  }
+  std::vector<wvm::VmState> resumed_states(1);
+  resumed_states[0].status = wvm::kRunning;
+  resumed_states[0].rng_state = 0x1234567u;
+  for (uint32_t lane = 0; lane < wvm::kLanes; ++lane)
+    resumed_states[0].vregs[5 * wvm::kLanes + lane] =
+        1000u + lane * 17u;
+  if (!compiled.Launch(resumed_states, err)) {
+    std::printf("compiled slice 1: seeded launch FAIL: %s\n", err.c_str());
+    return 1;
+  }
+  difference.clear();
+  const bool seeded_equal =
+      SameArchitecturalState(cpu_state, resumed_states[0], difference);
+  std::printf("compiled slice 1: seeded CPU/compiled state %s",
+              seeded_equal ? "PASS" : "FAIL");
+  if (!seeded_equal) std::printf(" (%s)", difference.c_str());
+  std::printf("\n");
+  ok &= seeded_equal;
+
+  // A backward bytecode branch must become native control flow while keeping
+  // WarpVM's warp-wide ANY semantics and exact dynamic retirement count.
+  wvm::WvmFile control;
+  control.code = {
+      wvm::enc_r(wvm::kLaneId, 0, 0, 0, 0),
+      wvm::enc_i(wvm::kMovI, 0, 1, 0, 0),
+      wvm::enc_i(wvm::kAddI, 0, 1, 1, 1),
+      wvm::enc_r(wvm::kCmpLt, 0, 0, 1, 0),
+      wvm::enc_i(wvm::kJmpIfAny, 1, 0, 0, 2),
+      wvm::enc_r(wvm::kHalt, 0, 0, 0, 0),
+  };
+  wvm::CpuVm control_cpu;
+  control_cpu.Init(0, control);
+  control_cpu.RunQuantum();
+  const wvm::VmState control_reference = StateFromCpu(control_cpu);
+  if (!compiled.Compile(control, err)) {
+    std::printf("compiled slice 2: control-flow PTX compile FAIL: %s\n",
+                err.c_str());
+    return 1;
+  }
+  std::vector<wvm::VmState> control_states(1);
+  control_states[0].status = wvm::kRunning;
+  control_states[0].rng_state = 0x1234567u;
+  if (!compiled.Launch(control_states, err)) {
+    std::printf("compiled slice 2: control-flow launch FAIL: %s\n",
+                err.c_str());
+    return 1;
+  }
+  difference.clear();
+  const bool control_equal =
+      SameArchitecturalState(control_reference, control_states[0], difference);
+  std::printf("compiled slice 2: loop/predicate state %s",
+              control_equal ? "PASS" : "FAIL");
+  if (!control_equal) std::printf(" (%s)", difference.c_str());
+  std::printf(" (instrs=%llu)\n",
+              static_cast<unsigned long long>(
+                  control_states[0].instruction_counter));
+  ok &= control_equal;
+
+  // A compact loop32 form exercises scalar loop control, guarded vector
+  // execution, private RAM, and a backward loop.
+  wvm::WvmFile loop32;
+  loop32.code = {
+      wvm::enc_i(wvm::kSMovI, 0, 0, 0, 0),
+      wvm::enc_r(wvm::kLaneId, 0, 0, 0, 0),
+      wvm::enc_r(wvm::kSBcast, 0, 1, 0, 0),
+      wvm::enc_r(wvm::kAdd, 0, 2, 0, 1),
+      wvm::enc_i(wvm::kCmpLtI, 0, 0, 2, 100),
+      wvm::enc_r(wvm::kStore, 1, 2, 2, 0),
+      wvm::enc_i(wvm::kSAddI, 0, 0, 0, 32),
+      wvm::enc_i(wvm::kSCmpLtI, 0, 1, 0, 100),
+      wvm::enc_i(wvm::kJmpIfAny, 2, 0, 0, 1),
+      wvm::enc_i(wvm::kMovI, 0, 4, 0, 10),
+      wvm::enc_r(wvm::kLoad, 0, 7, 4, 0),
+      wvm::enc_r(wvm::kHalt, 0, 0, 0, 0),
+  };
+  wvm::CpuVm loop_cpu;
+  loop_cpu.Init(0, loop32, 16384);
+  loop_cpu.RunQuantum();
+  const wvm::VmState loop_reference = StateFromCpu(loop_cpu);
+  if (!compiled.Compile(loop32, err)) {
+    std::printf("compiled slice 3: loop32 PTX compile FAIL: %s\n",
+                err.c_str());
+    return 1;
+  }
+  std::vector<wvm::VmState> loop_states(1);
+  loop_states[0].status = wvm::kRunning;
+  loop_states[0].rng_state = 0x1234567u;
+  std::vector<uint32_t> loop_memory(16384, 0);
+  std::vector<uint32_t> no_framebuffer;
+  std::vector<uint32_t> no_frame_seq;
+  if (!compiled.Launch(loop_states, loop_memory, 16384, no_framebuffer,
+                       no_frame_seq, err)) {
+    std::printf("compiled slice 3: loop32 launch FAIL: %s\n", err.c_str());
+    return 1;
+  }
+  difference.clear();
+  const bool loop_state_equal =
+      SameArchitecturalState(loop_reference, loop_states[0], difference);
+  const bool loop_memory_equal = loop_memory == loop_cpu.memory;
+  std::printf("compiled slice 3: loop32 state/memory %s",
+              loop_state_equal && loop_memory_equal ? "PASS" : "FAIL");
+  if (!loop_state_equal) std::printf(" (state: %s)", difference.c_str());
+  if (!loop_memory_equal) std::printf(" (memory differs)");
+  std::printf("\n");
+  ok &= loop_state_equal && loop_memory_equal;
+
+  // Invalid per-lane addresses fault the whole VM at the same bytecode PC;
+  // the faulting memory instruction is not counted as retired.
+  wvm::WvmFile memory_fault;
+  memory_fault.code = {
+      wvm::enc_i(wvm::kMovI, 0, 0, 0, 1000),
+      wvm::enc_r(wvm::kLoad, 0, 1, 0, 0),
+      wvm::enc_r(wvm::kHalt, 0, 0, 0, 0),
+  };
+  wvm::CpuVm fault_cpu;
+  fault_cpu.Init(0, memory_fault, 16);
+  fault_cpu.RunQuantum();
+  if (!compiled.Compile(memory_fault, err)) {
+    std::printf("compiled slice 3: memory-fault PTX compile FAIL: %s\n",
+                err.c_str());
+    return 1;
+  }
+  std::vector<wvm::VmState> fault_states(1);
+  fault_states[0].status = wvm::kRunning;
+  fault_states[0].rng_state = 0x1234567u;
+  std::vector<uint32_t> fault_memory(16, 0);
+  if (!compiled.Launch(fault_states, fault_memory, 16, no_framebuffer,
+                       no_frame_seq, err)) {
+    std::printf("compiled slice 3: memory-fault launch FAIL: %s\n",
+                err.c_str());
+    return 1;
+  }
+  difference.clear();
+  const bool fault_equal = SameArchitecturalState(
+      StateFromCpu(fault_cpu), fault_states[0], difference);
+  std::printf("compiled slice 3: memory-fault semantics %s",
+              fault_equal ? "PASS" : "FAIL");
+  if (!fault_equal) std::printf(" (%s)", difference.c_str());
+  std::printf("\n");
+  ok &= fault_equal;
+
+  // Unsupported bytecode must stop at compilation, never become a partial
+  // instruction-level fallback inside native execution.
+  wvm::WvmFile unsupported;
+  unsupported.code = {
+      wvm::enc_r(wvm::kDiv, 0, 0, 0, 1),
+      wvm::enc_r(wvm::kHalt, 0, 0, 0, 0),
+  };
+  err.clear();
+  const bool rejected = !compiled.Compile(unsupported, err) &&
+                        err.find("unsupported") != std::string::npos;
+  std::printf("compiled slice 1: unsupported opcode rejection %s",
+              rejected ? "PASS" : "FAIL");
+  if (!rejected) std::printf(" (%s)", err.c_str());
+  std::printf("\n");
+  ok &= rejected;
+
+  wvm::PtxCompilationCache cache;
+  std::shared_ptr<wvm::PtxCompiledProgram> cached_first;
+  std::shared_ptr<wvm::PtxCompiledProgram> cached_second;
+  bool first_hit = true;
+  bool second_hit = false;
+  const bool cache_ok =
+      cache.GetOrCompile(arithmetic, cached_first, first_hit, err) &&
+      cache.GetOrCompile(arithmetic, cached_second, second_hit, err) &&
+      !first_hit && second_hit && cached_first == cached_second &&
+      cache.size() == 1;
+  std::printf("compiled slice 9: program-identity cache %s\n",
+              cache_ok ? "PASS" : "FAIL");
+  ok &= cache_ok;
+
+  std::printf(ok ? "compiled backend: PASS\n" :
+                   "compiled backend: FAIL\n");
+  return ok ? 0 : 1;
+}
+
+int EmitCompiledPtx(const char* input, const char* output) {
+  wvm::WvmFile file;
+  std::string err;
+  if (!wvm::LoadWvm(input, file, err)) {
+    std::fprintf(stderr, "error: %s: %s\n", input, err.c_str());
+    return 2;
+  }
+  std::string ptx;
+  if (!wvm::TranslateWvmToPtx(file, ptx, err)) {
+    std::fprintf(stderr, "error: %s\n", err.c_str());
+    return 1;
+  }
+  std::ofstream stream(output, std::ios::binary | std::ios::trunc);
+  if (!stream || !stream.write(ptx.data(), ptx.size())) {
+    std::fprintf(stderr, "error: cannot write %s\n", output);
+    return 1;
+  }
+  std::printf("compiled PTX: %zu bytes -> %s\n", ptx.size(), output);
+  return 0;
+}
+
+int RunCompiledLife(const char* path) {
+  constexpr uint32_t kVms = 2;
+  constexpr uint32_t kMemoryWords = 16384;
+  wvm::WvmFile file;
+  std::string err;
+  if (!wvm::LoadWvm(path, file, err)) {
+    std::fprintf(stderr, "error: %s: %s\n", path, err.c_str());
+    return 2;
+  }
+
+  wvm::PtxCompiledProgram compiled;
+  if (!compiled.Compile(file, err)) {
+    std::printf("compiled WarpLife: compile FAIL: %s\n", err.c_str());
+    return 1;
+  }
+
+  std::vector<wvm::CpuVm> cpu(kVms);
+  for (uint32_t vm = 0; vm < kVms; ++vm) {
+    cpu[vm].Init(vm, file, kMemoryWords);
+    if (!RunCpuToNextYield(cpu[vm])) {
+      std::printf("compiled WarpLife: CPU checkpoint FAIL (vm %u)\n", vm);
+      return 1;
+    }
+  }
+
+  std::vector<wvm::VmState> states(kVms);
+  std::vector<uint32_t> memory(kVms * kMemoryWords, 0);
+  std::vector<uint32_t> framebuffers(kVms * wvm::kVideoWords,
+                                     wvm::kVideoResetColor);
+  std::vector<uint32_t> frame_seq(kVms, 0);
+  for (uint32_t vm = 0; vm < kVms; ++vm) {
+    states[vm].vm_id = vm;
+    states[vm].status = wvm::kRunning;
+    states[vm].rng_state = vm * 0x9E3779B9u + 0x1234567u;
+  }
+  if (!compiled.Launch(states, memory, kMemoryWords, framebuffers,
+                       frame_seq, err)) {
+    std::printf("compiled WarpLife: first checkpoint launch FAIL: %s\n",
+                err.c_str());
+    return 1;
+  }
+
+  bool first_equal = true;
+  std::string difference;
+  for (uint32_t vm = 0; vm < kVms; ++vm) {
+    wvm::VmState expected = StateFromCpu(cpu[vm]);
+    expected.status = wvm::kPaused;
+    difference.clear();
+    const bool state_equal =
+        SameArchitecturalState(expected, states[vm], difference);
+    const bool memory_equal =
+        std::equal(cpu[vm].memory.begin(), cpu[vm].memory.end(),
+                   memory.begin() + vm * kMemoryWords);
+    const bool framebuffer_equal = std::equal(
+        cpu[vm].framebuffer.begin(), cpu[vm].framebuffer.end(),
+        framebuffers.begin() + vm * wvm::kVideoWords);
+    const bool seq_equal = frame_seq[vm] == cpu[vm].frame_seq;
+    if (!state_equal || !memory_equal || !framebuffer_equal || !seq_equal) {
+      std::printf("compiled WarpLife: vm %u differs:", vm);
+      if (!state_equal) std::printf(" state(%s)", difference.c_str());
+      if (!memory_equal) {
+        for (uint32_t i = 0; i < kMemoryWords; ++i) {
+          if (cpu[vm].memory[i] != memory[vm * kMemoryWords + i]) {
+            std::printf(" memory[%u]=%08x/%08x", i, cpu[vm].memory[i],
+                        memory[vm * kMemoryWords + i]);
+            break;
+          }
+        }
+      }
+      if (!framebuffer_equal) {
+        for (uint32_t i = 0; i < wvm::kVideoWords; ++i) {
+          if (cpu[vm].framebuffer[i] !=
+              framebuffers[vm * wvm::kVideoWords + i]) {
+            std::printf(" framebuffer[%u]=%08x/%08x", i,
+                        cpu[vm].framebuffer[i],
+                        framebuffers[vm * wvm::kVideoWords + i]);
+            break;
+          }
+        }
+      }
+      if (!seq_equal)
+        std::printf(" frame_seq=%u/%u", cpu[vm].frame_seq, frame_seq[vm]);
+      std::printf("\n");
+    }
+    first_equal &= state_equal && memory_equal && framebuffer_equal &&
+                   seq_equal;
+  }
+  std::printf("compiled WarpLife: two-VM shared-artifact checkpoint %s\n",
+              first_equal ? "PASS" : "FAIL");
+  if (!first_equal) return 1;
+
+  // compiled -> interpreted: restore VM 0's exact checkpoint into the CPU
+  // reference engine, then retire one more generation there.
+  wvm::CpuVm compiled_to_cpu;
+  compiled_to_cpu.Init(0, file, kMemoryWords);
+  RestoreCpuAtCheckpoint(compiled_to_cpu, states[0], memory.data(),
+                         framebuffers.data(), frame_seq[0]);
+  if (!RunCpuToNextYield(compiled_to_cpu)) {
+    std::printf("compiled WarpLife: compiled->interpreted continuation FAIL\n");
+    return 1;
+  }
+
+  // interpreted -> compiled: materialize the CPU checkpoint for both VMs and
+  // let the same shared native artifact retire their next generation.
+  std::vector<wvm::VmState> transitioned_states(kVms);
+  std::vector<uint32_t> transitioned_memory(kVms * kMemoryWords);
+  std::vector<uint32_t> transitioned_framebuffers(kVms * wvm::kVideoWords);
+  std::vector<uint32_t> transitioned_seq(kVms);
+  for (uint32_t vm = 0; vm < kVms; ++vm) {
+    transitioned_states[vm] = StateFromCpu(cpu[vm]);
+    transitioned_states[vm].status = wvm::kPaused;
+    std::copy(cpu[vm].memory.begin(), cpu[vm].memory.end(),
+              transitioned_memory.begin() + vm * kMemoryWords);
+    std::copy(cpu[vm].framebuffer.begin(), cpu[vm].framebuffer.end(),
+              transitioned_framebuffers.begin() + vm * wvm::kVideoWords);
+    transitioned_seq[vm] = cpu[vm].frame_seq;
+    if (!RunCpuToNextYield(cpu[vm])) {
+      std::printf("compiled WarpLife: second CPU checkpoint FAIL (vm %u)\n",
+                  vm);
+      return 1;
+    }
+  }
+  if (!compiled.Launch(transitioned_states, transitioned_memory,
+                       kMemoryWords, transitioned_framebuffers,
+                       transitioned_seq, err)) {
+    std::printf("compiled WarpLife: interpreted->compiled launch FAIL: %s\n",
+                err.c_str());
+    return 1;
+  }
+
+  bool transition_equal = true;
+  for (uint32_t vm = 0; vm < kVms; ++vm) {
+    wvm::VmState expected = StateFromCpu(cpu[vm]);
+    expected.status = wvm::kPaused;
+    difference.clear();
+    transition_equal &=
+        SameArchitecturalState(expected, transitioned_states[vm], difference);
+    transition_equal &= std::equal(
+        cpu[vm].memory.begin(), cpu[vm].memory.end(),
+        transitioned_memory.begin() + vm * kMemoryWords);
+    transition_equal &= std::equal(
+        cpu[vm].framebuffer.begin(), cpu[vm].framebuffer.end(),
+        transitioned_framebuffers.begin() + vm * wvm::kVideoWords);
+    transition_equal &= transitioned_seq[vm] == cpu[vm].frame_seq;
+  }
+  wvm::VmState c2i_expected = StateFromCpu(cpu[0]);
+  c2i_expected.status = wvm::kPaused;
+  wvm::VmState c2i_actual = StateFromCpu(compiled_to_cpu);
+  c2i_actual.status = wvm::kPaused;
+  difference.clear();
+  const bool reverse_equal =
+      SameArchitecturalState(c2i_expected, c2i_actual, difference) &&
+      compiled_to_cpu.memory == cpu[0].memory &&
+      compiled_to_cpu.framebuffer == cpu[0].framebuffer &&
+      compiled_to_cpu.frame_seq == cpu[0].frame_seq;
+
+  // Mixed session: VM 0 remains live in the persistent interpreter while an
+  // independently identified VM 1 reaches a compiled YIELD checkpoint on a
+  // separate non-blocking stream.
+  wvm::VmImage interpreted_image;
+  interpreted_image.code = file.code;
+  interpreted_image.literals = file.literals;
+  interpreted_image.mem_size_words = kMemoryWords;
+  wvm::PersistentRuntime interpreted_runtime;
+  bool mixed_equal = interpreted_runtime.Init({interpreted_image}, err) &&
+                     interpreted_runtime.Launch(err);
+  const bool mixed_started = mixed_equal;
+  if (mixed_equal) interpreted_runtime.BootAll();
+  for (int waited = 0;
+       mixed_equal && interpreted_runtime.FrameSeq(0) < 1 && waited < 10000;
+       ++waited)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  const bool interpreted_ready = interpreted_runtime.FrameSeq(0) >= 1 &&
+                                 interpreted_runtime.Status(0) == wvm::kRunning;
+  mixed_equal &= interpreted_ready;
+  const uint32_t interpreted_before = interpreted_runtime.FrameSeq(0);
+
+  std::vector<wvm::VmState> mixed_state(1);
+  mixed_state[0].vm_id = 1;
+  mixed_state[0].status = wvm::kRunning;
+  mixed_state[0].rng_state = 1u * 0x9E3779B9u + 0x1234567u;
+  std::vector<uint32_t> mixed_memory(kMemoryWords, 0);
+  std::vector<uint32_t> mixed_framebuffer(wvm::kVideoWords,
+                                           wvm::kVideoResetColor);
+  std::vector<uint32_t> mixed_seq(1, 0);
+  bool mixed_launch = false;
+  if (mixed_equal)
+    mixed_launch = compiled.Launch(mixed_state, mixed_memory, kMemoryWords,
+                                   mixed_framebuffer, mixed_seq, err);
+  mixed_equal &= mixed_launch;
+  std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  const uint32_t interpreted_after = interpreted_runtime.FrameSeq(0);
+  const bool interpreted_progress =
+      interpreted_after > interpreted_before &&
+      interpreted_runtime.Status(0) == wvm::kRunning;
+  mixed_equal &= interpreted_progress;
+
+  wvm::CpuVm mixed_reference;
+  mixed_reference.Init(1, file, kMemoryWords);
+  mixed_equal &= RunCpuToNextYield(mixed_reference);
+  wvm::VmState mixed_expected = StateFromCpu(mixed_reference);
+  mixed_expected.status = wvm::kPaused;
+  difference.clear();
+  const bool mixed_state_equal =
+      SameArchitecturalState(mixed_expected, mixed_state[0], difference);
+  const bool mixed_memory_equal = mixed_memory == mixed_reference.memory;
+  const bool mixed_framebuffer_equal =
+      mixed_framebuffer == mixed_reference.framebuffer;
+  const bool mixed_seq_equal = mixed_seq[0] == mixed_reference.frame_seq;
+  mixed_equal &= mixed_state_equal && mixed_memory_equal &&
+                 mixed_framebuffer_equal && mixed_seq_equal;
+  interpreted_runtime.ShutdownAll();
+  mixed_equal &= interpreted_runtime.Sync() == cudaSuccess;
+
+  std::printf("compiled WarpLife: interpreted->compiled transition %s\n",
+              transition_equal ? "PASS" : "FAIL");
+  std::printf("compiled WarpLife: compiled->interpreted transition %s\n",
+              reverse_equal ? "PASS" : "FAIL");
+  std::printf("compiled WarpLife: simultaneous mixed-mode session %s\n",
+              mixed_equal ? "PASS" : "FAIL");
+  if (!mixed_equal) {
+    std::printf("  mixed diagnostics: start=%d ready=%d launch=%d "
+                "progress=%d frames=%u->%u state=%d(%s) memory=%d "
+                "framebuffer=%d seq=%d error=%s\n",
+                mixed_started, interpreted_ready, mixed_launch,
+                interpreted_progress, interpreted_before, interpreted_after,
+                mixed_state_equal, difference.c_str(), mixed_memory_equal,
+                mixed_framebuffer_equal, mixed_seq_equal, err.c_str());
+  }
+  std::printf("compiled WarpLife: PTX %zu bytes, JIT %.3f ms\n",
+              compiled.ptx().size(), compiled.jit_milliseconds());
+  const bool ok = transition_equal && reverse_equal && mixed_equal;
+  std::printf(ok ? "compiled WarpLife: PASS\n" :
+                   "compiled WarpLife: FAIL\n");
+  return ok ? 0 : 1;
+}
+
+int RunCompiledLifeBenchmark(const char* path) {
+  constexpr uint32_t kMemoryWords = 16384;
+  constexpr uint32_t kCells = 128 * 128;
+  struct Case { uint32_t vms; uint32_t checkpoints; };
+  const Case cases[] = {
+      {1, 500}, {8, 500}, {32, 500}, {64, 500}, {256, 300}};
+
+  wvm::WvmFile file;
+  std::string err;
+  if (!wvm::LoadWvm(path, file, err)) {
+    std::fprintf(stderr, "error: %s: %s\n", path, err.c_str());
+    return 2;
+  }
+  wvm::PtxCompiledProgram compiled;
+  if (!compiled.Compile(file, err)) {
+    std::printf("compiled WarpLife benchmark: compile FAIL: %s\n",
+                err.c_str());
+    return 1;
+  }
+  std::printf("compiled WarpLife benchmark: PTX %zu bytes, JIT %.3f ms\n",
+              compiled.ptx().size(), compiled.jit_milliseconds());
+  std::printf("VMs  checkpoints  ms/checkpoint  gen/s/VM  aggregate Mcell/s\n");
+
+  for (const Case& benchmark : cases) {
+    std::vector<wvm::VmState> states(benchmark.vms);
+    std::vector<uint32_t> memory(
+        static_cast<size_t>(benchmark.vms) * kMemoryWords, 0);
+    std::vector<uint32_t> framebuffers(
+        static_cast<size_t>(benchmark.vms) * wvm::kVideoWords,
+        wvm::kVideoResetColor);
+    std::vector<uint32_t> frame_seq(benchmark.vms, 0);
+    for (uint32_t vm = 0; vm < benchmark.vms; ++vm) {
+      states[vm].vm_id = vm;
+      states[vm].status = wvm::kRunning;
+      states[vm].rng_state = vm * 0x9E3779B9u + 0x1234567u;
+    }
+    // First checkpoint performs deterministic initialization and warms the
+    // generated kernel before the resident timing interval.
+    if (!compiled.Launch(states, memory, kMemoryWords, framebuffers,
+                         frame_seq, err)) {
+      std::printf("compiled WarpLife benchmark: %u-VM warm-up FAIL: %s\n",
+                  benchmark.vms, err.c_str());
+      return 1;
+    }
+    double elapsed_ms = 0.0;
+    if (!compiled.LaunchCheckpoints(
+            states, memory, kMemoryWords, framebuffers, frame_seq,
+            benchmark.checkpoints, elapsed_ms, err)) {
+      std::printf("compiled WarpLife benchmark: %u-VM run FAIL: %s\n",
+                  benchmark.vms, err.c_str());
+      return 1;
+    }
+    bool frames_ok = true;
+    for (uint32_t seq : frame_seq)
+      frames_ok &= seq == benchmark.checkpoints + 1;
+    if (!frames_ok) {
+      std::printf("compiled WarpLife benchmark: %u-VM frame count FAIL\n",
+                  benchmark.vms);
+      return 1;
+    }
+    const double seconds = elapsed_ms / 1000.0;
+    const double generations_per_vm = benchmark.checkpoints / seconds;
+    const double aggregate_mcells =
+        generations_per_vm * benchmark.vms * kCells / 1.0e6;
+    std::printf("%3u  %11u  %13.4f  %8.1f  %17.1f\n",
+                benchmark.vms, benchmark.checkpoints,
+                elapsed_ms / benchmark.checkpoints, generations_per_vm,
+                aggregate_mcells);
+  }
+  return 0;
 }
 
 void PrintState(const wvm::VmState& st) {
@@ -1727,6 +2388,13 @@ void Usage(const char* argv0) {
   std::printf("                  one-VM opcode, phase, and matched-cost profile\n");
   std::printf("  cpu_tests             v0.1.2 CPU interpreter self-tests\n");
   std::printf("  life_equiv <file.wvm> v0.1.2 CPU/GPU WarpLife equivalence\n");
+  std::printf("  compiled_tests        v0.1.3 minimal PTX backend tests\n");
+  std::printf("  compiled_life <file.wvm>\n");
+  std::printf("                  compiled WarpLife checkpoints and mode transitions\n");
+  std::printf("  compiled_life_bench <file.wvm>\n");
+  std::printf("                  resident compiled WarpLife benchmark matrix\n");
+  std::printf("  emit_ptx <file.wvm> -o <file.ptx>\n");
+  std::printf("                  translate the supported bytecode subset to PTX\n");
 }
 
 }  // namespace
@@ -1741,6 +2409,31 @@ int main(int argc, char** argv) {
   // device. Cross-engine commands continue through normal GPU setup below.
   if (std::strcmp(cmd, "cpu_tests") == 0)
     return wvm::RunCpuInterpreterTests();
+  if (std::strcmp(cmd, "emit_ptx") == 0) {
+    if (argc != 5 || std::strcmp(argv[3], "-o") != 0) {
+      std::fprintf(stderr, "error: emit_ptx requires <file.wvm> -o <file.ptx>\n");
+      return 2;
+    }
+    return EmitCompiledPtx(argv[2], argv[4]);
+  }
+  if (std::strcmp(cmd, "compiled_life") == 0) {
+    if (argc != 3) {
+      std::fprintf(stderr, "error: compiled_life requires a .wvm file\n");
+      return 2;
+    }
+    return RunCompiledLife(argv[2]);
+  }
+  if (std::strcmp(cmd, "compiled_life_bench") == 0) {
+    if (argc != 3) {
+      std::fprintf(stderr,
+                   "error: compiled_life_bench requires a .wvm file\n");
+      return 2;
+    }
+    return RunCompiledLifeBenchmark(argv[2]);
+  }
+  // The compiled backend uses the CUDA driver API directly, so its semantic
+  // tests do not depend on the separately versioned CUDA runtime.
+  if (std::strcmp(cmd, "compiled_tests") == 0) return RunCompiledSlice1();
 
   int device = 0;
   CUDA_CHECK(cudaGetDevice(&device));

@@ -26,6 +26,9 @@
 
 namespace wvm {
 int RunCpuGpuLifeEquivalence(const char* path);
+int RunCpuGpuLifeEquivalenceMode(const char* path,
+                                 PersistentKernelMode mode,
+                                 const char* label);
 
 namespace {
 
@@ -134,7 +137,9 @@ bool WaitForWarmup(PersistentRuntime& rt, uint32_t n_vms,
 }
 
 WarpMeasurement MeasureWarpVm(const WvmFile& file, uint32_t n_vms,
-                              int duration_ms, std::string& err) {
+                              int duration_ms, std::string& err,
+                              PersistentKernelMode mode =
+                                  PersistentKernelMode::kNormal) {
   WarpMeasurement result;
   std::vector<VmImage> images(n_vms);
   for (VmImage& image : images) {
@@ -144,7 +149,7 @@ WarpMeasurement MeasureWarpVm(const WvmFile& file, uint32_t n_vms,
   }
 
   PersistentRuntime rt;
-  if (!rt.Init(images, err) || !rt.Launch(err)) return result;
+  if (!rt.Init(images, err) || !rt.Launch(err, mode)) return result;
   rt.BootAll();
   if (!WaitForWarmup(rt, n_vms, 2, 30000)) {
     err = "not all WarpLife VMs published two warm-up generations";
@@ -572,17 +577,95 @@ uint32_t ResidentVmSlots(std::string& err) {
     status = cudaGetDeviceProperties(&properties, device);
   if (status == cudaSuccess) {
     status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &blocks_per_sm, PersistentKernel, 256, 0);
+        &blocks_per_sm, PersistentKernel, kPersistentBlockThreads, 0);
   }
   if (status != cudaSuccess || blocks_per_sm < 1) {
     err = std::string("persistent-kernel occupancy query failed: ") +
           cudaGetErrorString(status);
     return 0;
   }
-  const uint32_t vms_per_block = 256 / kLanes;
+  const uint32_t vms_per_block = kPersistentBlockThreads / kLanes;
   const uint64_t capacity = static_cast<uint64_t>(blocks_per_sm) *
                             properties.multiProcessorCount * vms_per_block;
   return static_cast<uint32_t>(capacity);
+}
+
+struct PersistentKernelStats {
+  int registers_per_thread = 0;
+  size_t local_bytes_per_thread = 0;
+  size_t shared_bytes_per_block = 0;
+  int blocks_per_sm = 0;
+  uint32_t resident_vm_slots = 0;
+};
+
+template <typename Kernel>
+cudaError_t QueryPersistentKernel(Kernel kernel,
+                                  PersistentKernelStats& stats) {
+  cudaFuncAttributes attributes{};
+  cudaError_t status = cudaFuncGetAttributes(&attributes, kernel);
+  if (status == cudaSuccess)
+    status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &stats.blocks_per_sm, kernel, kPersistentBlockThreads, 0);
+  if (status != cudaSuccess) return status;
+  stats.registers_per_thread = attributes.numRegs;
+  stats.local_bytes_per_thread = attributes.localSizeBytes;
+  stats.shared_bytes_per_block = attributes.sharedSizeBytes;
+  int device = 0;
+  cudaDeviceProp properties{};
+  status = cudaGetDevice(&device);
+  if (status == cudaSuccess)
+    status = cudaGetDeviceProperties(&properties, device);
+  if (status == cudaSuccess) {
+    stats.resident_vm_slots = static_cast<uint32_t>(
+        stats.blocks_per_sm * properties.multiProcessorCount *
+        (kPersistentBlockThreads / kLanes));
+  }
+  return status;
+}
+
+bool PersistentStatsForMode(PersistentKernelMode mode,
+                            PersistentKernelStats& stats,
+                            std::string& err) {
+  cudaError_t status = cudaErrorInvalidValue;
+  switch (mode) {
+    case PersistentKernelMode::kNormal:
+      status = QueryPersistentKernel(PersistentKernel, stats);
+      break;
+    case PersistentKernelMode::kScalarRegs:
+      status = QueryPersistentKernel(PersistentScalarRegsKernel, stats);
+      break;
+    case PersistentKernelMode::kDenseDispatch:
+      status = QueryPersistentKernel(PersistentDenseDispatchKernel, stats);
+      break;
+    case PersistentKernelMode::kHotDispatch:
+      status = QueryPersistentKernel(PersistentHotDispatchKernel, stats);
+      break;
+    case PersistentKernelMode::kHot4Dispatch:
+      status = QueryPersistentKernel(PersistentHot4DispatchKernel, stats);
+      break;
+    case PersistentKernelMode::kScalarRegsDenseDispatch:
+      status = QueryPersistentKernel(PersistentScalarDenseKernel, stats);
+      break;
+    case PersistentKernelMode::kSharedRegs:
+      status = QueryPersistentKernel(PersistentSharedRegsKernel, stats);
+      break;
+    case PersistentKernelMode::kSharedRegsThreeBlock:
+      status = QueryPersistentKernel(PersistentSharedRegsThreeBlockKernel,
+                                     stats);
+      break;
+    case PersistentKernelMode::kSharedRegsDenseThreeBlock:
+      status = QueryPersistentKernel(PersistentSharedDenseThreeBlockKernel,
+                                     stats);
+      break;
+    default:
+      break;
+  }
+  if (status != cudaSuccess) {
+    err = std::string("kernel resource query failed: ") +
+          cudaGetErrorString(status);
+    return false;
+  }
+  return true;
 }
 
 const char* OpcodeName(uint32_t op) {
@@ -821,7 +904,15 @@ bool CpuLifeProgramsMatch(const WvmFile& a, const WvmFile& b,
   return true;
 }
 
-enum class MicroBody { kNop, kAdd, kRamLoad, kRamStore, kReduceOr, kFbStore };
+enum class MicroBody {
+  kNop,
+  kStepTrap,
+  kAdd,
+  kRamLoad,
+  kRamStore,
+  kReduceOr,
+  kFbStore
+};
 
 WvmFile MakeMicroProgram(MicroBody body, uint32_t body_ops) {
   WvmFile file;
@@ -841,6 +932,9 @@ WvmFile MakeMicroProgram(MicroBody body, uint32_t body_ops) {
     switch (body) {
       case MicroBody::kNop:
         file.code.push_back(enc_r(kNop, 0, 0, 0, 0));
+        break;
+      case MicroBody::kStepTrap:
+        file.code.push_back(enc_r(kStepTrap, 0, 0, 0, 0));
         break;
       case MicroBody::kAdd:
         file.code.push_back(enc_r(kAdd, 0, 1, 1, 0));
@@ -952,6 +1046,62 @@ double MedianGpuMillisecondsPerFrame(const WvmFile& file, int duration_ms,
   }
   std::sort(samples.begin(), samples.end());
   return samples[1];
+}
+
+double MedianGpuCyclesPerFrame(const WvmFile& file, uint32_t num_vms,
+                               std::string& err,
+                               PersistentKernelMode mode) {
+  VmImage image;
+  image.code = file.code;
+  image.literals = file.literals;
+  image.mem_size_words = 16384;
+  std::vector<VmImage> images(num_vms, image);
+  PersistentRuntime runtime;
+  if (!runtime.Init(images, err) || !runtime.Launch(err, mode)) return 0.0;
+  runtime.BootAll();
+  if (!WaitForWarmup(runtime, num_vms, 3, 30000)) {
+    err = "cycle-profile program did not publish warm-up frames";
+    runtime.ShutdownAll();
+    runtime.Sync();
+    return 0.0;
+  }
+
+  const uint32_t rounds = num_vms == 1 ? 31 : 7;
+  std::vector<uint64_t> samples;
+  samples.reserve(static_cast<size_t>(rounds) * num_vms);
+  std::vector<uint32_t> sequences(num_vms);
+  for (uint32_t round = 0; round < rounds; ++round) {
+    for (uint32_t vm = 0; vm < num_vms; ++vm)
+      sequences[vm] = runtime.FrameSeq(vm);
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(30);
+    for (uint32_t vm = 0; vm < num_vms; ++vm) {
+      while (runtime.FrameSeq(vm) <= sequences[vm] &&
+             std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+      if (runtime.FrameSeq(vm) <= sequences[vm]) {
+        err = "cycle-profile frame wait timed out";
+        runtime.ShutdownAll();
+        runtime.Sync();
+        return 0.0;
+      }
+      const uint64_t sample = runtime.ProfileFrameCycles(vm);
+      if (sample == 0) {
+        err = "cycle-profile kernel did not publish a cycle count";
+        runtime.ShutdownAll();
+        runtime.Sync();
+        return 0.0;
+      }
+      samples.push_back(sample);
+    }
+  }
+  runtime.ShutdownAll();
+  if (runtime.Sync() != cudaSuccess) {
+    err = "cycle-profile persistent kernel shutdown failed";
+    return 0.0;
+  }
+  std::sort(samples.begin(), samples.end());
+  return static_cast<double>(samples[samples.size() / 2]);
 }
 
 }  // namespace
@@ -1132,6 +1282,26 @@ int RunLifeProfile(const char* path, int duration_ms) {
                  "error: refusing to profile non-equivalent CPU/GPU state\n");
     return 1;
   }
+  constexpr std::array<std::pair<PersistentKernelMode, const char*>, 8>
+      kExperimentalModes{{
+          {PersistentKernelMode::kScalarRegs, "scalar_regs"},
+          {PersistentKernelMode::kDenseDispatch, "dense_dispatch"},
+          {PersistentKernelMode::kHotDispatch, "hot_dispatch"},
+          {PersistentKernelMode::kHot4Dispatch, "hot4_dispatch"},
+          {PersistentKernelMode::kScalarRegsDenseDispatch, "scalar_dense"},
+          {PersistentKernelMode::kSharedRegs, "shared_regs"},
+          {PersistentKernelMode::kSharedRegsThreeBlock, "shared_regs_3block"},
+          {PersistentKernelMode::kSharedRegsDenseThreeBlock,
+           "shared_dense_3block"},
+      }};
+  for (const auto& [mode, label] : kExperimentalModes) {
+    if (RunCpuGpuLifeEquivalenceMode(path, mode, label) != 0) {
+      std::fprintf(stderr,
+                   "error: refusing to profile non-equivalent %s kernel\n",
+                   label);
+      return 1;
+    }
+  }
   WvmFile file;
   std::string err;
   if (!LoadWvm(path, file, err)) {
@@ -1262,6 +1432,113 @@ int RunLifeProfile(const char* path, int duration_ms) {
   err.clear();
   const double full_ms =
       MedianGpuMillisecondsPerFrame(file, duration_ms, err);
+  std::array<double, kExperimentalModes.size()> experimental_ms{};
+  for (size_t index = 0; index < kExperimentalModes.size() && full_ms;
+       ++index) {
+    experimental_ms[index] = MedianGpuMillisecondsPerFrame(
+        file, duration_ms, err, kExperimentalModes[index].first);
+  }
+  const bool experimental_timing_ok =
+      std::all_of(experimental_ms.begin(), experimental_ms.end(),
+                  [](double value) { return value != 0.0; });
+  if (!full_ms || !experimental_timing_ok) {
+    std::fprintf(stderr, "error: interpreter matrix: %s\n", err.c_str());
+    return 1;
+  }
+  std::printf("    full WarpLife:                 %9.3f ms/generation\n",
+              full_ms);
+  std::printf("\n    interpreter experiment matrix (normal semantics):\n");
+  std::printf("      %-24s %9.3f ms  %6.2fx baseline\n", "baseline",
+              full_ms, 1.0);
+  for (size_t index = 0; index < kExperimentalModes.size(); ++index) {
+    std::printf("      %-24s %9.3f ms  %6.2fx baseline\n",
+                kExperimentalModes[index].second, experimental_ms[index],
+                full_ms / experimental_ms[index]);
+  }
+  // Counter sequential-order drift by alternating the production and hot
+  // kernels. Each entry is one independently warmed, frame-aligned sample;
+  // report the median of three for each mode.
+  std::array<double, 3> alternating_baseline{};
+  std::array<double, 3> alternating_hot{};
+  for (size_t round = 0; round < alternating_baseline.size(); ++round) {
+    double* first = round % 2 == 0 ? &alternating_baseline[round]
+                                    : &alternating_hot[round];
+    double* second = round % 2 == 0 ? &alternating_hot[round]
+                                     : &alternating_baseline[round];
+    const PersistentKernelMode first_mode =
+        round % 2 == 0 ? PersistentKernelMode::kNormal
+                       : PersistentKernelMode::kHotDispatch;
+    const PersistentKernelMode second_mode =
+        round % 2 == 0 ? PersistentKernelMode::kHotDispatch
+                       : PersistentKernelMode::kNormal;
+    *first = MeasureGpuMillisecondsPerFrame(file, duration_ms, err,
+                                            first_mode);
+    *second = *first ? MeasureGpuMillisecondsPerFrame(
+                           file, duration_ms, err, second_mode)
+                     : 0.0;
+  }
+  if (std::any_of(alternating_baseline.begin(), alternating_baseline.end(),
+                  [](double value) { return value == 0.0; }) ||
+      std::any_of(alternating_hot.begin(), alternating_hot.end(),
+                  [](double value) { return value == 0.0; })) {
+    std::fprintf(stderr, "error: alternating dispatch comparison: %s\n",
+                 err.c_str());
+    return 1;
+  }
+  std::sort(alternating_baseline.begin(), alternating_baseline.end());
+  std::sort(alternating_hot.begin(), alternating_hot.end());
+  const double alternating_baseline_ms = alternating_baseline[1];
+  const double alternating_hot_ms = alternating_hot[1];
+  std::printf("\n    alternating baseline/hot comparison:\n");
+  std::printf("      baseline                    %9.3f ms\n",
+              alternating_baseline_ms);
+  std::printf("      hot_dispatch                %9.3f ms  %6.2fx baseline\n",
+              alternating_hot_ms,
+              alternating_baseline_ms / alternating_hot_ms);
+  const double baseline_cycles = MedianGpuCyclesPerFrame(
+      file, 1, err, PersistentKernelMode::kCycleProfile);
+  const double hot_cycles = baseline_cycles
+                                ? MedianGpuCyclesPerFrame(
+                                      file, 1, err,
+                                      PersistentKernelMode::kHotCycleProfile)
+                                : 0.0;
+  const double hot4_cycles = hot_cycles
+                                 ? MedianGpuCyclesPerFrame(
+                                       file, 1, err,
+                                       PersistentKernelMode::kHot4CycleProfile)
+                                 : 0.0;
+  if (!hot4_cycles) {
+    std::fprintf(stderr, "error: dispatch cycle comparison: %s\n",
+                 err.c_str());
+    return 1;
+  }
+  std::printf("\n    device-cycle comparison (median of 31 frames):\n");
+  std::printf("      baseline                    %12.0f cycles/frame\n",
+              baseline_cycles);
+  std::printf("      hot_dispatch                %12.0f cycles/frame  "
+              "%6.2fx baseline\n",
+              hot_cycles, baseline_cycles / hot_cycles);
+  std::printf("      hot4_dispatch               %12.0f cycles/frame  "
+              "%6.2fx baseline\n",
+              hot4_cycles, baseline_cycles / hot4_cycles);
+  const double baseline_64_cycles = MedianGpuCyclesPerFrame(
+      file, 64, err, PersistentKernelMode::kCycleProfile);
+  const double hot_64_cycles = baseline_64_cycles
+                                   ? MedianGpuCyclesPerFrame(
+                                         file, 64, err,
+                                         PersistentKernelMode::kHotCycleProfile)
+                                   : 0.0;
+  if (!hot_64_cycles) {
+    std::fprintf(stderr, "error: 64-VM dispatch cycle comparison: %s\n",
+                 err.c_str());
+    return 1;
+  }
+  std::printf("      baseline, 64 VMs            %12.0f cycles/frame\n",
+              baseline_64_cycles);
+  std::printf("      hot_dispatch, 64 VMs        %12.0f cycles/frame  "
+              "%6.2fx baseline\n",
+              hot_64_cycles, baseline_64_cycles / hot_64_cycles);
+  std::fflush(stdout);
   const double evolve_publish_ms =
       full_ms ? MedianGpuMillisecondsPerFrame(no_render, duration_ms, err) : 0;
   const double render_publish_ms =
@@ -1303,8 +1580,49 @@ int RunLifeProfile(const char* path, int duration_ms) {
   const double phase_residual_ms =
       evolve_publish_ms + render_publish_ms - full_ms;
   const double framebuffer_memory_ms = full_ms - no_fb_ms;
-  std::printf("    full WarpLife:                 %9.3f ms/generation\n",
-              full_ms);
+  std::printf("\n    compiled kernel resources (%d-thread blocks):\n",
+              kPersistentBlockThreads);
+  constexpr std::array<std::pair<PersistentKernelMode, const char*>, 9>
+      kMatrixModes{{
+          {PersistentKernelMode::kNormal, "baseline"},
+          {PersistentKernelMode::kScalarRegs, "scalar_regs"},
+          {PersistentKernelMode::kDenseDispatch, "dense_dispatch"},
+          {PersistentKernelMode::kHotDispatch, "hot_dispatch"},
+          {PersistentKernelMode::kHot4Dispatch, "hot4_dispatch"},
+          {PersistentKernelMode::kScalarRegsDenseDispatch, "scalar_dense"},
+          {PersistentKernelMode::kSharedRegs, "shared_regs"},
+          {PersistentKernelMode::kSharedRegsThreeBlock, "shared_regs_3block"},
+          {PersistentKernelMode::kSharedRegsDenseThreeBlock,
+           "shared_dense_3block"},
+      }};
+  for (const auto& [mode, label] : kMatrixModes) {
+    PersistentKernelStats stats;
+    if (!PersistentStatsForMode(mode, stats, err)) {
+      std::fprintf(stderr, "error: %s\n", err.c_str());
+      return 1;
+    }
+    std::printf("      %-24s regs %3d, local %4zu B/thread, "
+                "shared %5zu B/block, %d blocks/SM, %u VM slots\n",
+                label, stats.registers_per_thread,
+                stats.local_bytes_per_thread, stats.shared_bytes_per_block,
+                stats.blocks_per_sm,
+                stats.resident_vm_slots);
+  }
+
+  std::printf("\n    64-VM throughput (%d ms samples):\n", duration_ms);
+  for (const auto& [mode, label] : kMatrixModes) {
+    err.clear();
+    const WarpMeasurement measurement =
+        MeasureWarpVm(file, 64, duration_ms, err, mode);
+    if (!measurement.ok) {
+      std::fprintf(stderr, "error: 64-VM %s: %s\n", label, err.c_str());
+      return 1;
+    }
+    std::printf("      %-24s %8.2f gen/s/VM, %8.3f Mcell/s aggregate\n",
+                label, measurement.avg_generations_per_second,
+                measurement.aggregate_cells_per_second / 1.0e6);
+  }
+
   std::printf("    evolution + publication:      %9.3f ms/generation\n",
               evolve_publish_ms);
   std::printf("    rendering + publication:      %9.3f ms/generation\n",
@@ -1349,7 +1667,9 @@ int RunLifeProfile(const char* path, int duration_ms) {
   };
   const double nop0 = micro(MicroBody::kNop, 0);
   const double nop128 = nop0 ? micro(MicroBody::kNop, 128) : 0;
-  const double nop32 = nop128 ? micro(MicroBody::kNop, 32) : 0;
+  const double step_trap128 =
+      nop128 ? micro(MicroBody::kStepTrap, 128) : 0;
+  const double nop32 = step_trap128 ? micro(MicroBody::kNop, 32) : 0;
   const double add32 = nop32 ? micro(MicroBody::kAdd, 32) : 0;
   const double load32 = add32 ? micro(MicroBody::kRamLoad, 32) : 0;
   const double store32 = load32 ? micro(MicroBody::kRamStore, 32) : 0;
@@ -1374,8 +1694,13 @@ int RunLifeProfile(const char* path, int duration_ms) {
   std::printf("    NOP body 0:                    %9.3f ms/frame\n", nop0);
   std::printf("    NOP body 32:                   %9.3f ms/frame\n", nop32);
   std::printf("    NOP body 128:                  %9.3f ms/frame\n", nop128);
+  std::printf("    STEP_TRAP body 128:            %9.3f ms/frame\n",
+              step_trap128);
   std::printf("    incremental NOP slot:          %9.1f ns/op\n",
               incremental_nop_ns);
+  std::printf("    STEP_TRAP - NOP dispatch path: %9.1f ns/op\n",
+              (step_trap128 - nop128) * 1.0e6 /
+                  (128.0 * kBodyExecutions));
   std::printf("    inferred control poll:         %9.3f us/poll\n",
               estimated_poll_us);
   std::printf("    equal-count delta versus NOP: ADD %+.1f, RAM LOAD %+.1f, "
@@ -1400,7 +1725,9 @@ int RunLifeProfile(const char* path, int duration_ms) {
   return 0;
 }
 
-int RunCpuGpuLifeEquivalence(const char* path) {
+int RunCpuGpuLifeEquivalenceMode(const char* path,
+                                 PersistentKernelMode mode,
+                                 const char* label) {
   WvmFile file;
   std::string err;
   if (!LoadWvm(path, file, err)) {
@@ -1418,7 +1745,7 @@ int RunCpuGpuLifeEquivalence(const char* path) {
     image.mem_size_words = 16384;
   }
   PersistentRuntime gpu;
-  if (!gpu.Init(images, err) || !gpu.Launch(err)) {
+  if (!gpu.Init(images, err) || !gpu.Launch(err, mode)) {
     std::fprintf(stderr, "error: %s\n", err.c_str());
     return 1;
   }
@@ -1483,14 +1810,19 @@ int RunCpuGpuLifeEquivalence(const char* path) {
                        actual == expected[index].words;
     equivalent &= match;
     std::printf(
-        "cpu_gpu_equivalence: vm=%u generation=%u cpu=%016llx gpu=%016llx %s\n",
-        vm_id, target, static_cast<unsigned long long>(checksum(actual)),
+        "%s_equivalence: vm=%u generation=%u cpu=%016llx gpu=%016llx %s\n",
+        label, vm_id, target, static_cast<unsigned long long>(checksum(actual)),
         static_cast<unsigned long long>(checksum(expected[index].words)),
         match ? "PASS" : "FAIL");
   }
-  std::printf("cpu_gpu_equivalence: %s\n",
+  std::printf("%s_equivalence: %s\n", label,
               equivalent ? "PASS" : "FAIL");
   return equivalent ? 0 : 1;
+}
+
+int RunCpuGpuLifeEquivalence(const char* path) {
+  return RunCpuGpuLifeEquivalenceMode(path, PersistentKernelMode::kNormal,
+                                      "cpu_gpu");
 }
 
 }  // namespace wvm

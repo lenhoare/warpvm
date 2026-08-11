@@ -1,18 +1,20 @@
 # ---- SDL2 (host viewer, v0.1.1) -----------------------------------------
 find_package(PkgConfig REQUIRED)
+find_package(CUDAToolkit REQUIRED)
 pkg_check_modules(SDL2 REQUIRED sdl2)
 
 add_executable(warpvm
   src/main.cu
   src/gpu/kernel.cu
   src/host/cpu_interpreter.cpp
+  src/host/ptx_compiler.cpp
   src/host/life_bench.cu
   src/host/view_sdl.cu
 )
 
 target_include_directories(warpvm PRIVATE src ${SDL2_INCLUDE_DIRS})
 target_compile_definitions(warpvm PRIVATE ${SDL2_CFLAGS_OTHER})
-target_link_libraries(warpvm ${SDL2_LIBRARIES})
+target_link_libraries(warpvm ${SDL2_LIBRARIES} CUDA::cuda_driver)
 
 target_compile_options(warpvm PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-O3 -lineinfo --Werror all-warnings>
@@ -44,6 +46,8 @@ add_test(NAME slice7_messaging COMMAND warpvm slice7)
 add_test(NAME gfxa_framebuffer COMMAND warpvm gfxa)
 add_test(NAME gfxb_flip COMMAND warpvm gfxb)
 add_test(NAME cpu_interpreter COMMAND warpvm cpu_tests)
+add_test(NAME v013_compiled_arithmetic_control_memory
+  COMMAND warpvm compiled_tests)
 
 add_test(NAME pipeline_hello
   COMMAND bash ${CMAKE_SOURCE_DIR}/tests/pipeline.sh
@@ -100,3 +104,8 @@ add_test(NAME v012_cpu_gpu_equivalence
           ${WVM_AS} $<TARGET_FILE:warpvm>
           ${CMAKE_SOURCE_DIR}/programs/warplife.wva
           ${CMAKE_BINARY_DIR}/warplife_equiv)
+add_test(NAME v013_compiled_warplife
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/compiled_life.sh
+          ${WVM_AS} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/programs/warplife.wva
+          ${CMAKE_BINARY_DIR}/compiled_warplife)

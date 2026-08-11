@@ -73,16 +73,25 @@ __global__ void VmArrayKernel(const VmDesc* descs, VmState* states) {
 // Run a VM through any number of pause/resume/step cycles until it halts,
 // faults, is reset, or the kernel must exit. Returns false when the warp
 // should leave the kernel (global shutdown or EXIT).
-template <bool kResolveFaultVotes, bool kPollBackwardControl>
+template <bool kResolveFaultVotes, bool kPollBackwardControl,
+          bool kScalarizedVectorRegs = false,
+          bool kAlternativeDispatch = false,
+          bool kSharedVectorRegs = false,
+          int kHotOpcodeCount = 0,
+          bool kProfileFrameCycles = false>
 __device__ static bool RunVmUntilStop(VmCtx& ctx, const VmDesc& d,
                                       Control* ctrl, uint32_t vm_id,
                                       uint32_t lane, VmState* state,
-                                      Mailbox* mailboxes, uint32_t num_vms) {
+                                      Mailbox* mailboxes, uint32_t num_vms,
+                                      uint32_t* shared_vregs = nullptr) {
   for (;;) {
     PublishStatus(ctrl, vm_id, lane, kRunning, ctx.fault, ctx.pc,
                   ctx.instr_count);
     const StopReason reason =
-        VmRun<kResolveFaultVotes, kPollBackwardControl>(ctx, ctrl, vm_id);
+        VmRun<kResolveFaultVotes, kPollBackwardControl, kScalarizedVectorRegs,
+              kAlternativeDispatch, kSharedVectorRegs,
+              kHotOpcodeCount, kProfileFrameCycles>(ctx, ctrl, vm_id,
+                                                    shared_vregs);
     SpillState(ctx, state);
 
     if (reason == kStopShutdown) return false;
@@ -109,7 +118,10 @@ __device__ static bool RunVmUntilStop(VmCtx& ctx, const VmDesc& d,
         // can detect completion (status may stay PAUSED throughout).
         ctx.step = true;
         const StopReason r =
-            VmRun<kResolveFaultVotes, kPollBackwardControl>(ctx, ctrl, vm_id);
+            VmRun<kResolveFaultVotes, kPollBackwardControl,
+                  kScalarizedVectorRegs, kAlternativeDispatch,
+                  kSharedVectorRegs, kHotOpcodeCount, kProfileFrameCycles>(
+                ctx, ctrl, vm_id, shared_vregs);
         ctx.step = false;
         SpillState(ctx, state);
         if (r == kStopShutdown) return false;
@@ -145,14 +157,24 @@ __device__ static bool RunVmUntilStop(VmCtx& ctx, const VmDesc& d,
   }
 }
 
-template <bool kResolveFaultVotes, bool kPollBackwardControl>
+template <bool kResolveFaultVotes, bool kPollBackwardControl,
+          bool kScalarizedVectorRegs = false,
+          bool kAlternativeDispatch = false,
+          bool kSharedVectorRegs = false,
+          int kHotOpcodeCount = 0,
+          bool kProfileFrameCycles = false>
 __device__ void PersistentKernelBody(const VmDesc* descs, VmState* states,
                                      Control* ctrl, uint32_t num_vms,
-                                     Mailbox* mailboxes) {
+                                     Mailbox* mailboxes,
+                                     uint32_t* block_shared_vregs = nullptr) {
   const uint32_t global = blockIdx.x * blockDim.x + threadIdx.x;
   const uint32_t vm_id = global >> 5;
   const uint32_t lane = global & (kLanes - 1);
   if (vm_id >= num_vms) return;
+  uint32_t* shared_vregs =
+      kSharedVectorRegs
+          ? block_shared_vregs + threadIdx.x
+          : nullptr;
 
   const VmDesc d = descs[vm_id];
   VmCtx ctx{};
@@ -166,8 +188,12 @@ __device__ void PersistentKernelBody(const VmDesc* descs, VmState* states,
     switch (cmd) {
       case kCmdRun:
         InitVmCtx(ctx, d, vm_id, lane, mailboxes, num_vms);  // RUN = reset+run
-        alive = RunVmUntilStop<kResolveFaultVotes, kPollBackwardControl>(
-            ctx, d, ctrl, vm_id, lane, &states[vm_id], mailboxes, num_vms);
+        alive = RunVmUntilStop<kResolveFaultVotes, kPollBackwardControl,
+                               kScalarizedVectorRegs, kAlternativeDispatch,
+                               kSharedVectorRegs, kHotOpcodeCount,
+                               kProfileFrameCycles>(
+            ctx, d, ctrl, vm_id, lane, &states[vm_id], mailboxes, num_vms,
+            shared_vregs);
         break;
       case kCmdReset:
         InitVmCtx(ctx, d, vm_id, lane, mailboxes, num_vms);
@@ -191,6 +217,104 @@ __global__ void PersistentKernel(const VmDesc* descs, VmState* states,
                                  Control* ctrl, uint32_t num_vms,
                                  Mailbox* mailboxes) {
   PersistentKernelBody<true, true>(descs, states, ctrl, num_vms, mailboxes);
+}
+
+__global__ void PersistentScalarRegsKernel(const VmDesc* descs,
+                                           VmState* states, Control* ctrl,
+                                           uint32_t num_vms,
+                                           Mailbox* mailboxes) {
+  PersistentKernelBody<true, true, true, false>(descs, states, ctrl, num_vms,
+                                                mailboxes);
+}
+
+__global__ void PersistentDenseDispatchKernel(const VmDesc* descs,
+                                              VmState* states, Control* ctrl,
+                                              uint32_t num_vms,
+                                              Mailbox* mailboxes) {
+  PersistentKernelBody<true, true, false, true>(descs, states, ctrl, num_vms,
+                                                mailboxes);
+}
+
+__global__ void PersistentHotDispatchKernel(const VmDesc* descs,
+                                            VmState* states, Control* ctrl,
+                                            uint32_t num_vms,
+                                            Mailbox* mailboxes) {
+  PersistentKernelBody<true, true, false, false, false, 2>(
+      descs, states, ctrl, num_vms, mailboxes);
+}
+
+__global__ void PersistentHot4DispatchKernel(const VmDesc* descs,
+                                             VmState* states, Control* ctrl,
+                                             uint32_t num_vms,
+                                             Mailbox* mailboxes) {
+  PersistentKernelBody<true, true, false, false, false, 4>(
+      descs, states, ctrl, num_vms, mailboxes);
+}
+
+__global__ void PersistentCycleProfileKernel(const VmDesc* descs,
+                                             VmState* states, Control* ctrl,
+                                             uint32_t num_vms,
+                                             Mailbox* mailboxes) {
+  PersistentKernelBody<true, true, false, false, false, 0, true>(
+      descs, states, ctrl, num_vms, mailboxes);
+}
+
+__global__ void PersistentHotCycleProfileKernel(const VmDesc* descs,
+                                                VmState* states,
+                                                Control* ctrl,
+                                                uint32_t num_vms,
+                                                Mailbox* mailboxes) {
+  PersistentKernelBody<true, true, false, false, false, 2, true>(
+      descs, states, ctrl, num_vms, mailboxes);
+}
+
+__global__ void PersistentHot4CycleProfileKernel(const VmDesc* descs,
+                                                 VmState* states,
+                                                 Control* ctrl,
+                                                 uint32_t num_vms,
+                                                 Mailbox* mailboxes) {
+  PersistentKernelBody<true, true, false, false, false, 4, true>(
+      descs, states, ctrl, num_vms, mailboxes);
+}
+
+__global__ void PersistentScalarDenseKernel(const VmDesc* descs,
+                                            VmState* states, Control* ctrl,
+                                            uint32_t num_vms,
+                                            Mailbox* mailboxes) {
+  PersistentKernelBody<true, true, true, true>(descs, states, ctrl, num_vms,
+                                               mailboxes);
+}
+
+__global__ void PersistentSharedRegsKernel(const VmDesc* descs,
+                                           VmState* states, Control* ctrl,
+                                           uint32_t num_vms,
+                                           Mailbox* mailboxes) {
+  __shared__ uint32_t
+      shared_vregs[kPersistentBlockThreads * kVectorRegs];
+  PersistentKernelBody<true, true, false, false, true>(
+      descs, states, ctrl, num_vms, mailboxes, shared_vregs);
+}
+
+__global__ __launch_bounds__(kPersistentBlockThreads, 3)
+void PersistentSharedRegsThreeBlockKernel(const VmDesc* descs,
+                                          VmState* states, Control* ctrl,
+                                          uint32_t num_vms,
+                                          Mailbox* mailboxes) {
+  __shared__ uint32_t
+      shared_vregs[kPersistentBlockThreads * kVectorRegs];
+  PersistentKernelBody<true, true, false, false, true>(
+      descs, states, ctrl, num_vms, mailboxes, shared_vregs);
+}
+
+__global__ __launch_bounds__(kPersistentBlockThreads, 3)
+void PersistentSharedDenseThreeBlockKernel(const VmDesc* descs,
+                                           VmState* states, Control* ctrl,
+                                           uint32_t num_vms,
+                                           Mailbox* mailboxes) {
+  __shared__ uint32_t
+      shared_vregs[kPersistentBlockThreads * kVectorRegs];
+  PersistentKernelBody<true, true, false, true, true>(
+      descs, states, ctrl, num_vms, mailboxes, shared_vregs);
 }
 
 // Benchmark-only kernels. They deliberately relax fault voting and/or

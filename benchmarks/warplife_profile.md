@@ -196,6 +196,127 @@ latency. Nsight hardware counters would be needed to apportion the remaining
 floor reliably between dispatch branches, local accesses, dependencies, and
 instruction-fetch effects.
 
+## Register-file and dispatch experiment matrix
+
+The original register/dispatch matrix compared seven semantically equivalent
+persistent kernels: the array register file and sparse opcode switch,
+named-register and dense-opcode variants, both of those changes together, and
+three shared-memory register-file variants. The shared variants use 16 KiB per
+256-thread block. One lets ptxas choose occupancy, one requests at least three
+blocks per SM, and the final variant combines that launch bound with dense
+opcode mapping. Later dispatch-attribution variants are described separately
+below.
+
+Before timing, every kernel matched the CPU's complete packed world through
+generation 3 for VM IDs 0, 1, 2, and 37. A representative median-of-three
+one-second run was:
+
+| Kernel | ms/generation | Throughput vs baseline | Registers/thread | Local bytes/thread | Shared bytes/block | Resident VM slots |
+|---|---:|---:|---:|---:|---:|---:|
+| Baseline | 30.781 | 1.000× | 72 | 256 | 0 | 672 |
+| Named scalar registers | 40.038 | 0.769× | 118 | 256 | 0 | 448 |
+| Dense opcode translation | 30.761 | 1.001× | 72 | 256 | 0 | 672 |
+| Named registers + dense opcodes | 40.301 | 0.764× | 118 | 256 | 0 | 448 |
+| Shared registers | 30.801 | 0.999× | 72 | 256 | 16,384 | 672 |
+| Shared registers, three-block bound | 30.372 | 1.013× | 80 | 304 | 16,384 | 672 |
+| Shared registers + dense opcodes, three-block bound | 30.354 | 1.014× | 80 | 304 | 16,384 | 672 |
+
+The scalar form verifies the original hypothesis but rejects the proposed
+remedy. Static SASS occurrences of `LDL` fall from 250 to 147 and `STL` from
+388 to 316, while native register allocation rises from 72 to 118 registers
+per thread. However, a dynamic architectural register number still has to
+select one of sixteen named values. Inlining those selections expands the
+kernel from 772 to 7,162 branch instructions and from 597 to 5,090 integer
+comparisons. One-VM latency rises by 29.8%, and estimated residency falls by
+one third. Combining scalarization with the dispatch experiment has the same
+problem.
+
+The dense opcode translation is much less consequential. It removes four
+static branches and six comparisons from the full kernel. Crucially, SASS
+inspection shows that ptxas still lowers the opcode switch to a
+compare/branch tree; the only `BRX` in each kernel is the unrelated
+host-command switch. The experiment therefore did not create the intended
+indexed opcode dispatch. Its earlier apparent 0.8–1.2% advantage disappeared
+in the longer combined matrix, where it was effectively tied with baseline.
+
+The first shared-memory implementation used a natural thread-major
+`[thread][register]` layout. A warp reading the same dynamic architectural
+register then addresses words 16 apart, causing 16-way shared-memory bank
+conflicts. The corrected register-major `[register][thread]` layout makes the
+32 lanes access consecutive banks. Preventing ptxas from unrolling the
+entry/exit copies was also important: full unrolling raised allocation to 119
+registers per thread, whereas simple loops restored the unconstrained kernel
+to the baseline's 72 registers and 672 resident VM slots.
+
+With the corrected layout, static local-memory occurrences fall substantially
+without the named-register branch explosion:
+
+| Kernel | `LDL` | `STL` | `LDS` | `STS` | `BRA` | `ISETP` |
+|---|---:|---:|---:|---:|---:|---:|
+| Baseline | 250 | 388 | 0 | 0 | 772 | 597 |
+| Shared registers | 137 | 302 | 120 | 90 | 775 | 601 |
+| Shared registers, three-block bound | 147 | 308 | 120 | 90 | 775 | 601 |
+| Shared registers + dense opcodes, three-block bound | 147 | 308 | 120 | 90 | 771 | 595 |
+
+This is mechanically successful but only a small latency win. The
+three-block shared kernel improved one-VM throughput by 1.35%, and combining
+it with dense opcode mapping improved it by 1.41%; dense mapping therefore
+adds essentially nothing. Repeated 64-VM samples fluctuated. In the final
+one-second matrix, the combined shared+dense kernel achieved 26.15
+generations/s/VM against 26.12 for baseline, an effective tie. The shared
+implementation remains benchmark-only rather than replacing the normal
+kernel on this evidence.
+
+## Opcode-dispatch attribution
+
+Line-annotated `sm_86` SASS confirms that the sparse opcode switch is lowered
+to a balanced compare/branch tree. Its root compares the opcode with `0x37`,
+then recursively narrows the range; WarpLife's common handlers normally need
+about five or six dependent decisions. There is no opcode-dispatch `BRX`.
+
+Two valid opcodes provide a particularly clean path-position control. `NOP`
+at `0x00` and `STEP_TRAP` at `0x77` both have an empty handler under normal
+execution. Matched 128-instruction bodies therefore differ only in their
+route through the switch. Repeated samples put `STEP_TRAP` between 7 and 17
+ns/instruction slower than `NOP`, with a one-second run measuring 10.1 ns.
+This shows that tree position is measurable, but it is much smaller than the
+roughly 290 ns NOP fetch/decode/dispatch/postamble floor.
+
+A second experiment placed profile-guided checks for WarpLife's hottest
+opcodes before the general switch:
+
+| Fast-path handlers | Dynamic coverage | Median cycles/frame, 1 VM | Throughput vs baseline | Median cycles/frame, 64 VMs | Throughput vs baseline |
+|---|---:|---:|---:|---:|---:|
+| None | 0% | 62,608,603 | 1.000× | 80,314,984 | 1.000× |
+| `ADD`, `AND_I` | 40.0% | 60,588,772 | 1.033× | 79,447,861 | 1.011× |
+| plus `ADD_I`, `SHL_I` | 55.3% | 60,625,395 | 1.033× | not measured | — |
+
+These are in-kernel `clock64()` measurements: the one-VM figures are medians
+of 31 complete frames, and the 64-VM figures are medians of 448 VM-frames.
+They avoid the frequency drift visible in sequential host timings. A second
+one-VM run measured 62,439,369, 60,560,069, and 60,560,391 cycles
+respectively, reproducing the 3.1–3.3% two-handler saving and the lack of any
+benefit from extending the chain to four handlers.
+
+ptxas preserves the intended front end as two explicit equality comparisons.
+It also keeps allocation at 72 registers, a 256-byte local stack, three
+blocks/SM, and 672 resident VM slots. The cost is modest code duplication:
+
+| Kernel | Code bytes | Static instructions | `BRA` | `ISETP` | `LDL` | `STL` |
+|---|---:|---:|---:|---:|---:|---:|
+| Baseline | 77,184 | 4,824 | 772 | 597 | 250 | 388 |
+| Two hot handlers | 78,080 | 4,880 | 784 | 605 | 256 | 392 |
+| Four hot handlers | 78,848 | 4,928 | 796 | 613 | 260 | 396 |
+
+The result attributes a real but bounded cost to opcode selection. On this
+program, bypassing most of the decision tree for 40% of bytecodes saves about
+3.2% at one VM and 1.1% at 64 VMs. Adding more handlers does not help. A fixed
+`ADD`/`AND_I` fast path is nevertheless WarpLife-specific and makes every
+other program execute up to two extra comparisons. It therefore remains a
+benchmark specialization. A production version needs opcode profiles from a
+representative program suite or per-program specialization/JIT that can pick
+its own hot handlers.
+
 ## Interpretation
 
 The priorities indicated by this one-VM result are:
@@ -218,6 +339,18 @@ The priorities indicated by this one-VM result are:
    predecoding bytecode, or changing dispatch structure should be controlled
    experiments and must also be checked at high VM counts because register
    growth can reduce occupancy.
+6. Named-register scalarization and dense remapping have now been tested. The
+   former is decisively rejected; the latter did not change the generated
+   dispatch mechanism and remains benchmark-only.
+7. A bank-conflict-free shared-memory register file does replace much of the
+   dynamic local-memory traffic without reducing estimated occupancy. Its
+   roughly 1.4% one-VM gain and neutral 64-VM result are too small to justify
+   promoting the added complexity into the production interpreter.
+8. The compare/branch opcode tree has now been dynamically isolated. A
+   two-opcode profile-guided fast path saves 3.1–3.3% for one WarpLife VM and
+   1.1% at 64 VMs without reducing occupancy, but a four-opcode chain provides
+   no further gain. Retain this as evidence for adaptive specialization, not
+   as a global WarpLife-biased production dispatcher.
 
 These are baseline observations, not final architecture conclusions. Nsight
 stall counters, repeated clock-controlled runs, and equivalent measurements
