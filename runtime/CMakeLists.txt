@@ -57,6 +57,16 @@ add_test(NAME warpc_integer_smoke
           ${WVM_WARPC} $<TARGET_FILE:warpvm>
           ${CMAKE_SOURCE_DIR}/programs/warpc/integer_smoke.wc
           ${CMAKE_BINARY_DIR}/warpc_integer_smoke)
+add_test(NAME warpc_control_flow
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_acceptance.sh
+          ${WVM_WARPC} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/programs/warpc/control_flow.wc
+          ${CMAKE_BINARY_DIR}/warpc_control_flow warpc_control_flow)
+add_test(NAME warpc_switch
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_acceptance.sh
+          ${WVM_WARPC} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/programs/warpc/switch.wc
+          ${CMAKE_BINARY_DIR}/warpc_switch warpc_switch)
 
 add_test(NAME pipeline_hello
   COMMAND bash ${CMAKE_SOURCE_DIR}/tests/pipeline.sh

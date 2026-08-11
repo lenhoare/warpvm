@@ -45,10 +45,10 @@ build/tools-rust/release/warpvm-dis hello.wvm
 build/runtime/warpvm run hello.wvm
 ```
 
-The first Warp C slice supports signed `int`, `unsigned`, word-sized unsigned
-`char`, local variables, integer expressions, assignment, and `return`. It
-emits inspectable WarpVM assembly and assembles it in-process to canonical
-`.wvm`:
+Warp C currently supports signed `int`, `unsigned`, word-sized unsigned
+`char`, local variables, integer expressions, structured conditionals and
+loops, `switch`, assignment, and `return`. It emits inspectable WarpVM
+assembly and assembles it in-process to canonical `.wvm`:
 
 ```sh
 build/tools-rust/release/warpc programs/warpc/integer_smoke.wc \
@@ -162,6 +162,7 @@ control-poll, and memory breakdown is in
 | v0.1.2 | logical CPU interpreter, CPU/GPU equivalence, five-engine WarpLife benchmark | done |
 | v0.1.3 | direct `.wvm` to PTX compiled execution and mixed-mode equivalence | done |
 | v0.1.4-A | Warp C lexer/parser, typed integer expressions, direct `.wvm` output | done |
+| v0.1.4-B | uniform structured control flow, loop jumps, and switch fall-through | done |
 
 ## v0.1 milestone
 

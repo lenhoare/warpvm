@@ -21,14 +21,11 @@ impl<'a> Parser<'a> {
         if self.at(&TokenKind::Void) {
             self.bump();
         } else if !self.at(&TokenKind::RParen) {
-            return Err(self.error("v0.1.4 integer slice supports only a void parameter list"));
+            return Err(self.error("the current frontend supports only a void parameter list"));
         }
         self.expect(TokenKind::RParen, "expected ')' after parameter list")?;
         let body = self.block()?;
-        self.expect(
-            TokenKind::Eof,
-            "only one function is supported in the integer slice",
-        )?;
+        self.expect(TokenKind::Eof, "only one function is currently supported")?;
         Ok(Program {
             function: Function {
                 return_type,
@@ -46,15 +43,53 @@ impl<'a> Parser<'a> {
             if self.at(&TokenKind::Eof) {
                 return Err(Diagnostic::new(span, "unterminated block"));
             }
-            statements.push(self.statement()?);
+            statements.push(if self.starts_type() {
+                self.declaration()?
+            } else {
+                self.statement()?
+            });
         }
         self.bump();
         Ok(Block { statements, span })
     }
 
     fn statement(&mut self) -> Result<Stmt, Diagnostic> {
-        if self.starts_type() {
-            return self.declaration();
+        if self.at(&TokenKind::If) {
+            return self.if_statement();
+        }
+        if self.at(&TokenKind::While) {
+            return self.while_statement();
+        }
+        if self.at(&TokenKind::Do) {
+            return self.do_while_statement();
+        }
+        if self.at(&TokenKind::For) {
+            return self.for_statement();
+        }
+        if self.at(&TokenKind::Break) || self.at(&TokenKind::Continue) {
+            let token = self.bump();
+            self.expect(TokenKind::Semicolon, "expected ';' after jump statement")?;
+            return Ok(if token.kind == TokenKind::Break {
+                Stmt::Break(token.span)
+            } else {
+                Stmt::Continue(token.span)
+            });
+        }
+        if self.at(&TokenKind::Switch) {
+            return self.switch_statement();
+        }
+        if self.at(&TokenKind::Case) {
+            let span = self.bump().span;
+            let value = self.expression()?;
+            self.expect(TokenKind::Colon, "expected ':' after case value")?;
+            let body = Box::new(self.statement()?);
+            return Ok(Stmt::Case { value, body, span });
+        }
+        if self.at(&TokenKind::Default) {
+            let span = self.bump().span;
+            self.expect(TokenKind::Colon, "expected ':' after default")?;
+            let body = Box::new(self.statement()?);
+            return Ok(Stmt::Default { body, span });
         }
         if self.at(&TokenKind::Return) {
             let span = self.bump().span;
@@ -77,6 +112,116 @@ impl<'a> Parser<'a> {
         };
         self.expect(TokenKind::Semicolon, "expected ';' after expression")?;
         Ok(Stmt::Expr(value, span))
+    }
+
+    fn parenthesized_condition(&mut self, keyword: &str) -> Result<Expr, Diagnostic> {
+        self.expect(TokenKind::LParen, &format!("expected '(' after {keyword}"))?;
+        let condition = self.expression()?;
+        self.expect(TokenKind::RParen, "expected ')' after condition")?;
+        Ok(condition)
+    }
+
+    fn if_statement(&mut self) -> Result<Stmt, Diagnostic> {
+        let span = self.bump().span;
+        let condition = self.parenthesized_condition("if")?;
+        let then_branch = Box::new(self.statement()?);
+        let else_branch = if self.at(&TokenKind::Else) {
+            self.bump();
+            Some(Box::new(self.statement()?))
+        } else {
+            None
+        };
+        Ok(Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+            span,
+        })
+    }
+
+    fn while_statement(&mut self) -> Result<Stmt, Diagnostic> {
+        let span = self.bump().span;
+        let condition = self.parenthesized_condition("while")?;
+        let body = Box::new(self.statement()?);
+        Ok(Stmt::While {
+            condition,
+            body,
+            span,
+        })
+    }
+
+    fn do_while_statement(&mut self) -> Result<Stmt, Diagnostic> {
+        let span = self.bump().span;
+        let body = Box::new(self.statement()?);
+        self.expect(TokenKind::While, "expected 'while' after do body")?;
+        let condition = self.parenthesized_condition("while")?;
+        self.expect(TokenKind::Semicolon, "expected ';' after do/while")?;
+        Ok(Stmt::DoWhile {
+            body,
+            condition,
+            span,
+        })
+    }
+
+    fn for_statement(&mut self) -> Result<Stmt, Diagnostic> {
+        let span = self.bump().span;
+        self.expect(TokenKind::LParen, "expected '(' after for")?;
+        let init = if self.at(&TokenKind::Semicolon) {
+            self.bump();
+            None
+        } else if self.starts_type() {
+            let decl_span = self.peek().span;
+            let ty = self.type_name()?;
+            let (name, _) = self.identifier("expected variable name")?;
+            let init = if self.at(&TokenKind::Equal) {
+                self.bump();
+                Some(self.assignment()?)
+            } else {
+                None
+            };
+            self.expect(TokenKind::Semicolon, "expected ';' after for initializer")?;
+            Some(ForInit::Decl {
+                ty,
+                name,
+                init,
+                span: decl_span,
+            })
+        } else {
+            let expr = self.expression()?;
+            self.expect(TokenKind::Semicolon, "expected ';' after for initializer")?;
+            Some(ForInit::Expr(expr))
+        };
+        let condition = if self.at(&TokenKind::Semicolon) {
+            None
+        } else {
+            Some(self.expression()?)
+        };
+        self.expect(TokenKind::Semicolon, "expected ';' after for condition")?;
+        let step = if self.at(&TokenKind::RParen) {
+            None
+        } else {
+            Some(self.expression()?)
+        };
+        self.expect(TokenKind::RParen, "expected ')' after for clauses")?;
+        let body = Box::new(self.statement()?);
+        Ok(Stmt::For {
+            init,
+            condition,
+            step,
+            body,
+            span,
+        })
+    }
+
+    fn switch_statement(&mut self) -> Result<Stmt, Diagnostic> {
+        let span = self.bump().span;
+        let expression = self.parenthesized_condition("switch")?;
+        let body = Box::new(self.statement()?);
+        Ok(Stmt::Switch {
+            expression,
+            body,
+            span,
+        })
     }
 
     fn declaration(&mut self) -> Result<Stmt, Diagnostic> {
@@ -371,5 +516,30 @@ mod tests {
     #[test]
     fn compound_and_increment_parse() {
         parse_source("int main(void) { unsigned x = 1u; x <<= 3; ++x; x--; return x; }");
+    }
+
+    #[test]
+    fn parses_all_structured_control_forms() {
+        let program = parse_source(
+            "int main(void) { int x = 0; if (x) x++; else x--; while (x) break; do continue; while (x); for (int i = 0; i < 2; ++i) { x += i; } switch (x) { case 1: x++; break; default: x--; } return x; }",
+        );
+        assert!(program
+            .function
+            .body
+            .statements
+            .iter()
+            .any(|statement| matches!(statement, Stmt::If { .. })));
+        assert!(program
+            .function
+            .body
+            .statements
+            .iter()
+            .any(|statement| matches!(statement, Stmt::For { .. })));
+        assert!(program
+            .function
+            .body
+            .statements
+            .iter()
+            .any(|statement| matches!(statement, Stmt::Switch { .. })));
     }
 }

@@ -5,9 +5,9 @@ a lexer, parser, typed semantic tree, uniformity analysis, and direct WarpVM
 assembly lowering. The generated assembly is passed to the existing Rust
 assembler library in-process, producing a canonical `.wvm` file.
 
-This document describes the implemented v0.1.4 Slice A checkpoint. Later
-slices in `project_spec_01_04.md` will add structured control flow, functions,
-memory types, lane divergence, and graphics.
+This document describes the implemented v0.1.4 Slice A and B checkpoints.
+Later slices in `project_spec_01_04.md` will add functions, memory types, lane
+divergence, and graphics.
 
 ## Command line
 
@@ -22,9 +22,9 @@ at least one dump switch is required.
 ## Implemented source subset
 
 The current entry point is exactly one `int main(void)` function. Its body may
-contain nested blocks, local declarations, expression statements, and
-`return`. Locals are held in WarpVM vector registers and are replicated
-uniform values in this slice.
+contain nested blocks, local declarations, expression statements, structured
+control flow, and `return`. Locals are held in WarpVM vector registers and are
+replicated uniform values in these slices.
 
 Implemented types:
 
@@ -39,8 +39,22 @@ bitwise and logical operators, comparisons, shifts, comma, simple and compound
 assignment, and pre/post increment and decrement. Normal C precedence and
 associativity apply. `&&` and `||` short-circuit.
 
-Slice A deliberately does not yet accept `if`, loops, `switch`, functions,
-pointers, arrays, structs, strings, casts, or graphics intrinsics.
+Implemented statements include:
+
+- `if` / `else`, including the normal nearest-`if` dangling-else rule;
+- `while`, `do` / `while`, and all three-clause forms of `for`;
+- a declaration or expression in the `for` initializer and omitted loop
+  clauses;
+- `break` and `continue` with nearest enclosing-target semantics;
+- `switch`, `case`, `default`, fall-through, and nested switches;
+- compile-time integer expressions in case labels.
+
+Slice B requires controlling expressions to be uniform. This is checked in
+the typed semantic layer rather than inferred from the current lowering.
+Divergent conditions will be added with explicit mask lowering in Slice E.
+
+The compiler deliberately does not yet accept functions, pointers, arrays,
+structs, strings, casts, or graphics intrinsics.
 
 ## Integer semantics
 
@@ -64,7 +78,7 @@ is a compiler convenience, not a promise about the eventual full-language C
 semantics.
 
 The compiler already records every expression and local as `Uniform` or
-`Divergent`. All Slice A inputs are uniform. The representation decision is
+`Divergent`. All Slice A/B inputs are uniform. The representation decision is
 kept explicit so later `warp_lane_id()` and divergent control-flow lowering do
 not require replacing the frontend.
 
@@ -75,3 +89,9 @@ comparison; mixed unsigned comparison; word-sized character values; compound
 assignment; and short-circuit evaluation. It must halt with `r0 = 42` in the
 interpreter, then match complete architectural state, RAM, framebuffer, and
 frame sequence in the PTX-compiled backend.
+
+`warpc_control_flow` covers both arms of conditionals, dangling `else`, all
+three loop forms, declaration-scoped `for`, and loop `break` / `continue`.
+`warpc_switch` covers dispatch, no-match default, signed case values,
+fall-through, default before a later case, and switch/loop jump nesting. Both
+must also return 42 with exact interpreter/PTX equivalence.

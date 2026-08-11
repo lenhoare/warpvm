@@ -10,12 +10,23 @@ pub enum TokenKind {
     CharKw,
     Void,
     Return,
+    If,
+    Else,
+    While,
+    Do,
+    For,
+    Break,
+    Continue,
+    Switch,
+    Case,
+    Default,
     LParen,
     RParen,
     LBrace,
     RBrace,
     Semicolon,
     Comma,
+    Colon,
     Plus,
     Minus,
     Star,
@@ -164,6 +175,16 @@ impl<'a> Lexer<'a> {
             "char" => TokenKind::CharKw,
             "void" => TokenKind::Void,
             "return" => TokenKind::Return,
+            "if" => TokenKind::If,
+            "else" => TokenKind::Else,
+            "while" => TokenKind::While,
+            "do" => TokenKind::Do,
+            "for" => TokenKind::For,
+            "break" => TokenKind::Break,
+            "continue" => TokenKind::Continue,
+            "switch" => TokenKind::Switch,
+            "case" => TokenKind::Case,
+            "default" => TokenKind::Default,
             _ => TokenKind::Ident(text.to_string()),
         }
     }
@@ -261,6 +282,7 @@ impl<'a> Lexer<'a> {
             (b'}', _, _) => RBrace,
             (b';', _, _) => Semicolon,
             (b',', _, _) => Comma,
+            (b':', _, _) => Colon,
             (b'+', _, _) => Plus,
             (b'-', _, _) => Minus,
             (b'*', _, _) => Star,
@@ -310,5 +332,26 @@ mod tests {
         let err = lex("int x; /*").unwrap_err();
         assert_eq!(err.span.line, 1);
         assert!(err.message.contains("unterminated"));
+    }
+
+    #[test]
+    fn recognizes_control_flow_keywords_and_colon() {
+        let tokens =
+            lex("if else while do for break continue switch case 1: default: return").unwrap();
+        for kind in [
+            TokenKind::If,
+            TokenKind::Else,
+            TokenKind::While,
+            TokenKind::Do,
+            TokenKind::For,
+            TokenKind::Break,
+            TokenKind::Continue,
+            TokenKind::Switch,
+            TokenKind::Case,
+            TokenKind::Default,
+            TokenKind::Colon,
+        ] {
+            assert!(tokens.iter().any(|token| token.kind == kind));
+        }
     }
 }

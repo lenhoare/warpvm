@@ -503,9 +503,32 @@ three existing instructions absent from the minimal compiled backend:
 `DIV`, `MOD`, and `ABS`, plus the `NOTMASK` used by short-circuit control flow.
 All four now have direct PTX lowering.
 
-The comprehensive 40-condition smoke program is 419 words with five literals.
+The comprehensive 40-condition smoke program is 421 words with five literals.
 That is intentionally not treated as an optimization baseline: the current
 register-only allocator and explicit signed sequences favour transparent
 semantics. If signed-heavy real programs later show a measured material cost,
 signed ISA operations may be reconsidered then; Slice A provides no such
 evidence.
+
+## 17. Structured uniform C control flow maps directly to the current ISA
+
+**Discovered by:** Warp C v0.1.4 Slice B
+
+**Classification:** compiler implementation; no ISA change
+
+Uniform `if`, `while`, `do/while`, and `for` lower to the existing comparison
+and jump instructions. Compiler-maintained target stacks preserve C nesting:
+`break` selects the nearest loop or switch, whereas `continue` searches past
+switches for the nearest loop and enters a `for` at its step expression.
+
+`switch` currently emits one equality test per non-default case followed by a
+jump to the matching source-order label. The body is then emitted in source
+order, so fall-through needs no special instruction. Constant-expression
+evaluation rejects non-constant and duplicate case values before assembly.
+The control-flow and switch acceptance programs are 140 and 105 words and
+both return 42 with exact interpreter/PTX architectural equivalence.
+
+This linear switch strategy is deliberately inspectable and adequate for the
+first language slice. Jump tables or a dedicated multi-way branch should only
+be considered if real programs show large switches to be important. The
+current results provide no reason to change the ISA.

@@ -88,6 +88,65 @@ pub enum TypedStmt {
     Expr(Option<TypedExpr>),
     Return(Option<TypedExpr>, Span),
     Block(TypedBlock),
+    If {
+        condition: TypedExpr,
+        then_branch: Box<TypedStmt>,
+        else_branch: Option<Box<TypedStmt>>,
+        span: Span,
+    },
+    While {
+        condition: TypedExpr,
+        body: Box<TypedStmt>,
+        span: Span,
+    },
+    DoWhile {
+        body: Box<TypedStmt>,
+        condition: TypedExpr,
+        span: Span,
+    },
+    For {
+        init: Option<TypedForInit>,
+        condition: Option<TypedExpr>,
+        step: Option<TypedExpr>,
+        body: Box<TypedStmt>,
+        local_ids: Vec<LocalId>,
+        span: Span,
+    },
+    Break(Span),
+    Continue(Span),
+    Switch {
+        expression: TypedExpr,
+        body: Box<TypedStmt>,
+        labels: Vec<SwitchLabel>,
+        span: Span,
+    },
+    Case {
+        id: usize,
+        body: Box<TypedStmt>,
+        span: Span,
+    },
+    Default {
+        id: usize,
+        body: Box<TypedStmt>,
+        span: Span,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub enum TypedForInit {
+    Decl {
+        local: LocalId,
+        init: Option<TypedExpr>,
+        span: Span,
+    },
+    Expr(TypedExpr),
+}
+
+#[derive(Clone, Debug)]
+pub struct SwitchLabel {
+    pub id: usize,
+    pub value: Option<u32>,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug)]
@@ -130,6 +189,15 @@ struct Analyzer {
     scopes: Vec<HashMap<String, LocalId>>,
     locals: Vec<LocalInfo>,
     return_type: Type,
+    loop_depth: usize,
+    switch_stack: Vec<SwitchContext>,
+    next_switch_label: usize,
+}
+
+struct SwitchContext {
+    labels: Vec<SwitchLabel>,
+    values: HashMap<u32, Span>,
+    default_span: Option<Span>,
 }
 
 impl Analyzer {
@@ -138,6 +206,9 @@ impl Analyzer {
             scopes: Vec::new(),
             locals: Vec::new(),
             return_type: Type::Void,
+            loop_depth: 0,
+            switch_stack: Vec::new(),
+            next_switch_label: 0,
         }
     }
 
@@ -145,7 +216,7 @@ impl Analyzer {
         if program.function.name != "main" {
             return Err(Diagnostic::new(
                 program.function.span,
-                "the integer slice requires int main(void)",
+                "the current frontend requires int main(void)",
             ));
         }
         self.return_type = lower_type(program.function.return_type);
@@ -168,63 +239,269 @@ impl Analyzer {
         let mut statements = Vec::new();
         let mut local_ids = Vec::new();
         for statement in block.statements {
-            match statement {
-                ast::Stmt::Decl {
-                    ty,
-                    name,
-                    init,
-                    span,
-                } => {
-                    let ty = lower_type(ty);
-                    if ty == Type::Void {
-                        return Err(Diagnostic::new(span, "variable cannot have type void"));
-                    }
-                    if self.scopes.last().unwrap().contains_key(&name) {
-                        return Err(Diagnostic::new(span, format!("duplicate local '{name}'")));
-                    }
-                    let typed_init = init.map(|expr| self.expr(expr)).transpose()?;
-                    if let Some(value) = &typed_init {
-                        require_integer(value, "initializer")?;
-                    }
-                    let uniformity = typed_init
-                        .as_ref()
-                        .map_or(Uniformity::Uniform, |value| value.uniformity);
-                    let id = self.locals.len();
-                    self.locals.push(LocalInfo {
-                        name: name.clone(),
-                        ty,
-                        span,
-                        uniformity,
-                    });
-                    self.scopes.last_mut().unwrap().insert(name, id);
-                    local_ids.push(id);
-                    statements.push(TypedStmt::Decl {
-                        local: id,
-                        init: typed_init,
-                        span,
-                    });
-                }
-                ast::Stmt::Expr(value, _) => {
-                    statements.push(TypedStmt::Expr(
-                        value.map(|expr| self.expr(expr)).transpose()?,
-                    ));
-                }
-                ast::Stmt::Return(value, span) => {
-                    let value = value.map(|expr| self.expr(expr)).transpose()?;
-                    if value.is_none() {
-                        return Err(Diagnostic::new(span, "non-void main must return a value"));
-                    }
-                    require_integer(value.as_ref().unwrap(), "return value")?;
-                    statements.push(TypedStmt::Return(value, span));
-                }
-                ast::Stmt::Block(child) => statements.push(TypedStmt::Block(self.block(child)?)),
+            let typed = self.statement(statement)?;
+            if let TypedStmt::Decl { local, .. } = typed {
+                local_ids.push(local);
             }
+            statements.push(typed);
         }
         self.scopes.pop();
         Ok(TypedBlock {
             statements,
             local_ids,
             span: block.span,
+        })
+    }
+
+    fn statement(&mut self, statement: ast::Stmt) -> Result<TypedStmt, Diagnostic> {
+        match statement {
+            ast::Stmt::Decl {
+                ty,
+                name,
+                init,
+                span,
+            } => self.declaration(ty, name, init, span),
+            ast::Stmt::Expr(value, _) => Ok(TypedStmt::Expr(
+                value.map(|expr| self.expr(expr)).transpose()?,
+            )),
+            ast::Stmt::Return(value, span) => {
+                let value = value.map(|expr| self.expr(expr)).transpose()?;
+                if value.is_none() {
+                    return Err(Diagnostic::new(span, "non-void main must return a value"));
+                }
+                require_integer(value.as_ref().unwrap(), "return value")?;
+                Ok(TypedStmt::Return(value, span))
+            }
+            ast::Stmt::Block(child) => Ok(TypedStmt::Block(self.block(child)?)),
+            ast::Stmt::If {
+                condition,
+                then_branch,
+                else_branch,
+                span,
+            } => {
+                let condition = self.condition(condition, "if condition")?;
+                let then_branch = Box::new(self.statement(*then_branch)?);
+                let else_branch = else_branch
+                    .map(|branch| self.statement(*branch).map(Box::new))
+                    .transpose()?;
+                Ok(TypedStmt::If {
+                    condition,
+                    then_branch,
+                    else_branch,
+                    span,
+                })
+            }
+            ast::Stmt::While {
+                condition,
+                body,
+                span,
+            } => {
+                let condition = self.condition(condition, "while condition")?;
+                self.loop_depth += 1;
+                let body = self.statement(*body);
+                self.loop_depth -= 1;
+                Ok(TypedStmt::While {
+                    condition,
+                    body: Box::new(body?),
+                    span,
+                })
+            }
+            ast::Stmt::DoWhile {
+                body,
+                condition,
+                span,
+            } => {
+                self.loop_depth += 1;
+                let body = self.statement(*body);
+                self.loop_depth -= 1;
+                let body = Box::new(body?);
+                let condition = self.condition(condition, "do/while condition")?;
+                Ok(TypedStmt::DoWhile {
+                    body,
+                    condition,
+                    span,
+                })
+            }
+            ast::Stmt::For {
+                init,
+                condition,
+                step,
+                body,
+                span,
+            } => self.for_statement(init, condition, step, *body, span),
+            ast::Stmt::Break(span) => {
+                if self.loop_depth == 0 && self.switch_stack.is_empty() {
+                    return Err(Diagnostic::new(
+                        span,
+                        "break is not inside a loop or switch",
+                    ));
+                }
+                Ok(TypedStmt::Break(span))
+            }
+            ast::Stmt::Continue(span) => {
+                if self.loop_depth == 0 {
+                    return Err(Diagnostic::new(span, "continue is not inside a loop"));
+                }
+                Ok(TypedStmt::Continue(span))
+            }
+            ast::Stmt::Switch {
+                expression,
+                body,
+                span,
+            } => {
+                let expression = self.condition(expression, "switch expression")?;
+                self.switch_stack.push(SwitchContext {
+                    labels: Vec::new(),
+                    values: HashMap::new(),
+                    default_span: None,
+                });
+                let body = self.statement(*body);
+                let context = self.switch_stack.pop().unwrap();
+                Ok(TypedStmt::Switch {
+                    expression,
+                    body: Box::new(body?),
+                    labels: context.labels,
+                    span,
+                })
+            }
+            ast::Stmt::Case { value, body, span } => {
+                if self.switch_stack.is_empty() {
+                    return Err(Diagnostic::new(span, "case is not inside a switch"));
+                }
+                let value = self.expr(value)?;
+                require_integer(&value, "case value")?;
+                let value = constant_u32(&value)?;
+                let id = self.next_switch_label;
+                self.next_switch_label += 1;
+                let context = self.switch_stack.last_mut().unwrap();
+                if context.values.insert(value, span).is_some() {
+                    return Err(Diagnostic::new(span, "duplicate case value"));
+                }
+                context.labels.push(SwitchLabel {
+                    id,
+                    value: Some(value),
+                    span,
+                });
+                Ok(TypedStmt::Case {
+                    id,
+                    body: Box::new(self.statement(*body)?),
+                    span,
+                })
+            }
+            ast::Stmt::Default { body, span } => {
+                if self.switch_stack.is_empty() {
+                    return Err(Diagnostic::new(span, "default is not inside a switch"));
+                }
+                let id = self.next_switch_label;
+                self.next_switch_label += 1;
+                let context = self.switch_stack.last_mut().unwrap();
+                if context.default_span.replace(span).is_some() {
+                    return Err(Diagnostic::new(span, "duplicate default label"));
+                }
+                context.labels.push(SwitchLabel {
+                    id,
+                    value: None,
+                    span,
+                });
+                Ok(TypedStmt::Default {
+                    id,
+                    body: Box::new(self.statement(*body)?),
+                    span,
+                })
+            }
+        }
+    }
+
+    fn declaration(
+        &mut self,
+        ty: ast::TypeName,
+        name: String,
+        init: Option<ast::Expr>,
+        span: Span,
+    ) -> Result<TypedStmt, Diagnostic> {
+        let ty = lower_type(ty);
+        if ty == Type::Void {
+            return Err(Diagnostic::new(span, "variable cannot have type void"));
+        }
+        if self.scopes.last().unwrap().contains_key(&name) {
+            return Err(Diagnostic::new(span, format!("duplicate local '{name}'")));
+        }
+        let typed_init = init.map(|expr| self.expr(expr)).transpose()?;
+        if let Some(value) = &typed_init {
+            require_integer(value, "initializer")?;
+        }
+        let uniformity = typed_init
+            .as_ref()
+            .map_or(Uniformity::Uniform, |value| value.uniformity);
+        let id = self.locals.len();
+        self.locals.push(LocalInfo {
+            name: name.clone(),
+            ty,
+            span,
+            uniformity,
+        });
+        self.scopes.last_mut().unwrap().insert(name, id);
+        Ok(TypedStmt::Decl {
+            local: id,
+            init: typed_init,
+            span,
+        })
+    }
+
+    fn condition(&mut self, expr: ast::Expr, role: &str) -> Result<TypedExpr, Diagnostic> {
+        let expr = self.expr(expr)?;
+        require_integer(&expr, role)?;
+        if expr.uniformity != Uniformity::Uniform {
+            return Err(Diagnostic::new(
+                expr.span,
+                format!("{role} must be uniform in the structured-control slice"),
+            ));
+        }
+        Ok(expr)
+    }
+
+    fn for_statement(
+        &mut self,
+        init: Option<ast::ForInit>,
+        condition: Option<ast::Expr>,
+        step: Option<ast::Expr>,
+        body: ast::Stmt,
+        span: Span,
+    ) -> Result<TypedStmt, Diagnostic> {
+        self.scopes.push(HashMap::new());
+        let mut local_ids = Vec::new();
+        let init = match init {
+            Some(ast::ForInit::Decl {
+                ty,
+                name,
+                init,
+                span,
+            }) => {
+                let decl = self.declaration(ty, name, init, span)?;
+                let TypedStmt::Decl { local, init, span } = decl else {
+                    unreachable!()
+                };
+                local_ids.push(local);
+                Some(TypedForInit::Decl { local, init, span })
+            }
+            Some(ast::ForInit::Expr(expr)) => Some(TypedForInit::Expr(self.expr(expr)?)),
+            None => None,
+        };
+        let condition = condition
+            .map(|expr| self.condition(expr, "for condition"))
+            .transpose()?;
+        let step = step.map(|expr| self.expr(expr)).transpose()?;
+        self.loop_depth += 1;
+        let body = self.statement(body);
+        self.loop_depth -= 1;
+        self.scopes.pop();
+        Ok(TypedStmt::For {
+            init,
+            condition,
+            step,
+            body: Box::new(body?),
+            local_ids,
+            span,
         })
     }
 
@@ -409,6 +686,85 @@ fn require_integer(expr: &TypedExpr, role: &str) -> Result<(), Diagnostic> {
     }
 }
 
+fn constant_u32(expr: &TypedExpr) -> Result<u32, Diagnostic> {
+    use ast::BinaryOp::*;
+    use ast::UnaryOp::*;
+    match &expr.kind {
+        TypedExprKind::Literal(value) => Ok(*value),
+        TypedExprKind::Unary(op, operand) => {
+            let value = constant_u32(operand)?;
+            Ok(match op {
+                Plus => value,
+                Minus => 0u32.wrapping_sub(value),
+                BitNot => !value,
+                LogicalNot => u32::from(value == 0),
+                _ => {
+                    return Err(Diagnostic::new(
+                        expr.span,
+                        "case value must be a constant integer expression",
+                    ))
+                }
+            })
+        }
+        TypedExprKind::Binary {
+            op,
+            left,
+            right,
+            operand_type,
+        } => {
+            let left = constant_u32(left)?;
+            if *op == LogicalAnd && left == 0 {
+                return Ok(0);
+            }
+            if *op == LogicalOr && left != 0 {
+                return Ok(1);
+            }
+            let right = constant_u32(right)?;
+            let signed = *operand_type == Type::I32;
+            let value = match op {
+                Add => left.wrapping_add(right),
+                Sub => left.wrapping_sub(right),
+                Mul => left.wrapping_mul(right),
+                Div | Mod if right == 0 => {
+                    return Err(Diagnostic::new(expr.span, "division by zero in case value"))
+                }
+                Div if signed => ((left as i32 as i64) / (right as i32 as i64)) as u32,
+                Mod if signed => ((left as i32 as i64) % (right as i32 as i64)) as u32,
+                Div => left / right,
+                Mod => left % right,
+                Shl => left.wrapping_shl(right & 31),
+                Shr if signed => ((left as i32) >> (right & 31)) as u32,
+                Shr => left >> (right & 31),
+                Lt if signed => u32::from((left as i32) < (right as i32)),
+                Le if signed => u32::from((left as i32) <= (right as i32)),
+                Gt if signed => u32::from((left as i32) > (right as i32)),
+                Ge if signed => u32::from((left as i32) >= (right as i32)),
+                Lt => u32::from(left < right),
+                Le => u32::from(left <= right),
+                Gt => u32::from(left > right),
+                Ge => u32::from(left >= right),
+                Eq => u32::from(left == right),
+                Ne => u32::from(left != right),
+                BitAnd => left & right,
+                BitXor => left ^ right,
+                BitOr => left | right,
+                LogicalAnd | LogicalOr => u32::from(right != 0),
+                Comma => {
+                    return Err(Diagnostic::new(
+                        expr.span,
+                        "comma is not allowed in a case constant expression",
+                    ))
+                }
+            };
+            Ok(value)
+        }
+        _ => Err(Diagnostic::new(
+            expr.span,
+            "case value must be a constant integer expression",
+        )),
+    }
+}
+
 fn parse_integer(text: &str, span: Span) -> Result<(u32, Type), Diagnostic> {
     let compact: String = text.chars().filter(|&ch| ch != '_').collect();
     let (digits, unsigned) = match compact
@@ -492,5 +848,33 @@ mod tests {
         assert!(err.message.contains("assignment target"));
         let err = analyze_source("int main(void) { return missing; }").unwrap_err();
         assert!(err.message.contains("unknown identifier"));
+    }
+
+    #[test]
+    fn validates_jump_contexts() {
+        let err = analyze_source("int main(void) { break; return 0; }").unwrap_err();
+        assert!(err.message.contains("break is not inside"));
+        let err = analyze_source("int main(void) { switch (0) { default: continue; } return 0; }")
+            .unwrap_err();
+        assert!(err.message.contains("continue is not inside"));
+    }
+
+    #[test]
+    fn validates_switch_constants_and_duplicates() {
+        let program = analyze_source(
+            "int main(void) { switch (7) { case 1 + 2 * 3: return 42; default: return 0; } }",
+        )
+        .unwrap();
+        let TypedStmt::Switch { labels, .. } = &program.body.statements[0] else {
+            panic!("missing switch")
+        };
+        assert_eq!(labels[0].value, Some(7));
+
+        let err = analyze_source("int main(void) { switch (0) { case 1:; case 1:; } return 0; }")
+            .unwrap_err();
+        assert!(err.message.contains("duplicate case"));
+        let err = analyze_source("int main(void) { int x = 1; switch (x) { case x:; } return 0; }")
+            .unwrap_err();
+        assert!(err.message.contains("constant integer"));
     }
 }
