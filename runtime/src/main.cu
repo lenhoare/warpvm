@@ -306,6 +306,10 @@ int RunCompiledSlice1() {
       wvm::enc_r(wvm::kAdd, 0, 2, 0, 1),
       wvm::enc_i(wvm::kMulI, 0, 3, 2, 3),
       wvm::enc_i(wvm::kXorI, 0, 4, 3, -1),
+      wvm::enc_i(wvm::kMovI, 0, 5, 0, -21),
+      wvm::enc_r(wvm::kAbs, 0, 6, 5, 0),
+      wvm::enc_r(wvm::kDiv, 0, 7, 6, 1),
+      wvm::enc_r(wvm::kMod, 0, 8, 6, 1),
       wvm::enc_r(wvm::kHalt, 0, 0, 0, 0),
   };
   wvm::CpuVm arithmetic_cpu;
@@ -500,7 +504,7 @@ int RunCompiledSlice1() {
   // instruction-level fallback inside native execution.
   wvm::WvmFile unsupported;
   unsupported.code = {
-      wvm::enc_r(wvm::kDiv, 0, 0, 0, 1),
+      wvm::enc_r(wvm::kRand, 0, 0, 0, 0),
       wvm::enc_r(wvm::kHalt, 0, 0, 0, 0),
   };
   err.clear();
@@ -550,6 +554,65 @@ int EmitCompiledPtx(const char* input, const char* output) {
   }
   std::printf("compiled PTX: %zu bytes -> %s\n", ptx.size(), output);
   return 0;
+}
+
+int RunCompiledHaltEquivalence(const char* path) {
+  constexpr uint32_t kMemoryWords = 16384;
+  wvm::WvmFile file;
+  std::string err;
+  if (!wvm::LoadWvm(path, file, err)) {
+    std::fprintf(stderr, "error: %s: %s\n", path, err.c_str());
+    return 2;
+  }
+
+  wvm::CpuVm cpu;
+  cpu.Init(0, file, kMemoryWords);
+  while (cpu.status == wvm::kRunning &&
+         cpu.instruction_counter < 10000000u)
+    cpu.RunQuantum();
+  if (cpu.status != wvm::kHalted) {
+    std::printf("compiled halt equivalence: CPU did not halt "
+                "(status=%s fault=%s pc=%u)\n",
+                wvm::StatusName(cpu.status), wvm::FaultName(cpu.fault), cpu.pc);
+    return 1;
+  }
+
+  wvm::PtxCompiledProgram compiled;
+  if (!compiled.Compile(file, err)) {
+    std::printf("compiled halt equivalence: compile FAIL: %s\n", err.c_str());
+    return 1;
+  }
+  std::vector<wvm::VmState> states(1);
+  states[0].status = wvm::kRunning;
+  states[0].rng_state = 0x1234567u;
+  std::vector<uint32_t> memory(kMemoryWords, 0);
+  std::vector<uint32_t> framebuffer(wvm::kVideoWords,
+                                    wvm::kVideoResetColor);
+  std::vector<uint32_t> frame_seq(1, 0);
+  if (!compiled.Launch(states, memory, kMemoryWords, framebuffer, frame_seq,
+                       err)) {
+    std::printf("compiled halt equivalence: launch FAIL: %s\n", err.c_str());
+    return 1;
+  }
+
+  std::string difference;
+  const bool state_equal =
+      SameArchitecturalState(StateFromCpu(cpu), states[0], difference);
+  const bool memory_equal = memory == cpu.memory;
+  const bool framebuffer_equal = framebuffer == cpu.framebuffer;
+  const bool frame_equal = frame_seq[0] == cpu.frame_seq;
+  const bool pass = state_equal && memory_equal && framebuffer_equal &&
+                    frame_equal;
+  std::printf("compiled halt equivalence: state=%s memory=%s framebuffer=%s "
+              "frame_seq=%s r0=%u%s%s\n",
+              state_equal ? "PASS" : "FAIL",
+              memory_equal ? "PASS" : "FAIL",
+              framebuffer_equal ? "PASS" : "FAIL",
+              frame_equal ? "PASS" : "FAIL", states[0].vregs[0],
+              state_equal ? "" : " difference=", state_equal ? "" : difference.c_str());
+  std::printf(pass ? "compiled halt equivalence: PASS\n" :
+                     "compiled halt equivalence: FAIL\n");
+  return pass ? 0 : 1;
 }
 
 int RunCompiledLife(const char* path) {
@@ -2555,6 +2618,8 @@ void Usage(const char* argv0) {
   std::printf("  life_native_cpu_equiv <file.wvm>\n");
   std::printf("                  full-world WarpVM/native CPU equivalence\n");
   std::printf("  compiled_tests        v0.1.3 minimal PTX backend tests\n");
+  std::printf("  compiled_run <file.wvm>\n");
+  std::printf("                  exact CPU/compiled equivalence through HALT\n");
   std::printf("  compiled_life <file.wvm>\n");
   std::printf("                  compiled WarpLife checkpoints and mode transitions\n");
   std::printf("  compiled_life_bench <file.wvm>\n");
@@ -2597,6 +2662,13 @@ int main(int argc, char** argv) {
       return 2;
     }
     return RunCompiledLife(argv[2]);
+  }
+  if (std::strcmp(cmd, "compiled_run") == 0) {
+    if (argc != 3) {
+      std::fprintf(stderr, "error: compiled_run requires a .wvm file\n");
+      return 2;
+    }
+    return RunCompiledHaltEquivalence(argv[2]);
   }
   if (std::strcmp(cmd, "compiled_life_bench") == 0) {
     if (argc != 3) {

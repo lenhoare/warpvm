@@ -91,6 +91,14 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err) {
         body << predicated << "mul.lo.u32 " << VReg(rd) << ", " << VReg(rs1) << ", "
              << VReg(rs2) << ";\n";
         break;
+      case kDiv: case kMod:
+        body << "    setp.ne.u32 %p3, " << VReg(rs2) << ", 0;\n"
+             << "    and.pred %p3, %p3, %p2;\n"
+             << "    mov.u32 %t8, 0;\n"
+             << "    @%p3 " << (op == kDiv ? "div" : "rem") << ".u32 %t8, "
+             << VReg(rs1) << ", " << VReg(rs2) << ";\n"
+             << predicated << "mov.b32 " << VReg(rd) << ", %t8;\n";
+        break;
       case kMin:
         body << predicated << "min.u32 " << VReg(rd) << ", " << VReg(rs1) << ", "
              << VReg(rs2) << ";\n";
@@ -166,6 +174,10 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err) {
         body << predicated << "sub.u32 " << VReg(rd) << ", 0, " << VReg(rs1)
              << ";\n";
         break;
+      case kAbs:
+        body << predicated << "abs.s32 " << VReg(rd) << ", " << VReg(rs1)
+             << ";\n";
+        break;
       case kNot:
         body << predicated << "not.b32 " << VReg(rd) << ", " << VReg(rs1) << ";\n";
         break;
@@ -189,6 +201,16 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err) {
              << ";\n"
              << "    and.pred %p3, %p3, %p2;\n"
              << "    vote.sync.ballot.b32 %t8, %p3, 0xffffffff;\n"
+             << "    not.b32 %t4, %t9;\n"
+             << "    and.b32 %m" << rd << ", %m" << rd << ", %t4;\n"
+             << "    and.b32 %t8, %t8, %t9;\n"
+             << "    or.b32 %m" << rd << ", %m" << rd << ", %t8;\n";
+        break;
+      }
+      case kNotMask: {
+        if (rd >= kPredRegs || rs1 >= kPredRegs)
+          return reject("invalid predicate register");
+        body << "    not.b32 %t8, %m" << rs1 << ";\n"
              << "    not.b32 %t4, %t9;\n"
              << "    and.b32 %m" << rd << ", %m" << rd << ", %t4;\n"
              << "    and.b32 %t8, %t8, %t9;\n"

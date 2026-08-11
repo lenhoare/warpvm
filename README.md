@@ -11,7 +11,7 @@ See [project_spec.md](project_spec.md) for the full vision and
 
 ```text
 runtime/    C++/CUDA — kernel, interpreter, host runtime, CLI
-tools/      Rust — assembler (`warpvm-as`) and disassembler (`warpvm-dis`)
+tools/      Rust — assembler, disassembler, and Warp C compiler (`warpc`)
 programs/   .wva example programs
 docs/       architecture + ISA documentation
 tests/      host-side tests
@@ -36,14 +36,29 @@ ctest --test-dir build --output-on-failure
 
 ## Language tools
 
-The Rust assembler/disassembler build as part of `cmake --build` and land in
-`build/tools-rust/release/`:
+The Rust assembler, disassembler, and Warp C compiler build as part of
+`cmake --build` and land in `build/tools-rust/release/`:
 
 ```sh
 build/tools-rust/release/warpvm-as programs/hello.wva -o hello.wvm
 build/tools-rust/release/warpvm-dis hello.wvm
 build/runtime/warpvm run hello.wvm
 ```
+
+The first Warp C slice supports signed `int`, `unsigned`, word-sized unsigned
+`char`, local variables, integer expressions, assignment, and `return`. It
+emits inspectable WarpVM assembly and assembles it in-process to canonical
+`.wvm`:
+
+```sh
+build/tools-rust/release/warpc programs/warpc/integer_smoke.wc \
+  -o build/warpc_integer_smoke.wvm --emit-asm --dump-uniformity
+build/runtime/warpvm run build/warpc_integer_smoke.wvm
+build/runtime/warpvm compiled_run build/warpc_integer_smoke.wvm
+```
+
+The current subset and integer semantics are documented in
+[`docs/warpc.md`](docs/warpc.md).
 
 ## Persistent machines (slice 5)
 
@@ -145,6 +160,8 @@ control-poll, and memory breakdown is in
 | gfx-★ | **v0.1.1 capstone**: 64 VMs render distinct animated 128×128 images | done |
 | program-01 | **WarpLife**: packed toroidal Life, deterministic tests, 64-world grid | done |
 | v0.1.2 | logical CPU interpreter, CPU/GPU equivalence, five-engine WarpLife benchmark | done |
+| v0.1.3 | direct `.wvm` to PTX compiled execution and mixed-mode equivalence | done |
+| v0.1.4-A | Warp C lexer/parser, typed integer expressions, direct `.wvm` output | done |
 
 ## v0.1 milestone
 

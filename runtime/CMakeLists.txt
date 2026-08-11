@@ -21,18 +21,19 @@ target_compile_options(warpvm PRIVATE
   $<$<COMPILE_LANGUAGE:CXX>:-O2 -Wall -Wextra>
 )
 
-# ---- Rust language tools (assembler / disassembler) ----------------------
+# ---- Rust language tools (assembler / disassembler / Warp C) -------------
 set(WVM_TOOLS_DIR ${CMAKE_SOURCE_DIR}/tools)
 set(WVM_CARGO_TARGET_DIR ${CMAKE_BINARY_DIR}/tools-rust)
 set(WVM_AS ${WVM_CARGO_TARGET_DIR}/release/warpvm-as)
 set(WVM_DIS ${WVM_CARGO_TARGET_DIR}/release/warpvm-dis)
+set(WVM_WARPC ${WVM_CARGO_TARGET_DIR}/release/warpc)
 
 add_custom_target(rust_tools ALL
   COMMAND ${CMAKE_COMMAND} -E env CARGO_TARGET_DIR=${WVM_CARGO_TARGET_DIR}
           cargo build --release --manifest-path ${WVM_TOOLS_DIR}/Cargo.toml
-  BYPRODUCTS ${WVM_AS} ${WVM_DIS}
+  BYPRODUCTS ${WVM_AS} ${WVM_DIS} ${WVM_WARPC}
   WORKING_DIRECTORY ${WVM_TOOLS_DIR}
-  COMMENT "Building Rust assembler/disassembler"
+  COMMENT "Building Rust language tools"
   VERBATIM
 )
 
@@ -48,6 +49,14 @@ add_test(NAME gfxb_flip COMMAND warpvm gfxb)
 add_test(NAME cpu_interpreter COMMAND warpvm cpu_tests)
 add_test(NAME v013_compiled_arithmetic_control_memory
   COMMAND warpvm compiled_tests)
+add_test(NAME warpc_frontend_unit
+  COMMAND ${CMAKE_COMMAND} -E env CARGO_TARGET_DIR=${WVM_CARGO_TARGET_DIR}
+          cargo test --manifest-path ${WVM_TOOLS_DIR}/Cargo.toml -p warpc)
+add_test(NAME warpc_integer_smoke
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_integer_smoke.sh
+          ${WVM_WARPC} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/programs/warpc/integer_smoke.wc
+          ${CMAKE_BINARY_DIR}/warpc_integer_smoke)
 
 add_test(NAME pipeline_hello
   COMMAND bash ${CMAKE_SOURCE_DIR}/tests/pipeline.sh

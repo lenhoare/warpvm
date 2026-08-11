@@ -1,0 +1,11 @@
+[package]
+name = "warpc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+warpvm-asm = { path = "../warpvm-asm" }
+
+[[bin]]
+name = "warpc"
+path = "src/main.rs"

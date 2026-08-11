@@ -1,0 +1,79 @@
+/* Warp C v0.1.4 Slice A: signed/unsigned integer semantics. */
+int main(void)
+{
+    int dividend = -21;
+    int divisor = 4;
+    unsigned high = 0xffffffffu;
+    char letter = 'A';
+    int short_circuit = 0;
+    int compound = 5;
+    int checks = 0;
+
+    /* Signed arithmetic, bitwise operations, shifts and comparisons. */
+    checks += dividend + divisor == -17;
+    checks += dividend - divisor == -25;
+    checks += divisor * -3 == -12;
+    checks += dividend / divisor == -5;
+    checks += dividend % divisor == -1;
+    checks += (dividend & 7) == 3;
+    checks += (dividend | 4) == -17;
+    checks += (dividend ^ -1) == 20;
+    checks += ~dividend == 20;
+    checks += divisor << 2 == 16;
+    checks += dividend >> 2 == -6;
+    checks += dividend == -21;
+    checks += dividend != divisor;
+    checks += dividend < divisor;
+    checks += dividend <= -21;
+    checks += divisor > dividend;
+    checks += divisor >= 4;
+
+    /* Unsigned arithmetic, bitwise operations, shifts and comparisons. */
+    checks += high + 2u == 1u;
+    checks += high - 1u == 0xfffffffeu;
+    checks += 3u * divisor == 12u;
+    checks += high / 65535u == 65537u;
+    checks += high % 65535u == 0u;
+    checks += (high & 0xffu) == 0xffu;
+    checks += (high | 0u) == high;
+    checks += (high ^ 0xffffffffu) == 0u;
+    checks += 1u << 31 == 0x80000000u;
+    checks += high >> 31 == 1u;
+    checks += high == 0xffffffffu;
+    checks += high != 0u;
+    checks += 1u < high;
+    checks += 1u <= high;
+    checks += high > 1u;
+    checks += high >= 0xffffffffu;
+
+    /* Mixed arithmetic promotes int to unsigned. */
+    checks += !(high < 1);
+
+    /* char is an unsigned, word-sized integer in Warp C. */
+    checks += letter == 'A';
+    checks += letter + 1u == 'B';
+
+    checks += (0 || divisor) == 1;
+    short_circuit && ++short_circuit;
+    checks += short_circuit == 0;
+
+    compound += 3;
+    compound -= 2;
+    compound *= 7;
+    compound /= 5;
+    compound %= 3;
+    compound <<= 4;
+    compound >>= 2;
+    compound &= 7;
+    compound |= 9;
+    compound ^= 3;
+    checks += compound == 10;
+
+    ++compound;
+    compound++;
+    --compound;
+    compound--;
+    checks += compound == 10;
+
+    return checks + 2; /* 40 successful checks -> 42. */
+}

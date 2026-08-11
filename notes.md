@@ -481,3 +481,31 @@ The packed compiled kernel uses 58 native registers per thread with no stack,
 spills, or local-memory instructions. Its 3,368 static `sm_86` SASS
 instructions contain the expected `SHFL.IDX` operations. This confirms that
 the speedup did not exchange bytecode work for hidden local-memory traffic.
+
+## 16. C signed integers can be lowered without changing the ISA
+
+**Discovered by:** Warp C v0.1.4 Slice A
+
+**Classification:** compiler/backend implementation; no ISA change
+
+WarpVM's arithmetic comparisons, division, remainder, and right shift are
+unsigned, while Warp C defines `int` as signed 32-bit. The first compiler
+lowers signed comparison by XOR-biasing both operands with `0x80000000`,
+division and remainder through magnitudes plus sign reconstruction, and
+arithmetic right shift through logical shift and explicit sign fill. Signed
+overflow retains the machine's modulo-2^32 behaviour.
+
+The integer smoke program exercises these paths together with mixed
+signed/unsigned conversion and short-circuit evaluation. It halts with
+`r0 = 42` in the interpreter and matches complete architectural state, RAM,
+framebuffer, and frame sequence through direct PTX compilation. This exposed
+three existing instructions absent from the minimal compiled backend:
+`DIV`, `MOD`, and `ABS`, plus the `NOTMASK` used by short-circuit control flow.
+All four now have direct PTX lowering.
+
+The comprehensive 40-condition smoke program is 419 words with five literals.
+That is intentionally not treated as an optimization baseline: the current
+register-only allocator and explicit signed sequences favour transparent
+semantics. If signed-heavy real programs later show a measured material cost,
+signed ISA operations may be reconsidered then; Slice A provides no such
+evidence.
