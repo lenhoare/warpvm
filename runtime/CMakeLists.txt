@@ -5,6 +5,8 @@ pkg_check_modules(SDL2 REQUIRED sdl2)
 add_executable(warpvm
   src/main.cu
   src/gpu/kernel.cu
+  src/host/cpu_interpreter.cpp
+  src/host/life_bench.cu
   src/host/view_sdl.cu
 )
 
@@ -41,6 +43,7 @@ add_test(NAME slice5_control_plane COMMAND warpvm slice5)
 add_test(NAME slice7_messaging COMMAND warpvm slice7)
 add_test(NAME gfxa_framebuffer COMMAND warpvm gfxa)
 add_test(NAME gfxb_flip COMMAND warpvm gfxb)
+add_test(NAME cpu_interpreter COMMAND warpvm cpu_tests)
 
 add_test(NAME pipeline_hello
   COMMAND bash ${CMAKE_SOURCE_DIR}/tests/pipeline.sh
@@ -87,3 +90,13 @@ add_test(NAME program01_warplife
           ${WVM_AS} $<TARGET_FILE:warpvm>
           ${CMAKE_SOURCE_DIR}/programs/warplife.wva
           ${CMAKE_BINARY_DIR}/warplife)
+add_test(NAME program01_benchmark_smoke
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warplife_bench.sh
+          ${WVM_AS} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/programs/warplife.wva
+          ${CMAKE_BINARY_DIR}/warplife_bench)
+add_test(NAME v012_cpu_gpu_equivalence
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warplife_equiv.sh
+          ${WVM_AS} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/programs/warplife.wva
+          ${CMAKE_BINARY_DIR}/warplife_equiv)

@@ -123,6 +123,7 @@ __device__ inline bool BadPredField(uint32_t f) { return f >= kPredRegs; }
 // pause/shutdown request at a control point (YIELD, backward jumps).
 // Returns why execution stopped. With ctrl == nullptr this is the plain
 // run-to-completion path used by `warpvm run` and the slice self-tests.
+template <bool kResolveFaultVotes = true, bool kPollBackwardControl = true>
 __device__ StopReason VmRun(VmCtx& ctx, Control* ctrl = nullptr,
                             uint32_t vm_id = 0) {
   StopReason reason = kStopHalted;
@@ -685,28 +686,37 @@ __device__ StopReason VmRun(VmCtx& ctx, Control* ctrl = nullptr,
     // Resolve per-lane fault conditions to a warp-uniform decision: any
     // lane's fault faults the whole VM, taking the lowest faulting lane's
     // code. Keeps control flow converged even with scattered accesses.
-    const uint32_t fault_ballot =
-        __ballot_sync(kFullMask, ctx.fault != kFaultOk);
-    if (fault_ballot != 0u) {
-      ctx.fault = __shfl_sync(kFullMask, ctx.fault, __ffs(fault_ballot) - 1);
-      break;
+    if constexpr (kResolveFaultVotes) {
+      const uint32_t fault_ballot =
+          __ballot_sync(kFullMask, ctx.fault != kFaultOk);
+      if (fault_ballot != 0u) {
+        ctx.fault =
+            __shfl_sync(kFullMask, ctx.fault, __ffs(fault_ballot) - 1);
+        break;
+      }
     }
     ++ctx.instr_count;
     if (stop) break;
 
-    // Control point: backward branches are loop heads, so check for a
-    // pause/shutdown there too. pc already holds the taken target; stopping
-    // here resumes at that target. Publish throttled progress for the host.
-    if (jumped && ctrl != nullptr && ctx.pc <= this_pc) {
+    // Control point: taken backward branch instructions are loop backedges,
+    // so check for pause/shutdown there too. CALL/RET may also transfer to a
+    // lower PC, but they are subroutine mechanics rather than loop control
+    // points and must not poll mapped host state on every return.
+    const bool backward_branch =
+        jumped && ctx.pc <= this_pc &&
+        (op == kJmp || op == kJmpIfAny || op == kJmpIfAll);
+    if (backward_branch && ctrl != nullptr) {
       if (ctx.instr_count - ctx.last_pub >= 1024u) {
         ctx.last_pub = ctx.instr_count;
         PublishStatus(ctrl, vm_id, ctx.lane, kRunning, 0, ctx.pc,
                       ctx.instr_count);
       }
-      StopReason ir;
-      if (CheckInterrupt(ctrl, vm_id, ctx.lane, &ir)) {
-        reason = ir;
-        break;
+      if constexpr (kPollBackwardControl) {
+        StopReason ir;
+        if (CheckInterrupt(ctrl, vm_id, ctx.lane, &ir)) {
+          reason = ir;
+          break;
+        }
       }
     }
 

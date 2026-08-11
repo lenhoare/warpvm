@@ -24,6 +24,19 @@ namespace wvm {
 __global__ void PersistentKernel(const VmDesc* descs, VmState* states,
                                  Control* ctrl, uint32_t num_vms,
                                  Mailbox* mailboxes);
+__global__ void PersistentNoFaultVoteKernel(const VmDesc*, VmState*, Control*,
+                                            uint32_t, Mailbox*);
+__global__ void PersistentYieldPollKernel(const VmDesc*, VmState*, Control*,
+                                          uint32_t, Mailbox*);
+__global__ void PersistentMinimalProfileKernel(const VmDesc*, VmState*,
+                                               Control*, uint32_t, Mailbox*);
+
+enum class PersistentKernelMode {
+  kNormal,
+  kNoFaultVotes,
+  kYieldOnlyPolling,
+  kNoFaultVotesYieldOnlyPolling,
+};
 
 struct LogSnapshot {
   uint32_t head = 0;
@@ -123,7 +136,8 @@ class PersistentRuntime {
     return true;
   }
 
-  bool Launch(std::string& err) {
+  bool Launch(std::string& err,
+              PersistentKernelMode mode = PersistentKernelMode::kNormal) {
     // Launch on a non-blocking stream: the legacy default stream would make
     // cudaMemcpy / host reads implicitly wait on the resident kernel and
     // deadlock. Non-blocking streams are exempt from that synchronisation.
@@ -135,8 +149,24 @@ class PersistentRuntime {
     }
     const int block = 256;
     const int grid = static_cast<int>((num_vms_ * kLanes + block - 1) / block);
-    PersistentKernel<<<grid, block, 0, stream_>>>(d_descs_, d_states_, d_ctrl_,
-                                                  num_vms_, d_mailboxes_);
+    switch (mode) {
+      case PersistentKernelMode::kNormal:
+        PersistentKernel<<<grid, block, 0, stream_>>>(
+            d_descs_, d_states_, d_ctrl_, num_vms_, d_mailboxes_);
+        break;
+      case PersistentKernelMode::kNoFaultVotes:
+        PersistentNoFaultVoteKernel<<<grid, block, 0, stream_>>>(
+            d_descs_, d_states_, d_ctrl_, num_vms_, d_mailboxes_);
+        break;
+      case PersistentKernelMode::kYieldOnlyPolling:
+        PersistentYieldPollKernel<<<grid, block, 0, stream_>>>(
+            d_descs_, d_states_, d_ctrl_, num_vms_, d_mailboxes_);
+        break;
+      case PersistentKernelMode::kNoFaultVotesYieldOnlyPolling:
+        PersistentMinimalProfileKernel<<<grid, block, 0, stream_>>>(
+            d_descs_, d_states_, d_ctrl_, num_vms_, d_mailboxes_);
+        break;
+    }
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
       err = std::string("kernel launch failed: ") + cudaGetErrorString(e);

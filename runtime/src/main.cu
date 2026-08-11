@@ -12,6 +12,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -19,6 +20,7 @@
 #include "gpu/vm_state.cuh"
 #include "gpu/warpvm.cuh"
 #include "host/disasm.h"
+#include "host/cpu_interpreter.h"
 #include "host/persistent.h"
 #include "host/vm_image.h"
 #include "host/wvm_file.h"
@@ -28,6 +30,12 @@ __global__ void Slice1Kernel(uint32_t* lane_out, uint32_t* sum_out);
 __global__ void VmArrayKernel(const VmDesc* descs, VmState* states);
 int ViewSingleVm(const char* path, uint32_t vm_index);  // host/view_sdl.cu
 int ViewVmGrid(const char* path, uint32_t n_vms);       // host/view_sdl.cu
+int RunLifeBenchmark(const char* path,
+                     const std::vector<uint32_t>& vm_counts,
+                     int duration_ms,
+                     uint32_t cpu_workers);             // host/life_bench.cu
+int RunLifeProfile(const char* path, int duration_ms);  // host/life_bench.cu
+int RunCpuGpuLifeEquivalence(const char* path);         // host/life_bench.cu
 }  // namespace wvm
 
 namespace {
@@ -549,6 +557,36 @@ int RunSlice2() {
     ExecProgram(prog, {}, st);
     ok &= CheckState("fall_off_end_faults", st, wvm::kFaulted, wvm::kFaultJump,
                      1);
+  }
+
+  // A fault raised by only one guarded lane must still fault the whole VM.
+  // This protects the per-lane fault-vote contract during future tuning.
+  {
+    const std::vector<uint32_t> prog = {
+        enc_r(wvm::kLaneId, 0, 0, 0, 0),       // r0 = lane
+        enc_i(wvm::kCmpEqI, 0, 0, 0, 0),       // p0 = lane 0 only
+        enc_i(wvm::kLdw, 1, 1, 0, 0),          // @p0 r1 = bad RAM address
+        enc_r(wvm::kLoad, 1, 2, 1, 0),         // @p0 LOAD -> lane-local fault
+        enc_r(wvm::kHalt, 0, 0, 0, 0),
+    };
+    ExecProgram(prog, {20000u}, st);
+    ok &= CheckState("guarded_lane_mem_fault", st, wvm::kFaulted,
+                     wvm::kFaultMem, 0);
+    ok &= st.instruction_counter == 3;
+  }
+
+  // A guarded literal miss is also lane-local before the retained vote.
+  {
+    const std::vector<uint32_t> prog = {
+        enc_r(wvm::kLaneId, 0, 0, 0, 0),
+        enc_i(wvm::kCmpEqI, 0, 0, 0, 0),
+        enc_i(wvm::kLdw, 1, 1, 0, 0),          // empty literal pool
+        enc_r(wvm::kHalt, 0, 0, 0, 0),
+    };
+    ExecProgram(prog, {}, st);
+    ok &= CheckState("guarded_literal_fault", st, wvm::kFaulted,
+                     wvm::kFaultOperand, 0);
+    ok &= st.instruction_counter == 2;
   }
 
   std::printf(ok ? "slice2: PASS\n" : "slice2: FAIL\n");
@@ -1683,11 +1721,27 @@ void Usage(const char* argv0) {
   std::printf("  view <file.wvm> [--vm N | --vms N]\n");
   std::printf("                  show one VM or a tiled grid of N resident VMs\n");
   std::printf("  life_test <file.wvm> Program 01 packed-Life correctness test\n");
+  std::printf("  life_bench <file.wvm> [--vms N] [--ms N] [--workers N]\n");
+  std::printf("                  compare GPU/CPU WarpVM and native GPU/CPU\n");
+  std::printf("  life_profile <file.wvm> [--ms N]\n");
+  std::printf("                  one-VM opcode, phase, and matched-cost profile\n");
+  std::printf("  cpu_tests             v0.1.2 CPU interpreter self-tests\n");
+  std::printf("  life_equiv <file.wvm> v0.1.2 CPU/GPU WarpLife equivalence\n");
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (argc < 2) {
+    Usage(argv[0]);
+    return 2;
+  }
+  const char* cmd = argv[1];
+  // The logical CPU interpreter is deliberately usable without a CUDA
+  // device. Cross-engine commands continue through normal GPU setup below.
+  if (std::strcmp(cmd, "cpu_tests") == 0)
+    return wvm::RunCpuInterpreterTests();
+
   int device = 0;
   CUDA_CHECK(cudaGetDevice(&device));
   cudaDeviceProp prop{};
@@ -1695,11 +1749,6 @@ int main(int argc, char** argv) {
   std::printf("device: %s  SMs=%d  cc=%d.%d\n", prop.name,
               prop.multiProcessorCount, prop.major, prop.minor);
 
-  if (argc < 2) {
-    Usage(argv[0]);
-    return 2;
-  }
-  const char* cmd = argv[1];
   if (std::strcmp(cmd, "slice1") == 0) return RunSlice1();
   if (std::strcmp(cmd, "slice2") == 0) return RunSlice2();
   if (std::strcmp(cmd, "slice3") == 0) return RunSlice3();
@@ -1778,6 +1827,73 @@ int main(int argc, char** argv) {
       return 2;
     }
     return RunLifeTest(argv[2]);
+  }
+  if (std::strcmp(cmd, "life_equiv") == 0) {
+    if (argc < 3) {
+      std::fprintf(stderr, "error: life_equiv requires a .wvm file\n");
+      return 2;
+    }
+    return wvm::RunCpuGpuLifeEquivalence(argv[2]);
+  }
+  if (std::strcmp(cmd, "life_profile") == 0) {
+    if (argc < 3) {
+      std::fprintf(stderr, "error: life_profile requires a .wvm file\n");
+      return 2;
+    }
+    int duration_ms = 1000;
+    for (int i = 3; i < argc; ++i) {
+      if (std::strcmp(argv[i], "--ms") == 0 && i + 1 < argc) {
+        duration_ms = std::atoi(argv[++i]);
+        if (duration_ms < 200 || duration_ms > 10000) {
+          std::fprintf(stderr, "error: --ms must be 200..10000\n");
+          return 2;
+        }
+      } else {
+        std::fprintf(stderr, "error: unknown life_profile option '%s'\n",
+                     argv[i]);
+        return 2;
+      }
+    }
+    return wvm::RunLifeProfile(argv[2], duration_ms);
+  }
+  if (std::strcmp(cmd, "life_bench") == 0) {
+    if (argc < 3) {
+      std::fprintf(stderr, "error: life_bench requires a .wvm file\n");
+      return 2;
+    }
+    std::vector<uint32_t> vm_counts{1, 8, 32, 64};
+    int duration_ms = 2000;
+    uint32_t cpu_workers = std::max(1u, std::thread::hardware_concurrency());
+    for (int i = 3; i < argc; ++i) {
+      if (std::strcmp(argv[i], "--vms") == 0 && i + 1 < argc) {
+        const int value = std::atoi(argv[++i]);
+        if (value < 1 || value > static_cast<int>(wvm::kMaxVms)) {
+          std::fprintf(stderr, "error: --vms must be 1..%u\n", wvm::kMaxVms);
+          return 2;
+        }
+        vm_counts.assign(1, static_cast<uint32_t>(value));
+      } else if (std::strcmp(argv[i], "--ms") == 0 && i + 1 < argc) {
+        duration_ms = std::atoi(argv[++i]);
+        if (duration_ms < 100 || duration_ms > 60000) {
+          std::fprintf(stderr, "error: --ms must be 100..60000\n");
+          return 2;
+        }
+      } else if (std::strcmp(argv[i], "--workers") == 0 && i + 1 < argc) {
+        const int value = std::atoi(argv[++i]);
+        if (value < 1 || value > static_cast<int>(wvm::kMaxVms)) {
+          std::fprintf(stderr, "error: --workers must be 1..%u\n",
+                       wvm::kMaxVms);
+          return 2;
+        }
+        cpu_workers = static_cast<uint32_t>(value);
+      } else {
+        std::fprintf(stderr, "error: unknown life_bench option '%s'\n",
+                     argv[i]);
+        return 2;
+      }
+    }
+    return wvm::RunLifeBenchmark(argv[2], vm_counts, duration_ms,
+                                 cpu_workers);
   }
   if (std::strcmp(cmd, "run") == 0) {
     if (argc < 3) {

@@ -104,7 +104,18 @@ evolve_batch:
     ; Current cell.
     MOV r4, r1
     MOV r5, r2
-    CALL load_cell
+    ; Inlined load_cell. This nine-instruction sequence is deliberately
+    ; repeated at each sample: avoiding CALL/RET removes 9,216 interpreted
+    ; bytecodes per generation (see benchmarks/warplife_profile.md).
+    AND_I r4, r4, 127
+    AND_I r5, r5, 127
+    SHR_I r8, r4, 5
+    SHL_I r9, r5, 2
+    ADD r8, r8, r9
+    ADD r8, r8, r6
+    LOAD r7, r8
+    SHR r7, r7, r4
+    AND_I r7, r7, 1
     MOV r12, r7
 
     MOV_I r11, 0                ; neighbour count
@@ -112,49 +123,113 @@ evolve_batch:
     ; (-1,-1)
     ADD_I r4, r1, -1
     ADD_I r5, r2, -1
-    CALL load_cell
+    AND_I r4, r4, 127
+    AND_I r5, r5, 127
+    SHR_I r8, r4, 5
+    SHL_I r9, r5, 2
+    ADD r8, r8, r9
+    ADD r8, r8, r6
+    LOAD r7, r8
+    SHR r7, r7, r4
+    AND_I r7, r7, 1
     ADD r11, r11, r7
 
     ; (0,-1)
     MOV r4, r1
     ADD_I r5, r2, -1
-    CALL load_cell
+    AND_I r4, r4, 127
+    AND_I r5, r5, 127
+    SHR_I r8, r4, 5
+    SHL_I r9, r5, 2
+    ADD r8, r8, r9
+    ADD r8, r8, r6
+    LOAD r7, r8
+    SHR r7, r7, r4
+    AND_I r7, r7, 1
     ADD r11, r11, r7
 
     ; (+1,-1)
     ADD_I r4, r1, 1
     ADD_I r5, r2, -1
-    CALL load_cell
+    AND_I r4, r4, 127
+    AND_I r5, r5, 127
+    SHR_I r8, r4, 5
+    SHL_I r9, r5, 2
+    ADD r8, r8, r9
+    ADD r8, r8, r6
+    LOAD r7, r8
+    SHR r7, r7, r4
+    AND_I r7, r7, 1
     ADD r11, r11, r7
 
     ; (-1,0)
     ADD_I r4, r1, -1
     MOV r5, r2
-    CALL load_cell
+    AND_I r4, r4, 127
+    AND_I r5, r5, 127
+    SHR_I r8, r4, 5
+    SHL_I r9, r5, 2
+    ADD r8, r8, r9
+    ADD r8, r8, r6
+    LOAD r7, r8
+    SHR r7, r7, r4
+    AND_I r7, r7, 1
     ADD r11, r11, r7
 
     ; (+1,0)
     ADD_I r4, r1, 1
     MOV r5, r2
-    CALL load_cell
+    AND_I r4, r4, 127
+    AND_I r5, r5, 127
+    SHR_I r8, r4, 5
+    SHL_I r9, r5, 2
+    ADD r8, r8, r9
+    ADD r8, r8, r6
+    LOAD r7, r8
+    SHR r7, r7, r4
+    AND_I r7, r7, 1
     ADD r11, r11, r7
 
     ; (-1,+1)
     ADD_I r4, r1, -1
     ADD_I r5, r2, 1
-    CALL load_cell
+    AND_I r4, r4, 127
+    AND_I r5, r5, 127
+    SHR_I r8, r4, 5
+    SHL_I r9, r5, 2
+    ADD r8, r8, r9
+    ADD r8, r8, r6
+    LOAD r7, r8
+    SHR r7, r7, r4
+    AND_I r7, r7, 1
     ADD r11, r11, r7
 
     ; (0,+1)
     MOV r4, r1
     ADD_I r5, r2, 1
-    CALL load_cell
+    AND_I r4, r4, 127
+    AND_I r5, r5, 127
+    SHR_I r8, r4, 5
+    SHL_I r9, r5, 2
+    ADD r8, r8, r9
+    ADD r8, r8, r6
+    LOAD r7, r8
+    SHR r7, r7, r4
+    AND_I r7, r7, 1
     ADD r11, r11, r7
 
     ; (+1,+1)
     ADD_I r4, r1, 1
     ADD_I r5, r2, 1
-    CALL load_cell
+    AND_I r4, r4, 127
+    AND_I r5, r5, 127
+    SHR_I r8, r4, 5
+    SHL_I r9, r5, 2
+    ADD r8, r8, r9
+    ADD r8, r8, r6
+    LOAD r7, r8
+    SHR r7, r7, r4
+    AND_I r7, r7, 1
     ADD r11, r11, r7
 
     ; next = neighbours==3 || (current && neighbours==2)
@@ -218,19 +293,3 @@ render_batch:
     FLIP
     YIELD
     JMP generation
-
-; Load one packed cell.
-;   input:  r4=x, r5=y, r6=current world base
-;   output: r7=0/1
-;   clobber: r4,r5,r8,r9
-load_cell:
-    AND_I r4, r4, 127           ; toroidal x wrap
-    AND_I r5, r5, 127           ; toroidal y wrap
-    SHR_I r8, r4, 5             ; horizontal packed-word group
-    SHL_I r9, r5, 2             ; row * 4 packed words
-    ADD r8, r8, r9
-    ADD r8, r8, r6
-    LOAD r7, r8
-    SHR r7, r7, r4              ; SHR masks shift count to x & 31
-    AND_I r7, r7, 1
-    RET

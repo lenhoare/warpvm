@@ -95,7 +95,9 @@ build/runtime/warpvm view build/graphics.wvm --vms 64
 `programs/warplife.wva` is a complete 128×128 toroidal Conway's Life program
 written directly in WarpVM assembly. Each VM keeps two bit-packed 512-word
 worlds, evolves 32 cells per warp batch, renders through ordinary framebuffer
-stores, and runs independently forever.
+stores, and runs independently forever. Its frequently used nine-instruction
+`load_cell` sequence is inlined: this grows static code from 153 to 215 words
+but removes 9,216 interpreted `CALL`/`RET` bytecodes per generation.
 
 VM 0 is a deterministic blinker, VM 1 is a toroidal four-corner still life,
 and the remaining VMs use deterministic `VMID`-derived worlds:
@@ -104,10 +106,24 @@ and the remaining VMs use deterministic `VMID`-derived worlds:
 build/tools-rust/release/warpvm-as programs/warplife.wva -o build/warplife.wvm
 build/runtime/warpvm life_test build/warplife.wvm
 build/runtime/warpvm view build/warplife.wvm --vms 64
+build/runtime/warpvm life_equiv build/warplife.wvm
+build/runtime/warpvm life_bench build/warplife.wvm --ms 2000 --workers 4
+build/runtime/warpvm life_profile build/warplife.wvm --ms 1000
 ```
 
+The v0.1.2 benchmark runs the unchanged `.wvm` through both the persistent
+CUDA interpreter and a logical 32-lane CPU interpreter. It also measures
+single- and multi-worker native CPU Life plus native CUDA. The default CPU
+worker count is the host's reported hardware concurrency; `--workers`
+overrides it. Every benchmark run first performs deterministic, full-world
+CPU/GPU equivalence checks for VM IDs 0, 1, 2, and 37.
+
 Concrete architectural issues discovered while writing applications are
-recorded in [`notes.md`](notes.md).
+recorded in [`notes.md`](notes.md). The RTX 3060 timing methodology and first
+1/8/32/64/256-VM results are in
+[`benchmarks/warplife.md`](benchmarks/warplife.md). The one-VM opcode, phase,
+control-poll, and memory breakdown is in
+[`benchmarks/warplife_profile.md`](benchmarks/warplife_profile.md).
 
 ## Slice status
 
@@ -128,6 +144,7 @@ recorded in [`notes.md`](notes.md).
 | gfx-D | SDL multi-VM tiled viewer | done |
 | gfx-★ | **v0.1.1 capstone**: 64 VMs render distinct animated 128×128 images | done |
 | program-01 | **WarpLife**: packed toroidal Life, deterministic tests, 64-world grid | done |
+| v0.1.2 | logical CPU interpreter, CPU/GPU equivalence, five-engine WarpLife benchmark | done |
 
 ## v0.1 milestone
 
