@@ -90,6 +90,14 @@ provide:
 - `warp_set_pixel(x, y, colour)` lowering to address arithmetic and `STORE`;
 - `warp_flip()` lowering to the existing unguarded `FLIP` instruction.
 
+The same built-in header exposes the existing VM mailboxes as
+`warp_send(destination, type, payload)` and non-blocking
+`warp_try_recv(&payload, &metadata)`. Successful receives return nonzero and
+write metadata as `(type << 16) | source_vm`. Both operations are VM-wide and
+therefore rejected inside divergent control flow. Mailboxes exist on resident
+VMs; a program using them should run through `view`, `serve`, or `attach`, not
+the mailbox-free one-shot runner or the current PTX backend.
+
 No implicit clipping or bounds check is added to `warp_set_pixel`; invalid
 coordinates retain the architecture's normal memory-fault behaviour.
 `warp_flip()` is rejected inside divergent control because publication is one
@@ -221,3 +229,9 @@ GPU interpreter and PTX backend must both halt with `r0 = 42` and exact state,
 RAM, framebuffer, and frame-sequence equivalence. A persistent-runtime check
 then verifies the 128x128 ARGB8888 format, `frame_seq = 1`, and known red,
 green, blue, and white pixels through the attach inspection path.
+
+`warpc_firefly` runs 64 persistent copies of the Warp C firefly demo. Its
+uniform 512-iteration render loop combines each batch with `warp_lane_id()`,
+so every framebuffer store writes 32 distinct pixels. The acceptance check
+requires all 64 VMs to remain running without faults, a positive frame
+sequence, and a positive received-message counter in VM-private RAM.

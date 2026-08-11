@@ -290,6 +290,8 @@ pub enum Intrinsic {
     Flip,
     Argb,
     SetPixel,
+    Send,
+    TryRecv,
 }
 
 #[derive(Clone, Debug)]
@@ -670,6 +672,8 @@ impl Analyzer {
                 | "warp_flip"
                 | "warp_argb"
                 | "warp_set_pixel"
+                | "warp_send"
+                | "warp_try_recv"
         ) {
             return Err(Diagnostic::new(
                 function.span,
@@ -1288,6 +1292,8 @@ impl Analyzer {
             "warp_flip" => Some((Intrinsic::Flip, 0, Type::VOID, Uniformity::Uniform)),
             "warp_argb" => Some((Intrinsic::Argb, 4, Type::U32, Uniformity::Uniform)),
             "warp_set_pixel" => Some((Intrinsic::SetPixel, 3, Type::VOID, Uniformity::Uniform)),
+            "warp_send" => Some((Intrinsic::Send, 3, Type::VOID, Uniformity::Uniform)),
+            "warp_try_recv" => Some((Intrinsic::TryRecv, 2, Type::I32, Uniformity::Uniform)),
             _ => None,
         };
         if let Some((intrinsic, arity, ty, base_uniformity)) = signature {
@@ -1300,17 +1306,30 @@ impl Analyzer {
                     ),
                 ));
             }
-            if intrinsic == Intrinsic::Flip && self.divergent_depth != 0 {
+            if matches!(
+                intrinsic,
+                Intrinsic::Flip | Intrinsic::Send | Intrinsic::TryRecv
+            ) && self.divergent_depth != 0
+            {
                 return Err(Diagnostic::new(
                     span,
-                    "warp_flip() is not allowed inside divergent control flow",
+                    format!("{callee}() is not allowed inside divergent control flow"),
                 ));
             }
             let mut uniformity = base_uniformity;
             let mut typed_args = Vec::with_capacity(args.len());
             for arg in args {
                 let arg = self.expr(arg)?;
-                require_integer(&arg, "graphics intrinsic argument")?;
+                if intrinsic == Intrinsic::TryRecv {
+                    if value_type(arg.ty) != Type::U32.pointer_to() {
+                        return Err(Diagnostic::new(
+                            arg.span,
+                            "warp_try_recv arguments must have type unsigned *",
+                        ));
+                    }
+                } else {
+                    require_integer(&arg, "Warp intrinsic argument")?;
+                }
                 uniformity = uniformity.join(arg.uniformity);
                 typed_args.push(arg);
             }

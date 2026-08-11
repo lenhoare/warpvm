@@ -1,0 +1,148 @@
+#include <warp.h>
+
+/* One independent firefly world per VM. Persistent state lives in the VM's
+ * private RAM; the renderer uses one framebuffer pixel per hardware lane. */
+int firefly_x;
+int firefly_y;
+int velocity_x;
+int velocity_y;
+unsigned frame_number;
+unsigned excited_frames;
+unsigned pulse_age;
+unsigned messages_received;
+unsigned inbox_payload;
+unsigned inbox_metadata;
+
+unsigned background_colour;
+unsigned star_colour;
+unsigned outer_colour;
+unsigned middle_colour;
+unsigned inner_colour;
+unsigned core_colour;
+unsigned pulse_colour;
+unsigned pulse_inner_squared;
+unsigned pulse_outer_squared;
+
+int main(void)
+{
+    unsigned vm = warp_vm_id();
+
+    /* Relatively-prime multipliers give the 64 VMs distinct starting points. */
+    firefly_x = 8 + (vm * 29) % 112;
+    firefly_y = 8 + (vm * 47) % 112;
+    velocity_x = 1;
+    velocity_y = 1;
+    if (vm & 1)
+        velocity_x = -1;
+    if (vm & 2)
+        velocity_y = -1;
+
+    background_colour = warp_argb(255, 0, 0, 3 + (vm & 3));
+    star_colour = warp_argb(255, 12, 14, 22);
+    pulse_colour = warp_argb(255, 35, 120, 150);
+
+    while (1) {
+        /* Drain the non-blocking inbox. Every pulse refreshes the response. */
+        while (warp_try_recv(&inbox_payload, &inbox_metadata)) {
+            excited_frames = 32 + (inbox_payload & 15);
+            ++messages_received;
+        }
+
+        firefly_x += velocity_x;
+        firefly_y += velocity_y;
+        if (excited_frames != 0) {
+            /* A received pulse gives the firefly a second movement step. */
+            firefly_x += velocity_x;
+            firefly_y += velocity_y;
+            --excited_frames;
+        }
+
+        if (firefly_x < 7) {
+            firefly_x = 7;
+            velocity_x = 1;
+        }
+        if (firefly_x > 120) {
+            firefly_x = 120;
+            velocity_x = -1;
+        }
+        if (firefly_y < 7) {
+            firefly_y = 7;
+            velocity_y = 1;
+        }
+        if (firefly_y > 120) {
+            firefly_y = 120;
+            velocity_y = -1;
+        }
+
+        /* Stagger emission phases so the ring twinkles rather than firing in
+         * lockstep. Each pulse travels to both neighbours among exactly 64
+         * resident VMs. */
+        if ((frame_number + vm * 37) % 120 == 0) {
+            unsigned left = (vm + 63) % 64;
+            unsigned right = (vm + 1) % 64;
+            unsigned energy = 32 + (vm & 15);
+            warp_send(left, 1, energy);
+            warp_send(right, 1, energy);
+            pulse_age = 1;
+        }
+
+        if (pulse_age != 0) {
+            unsigned inner = pulse_age - 1;
+            unsigned outer = pulse_age + 1;
+            pulse_inner_squared = inner * inner;
+            pulse_outer_squared = outer * outer;
+        }
+
+        if (excited_frames != 0) {
+            outer_colour = warp_argb(255, 2, 18, 28);
+            middle_colour = warp_argb(255, 8, 75, 125);
+            inner_colour = warp_argb(255, 35, 190, 255);
+            core_colour = warp_argb(255, 210, 250, 255);
+        } else {
+            outer_colour = warp_argb(255, 18, 8, 1);
+            middle_colour = warp_argb(255, 85, 35, 3);
+            inner_colour = warp_argb(255, 255, 145, 12);
+            core_colour = warp_argb(255, 255, 250, 190);
+        }
+
+        /* 512 iterations x 32 lanes = one complete 128x128 framebuffer. */
+        for (unsigned batch = 0; batch < 512; ++batch) {
+            unsigned index = batch * 32 + warp_lane_id();
+            unsigned pixel_x = index & 127;
+            unsigned pixel_y = index >> 7;
+            int offset_x = pixel_x - firefly_x;
+            int offset_y = pixel_y - firefly_y;
+            unsigned distance_squared = offset_x * offset_x + offset_y * offset_y;
+            unsigned colour = background_colour;
+
+            /* A sparse, VM-specific star field makes motion easier to see. */
+            if (((index * 17 + vm * 43) & 2047) == 0)
+                colour = star_colour;
+
+            if (pulse_age != 0) {
+                if ((distance_squared >= pulse_inner_squared) &
+                    (distance_squared <= pulse_outer_squared))
+                    colour = pulse_colour;
+            }
+
+            if (distance_squared < 81)
+                colour = outer_colour;
+            if (distance_squared < 36)
+                colour = middle_colour;
+            if (distance_squared < 12)
+                colour = inner_colour;
+            if (distance_squared < 3)
+                colour = core_colour;
+
+            warp_set_pixel(pixel_x, pixel_y, colour);
+        }
+
+        warp_flip();
+        ++frame_number;
+        if (pulse_age != 0) {
+            ++pulse_age;
+            if (pulse_age > 18)
+                pulse_age = 0;
+        }
+    }
+}

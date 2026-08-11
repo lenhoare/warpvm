@@ -751,6 +751,52 @@ impl<'a> Generator<'a> {
                     owned: false,
                 })
             }
+            Intrinsic::Send => {
+                let destination = self.expr(&args[0])?;
+                let message_type = self.expr(&args[1])?;
+                let payload = self.expr(&args[2])?;
+                self.instr(&format!(
+                    "SEND r{}, r{}, r{}",
+                    destination.reg, message_type.reg, payload.reg
+                ));
+                self.release(destination);
+                self.release(message_type);
+                self.release(payload);
+                Ok(Value {
+                    reg: 0,
+                    owned: false,
+                })
+            }
+            Intrinsic::TryRecv => {
+                let payload_address = self.expr(&args[0])?;
+                let metadata_address = self.expr(&args[1])?;
+                let payload = self.alloc_reg(span)?;
+                let metadata = self.alloc_reg(span)?;
+                let received = self.alloc_reg(span)?;
+                self.instr(&format!("MOV r{payload}, 0"));
+                self.instr(&format!("MOV r{metadata}, 0"));
+                self.instr(&format!("TRY_RECV p0, r{payload}, r{metadata}"));
+                self.instr(&format!("MOV r{received}, 0"));
+                self.guarded_instr(0, false, &format!("MOV r{received}, 1"));
+                self.guarded_instr(
+                    0,
+                    false,
+                    &format!("STORE r{}, r{payload}", payload_address.reg),
+                );
+                self.guarded_instr(
+                    0,
+                    false,
+                    &format!("STORE r{}, r{metadata}", metadata_address.reg),
+                );
+                self.release(payload_address);
+                self.release(metadata_address);
+                self.free_reg(payload);
+                self.free_reg(metadata);
+                Ok(Value {
+                    reg: received,
+                    owned: true,
+                })
+            }
         }
     }
 

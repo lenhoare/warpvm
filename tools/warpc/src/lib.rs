@@ -119,4 +119,25 @@ mod tests {
         assert!(error.message.contains("warp_flip()"));
         assert!(error.message.contains("divergent"));
     }
+
+    #[test]
+    fn lowers_vm_wide_mailbox_intrinsics() {
+        let result = compile(
+            "unsigned payload; unsigned metadata; int main(void) { warp_send(1, 7, 42); return warp_try_recv(&payload, &metadata); }",
+        )
+        .unwrap();
+        assert!(result.assembly.contains("SEND"));
+        assert!(result.assembly.contains("TRY_RECV"));
+        assert!(result.assembly.contains("@p0 STORE"));
+    }
+
+    #[test]
+    fn rejects_send_inside_divergent_control_flow() {
+        let error =
+            compile("int main(void) { if (warp_lane_id() == 0) warp_send(1, 1, 42); return 0; }")
+                .err()
+                .unwrap();
+        assert!(error.message.contains("warp_send()"));
+        assert!(error.message.contains("divergent"));
+    }
 }

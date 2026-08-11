@@ -15,4 +15,9 @@ unsigned warp_vm_id(void);
 unsigned warp_argb(unsigned a, unsigned r, unsigned g, unsigned b);
 void warp_set_pixel(int x, int y, unsigned colour);
 
+/* VM-wide mailbox operations. warp_try_recv returns nonzero on success and
+ * writes payload plus (message_type << 16 | source_vm) metadata. */
+void warp_send(unsigned destination, unsigned message_type, unsigned payload);
+int warp_try_recv(unsigned *payload, unsigned *metadata);
+
 #endif

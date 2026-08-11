@@ -50,7 +50,7 @@ Warp C currently supports signed `int`, `unsigned`, word-sized unsigned
 loops, `switch`, named functions, prototypes, up to four parameters,
 assignment, pointers, fixed arrays, structs, word-per-character strings,
 globals, `sizeof`, `return`, the `warp_lane_id()` / `warp_vm_id()` intrinsics,
-and the built-in `<warp.h>` framebuffer API, including nested divergent
+and the built-in `<warp.h>` framebuffer and mailbox API, including nested divergent
 `if` / `else`. It emits inspectable
 WarpVM assembly and assembles it in-process to canonical `.wvm`:
 
@@ -111,6 +111,16 @@ one atlas upload, avoiding per-VM copy and texture-update overhead:
 build/tools-rust/release/warpvm-as programs/graphics.wva -o build/graphics.wvm
 build/runtime/warpvm view build/graphics.wvm --vm 0
 build/runtime/warpvm view build/graphics.wvm --vms 64
+```
+
+The Warp C firefly celebration runs 64 independent moving lights. Each VM
+occasionally sends a real mailbox pulse to its two ring neighbours; receivers
+temporarily accelerate and change from warm gold to electric blue:
+
+```sh
+build/tools-rust/release/warpc programs/warpc/warpc_firefly.wc \
+  -o build/warpc_firefly.wvm
+build/runtime/warpvm view build/warpc_firefly.wvm --vms 64
 ```
 
 ## Program 01: WarpLife

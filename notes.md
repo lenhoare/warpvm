@@ -662,3 +662,29 @@ created `VmDesc` records without framebuffer storage even though persistent
 VMs and the compiled path already supplied it. Allocating the canonical
 framebuffer in that wrapper made the architectural memory map consistent. No
 opcode, WVM format, or interpreter address-decoding change was needed.
+
+## 22. Uniform batch loops unlock warp-parallel Warp C graphics
+
+**Discovered by:** `warpc_firefly`
+
+**Classification:** application/compiler interface; no ISA change
+
+Warp C does not need a special draw-array operation to use all 32 lanes. A
+uniform loop over 512 batches can form `batch * 32 + warp_lane_id()`, producing
+one distinct framebuffer index per lane while preserving uniform loop control.
+The firefly renderer therefore covers all 16,384 pixels with 512 `STORE`
+instructions per frame. Divergent distance comparisons select glow colours
+through the compiler's existing predicate masks.
+
+The existing `SEND` and `TRY_RECV` instructions also map directly to two
+VM-wide C intrinsics. `warp_send()` takes destination, type, and payload;
+`warp_try_recv()` non-blockingly returns a payload and packed type/source
+metadata through `unsigned *` outputs. As with `FLIP`, the compiler rejects
+these mailbox effects inside lane-divergent control rather than inventing
+per-lane messaging semantics.
+
+In a live RTX 3060 check, all 64 firefly VMs remained `RUNNING / OK`. After
+five seconds sampled frame counters were 224–225 (about 45 FPS) and sampled
+private receive counters were 3–4, proving that the acceleration and blue
+colour response came from actual neighbouring mailbox traffic. The 577-word
+program needed no new opcode or runtime-specialized drawing path.

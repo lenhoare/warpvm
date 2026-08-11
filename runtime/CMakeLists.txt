@@ -97,6 +97,11 @@ add_test(NAME warpc_graphics
           ${WVM_WARPC} $<TARGET_FILE:warpvm>
           ${CMAKE_SOURCE_DIR}/programs/warpc/hello_pixels.wc
           ${CMAKE_BINARY_DIR}/warpc_graphics)
+add_test(NAME warpc_firefly
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_firefly.sh
+          ${WVM_WARPC} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/programs/warpc/warpc_firefly.wc
+          ${CMAKE_BINARY_DIR}/warpc_firefly)
 
 add_test(NAME pipeline_hello
   COMMAND bash ${CMAKE_SOURCE_DIR}/tests/pipeline.sh
