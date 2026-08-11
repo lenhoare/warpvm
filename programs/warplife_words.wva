@@ -1,0 +1,282 @@
+; WarpLife — packed word-per-lane implementation.
+;
+; This is semantically identical to warplife.wva, but maps one packed 32-bit
+; world word (32 adjacent cells) to each lane.  A warp therefore evolves 1024
+; cells at a time and covers the 512-word world in 16 batches instead of 512.
+;
+; Horizontal neighbours are assembled with SHUFFLE plus shifts across each
+; four-lane (128-cell) row.  The eight one-bit neighbour planes are accumulated
+; into four bit-sliced count planes, so ordinary Boolean operations implement
+; 32 independent Life rules in every lane.
+;
+; RAM (word addresses):
+;   0x000..0x1ff  world A
+;   0x200..0x3ff  world B
+
+.const BLACK            0xFF000000
+.const WHITE            0xFFFFFFFF
+.const HIGH_BIT         0x80000000
+
+.const WORLD_WORDS      512
+.const WORLD_B_BASE     512
+
+start:
+    VMID r0
+    LANEID r1
+
+    ; Keep initial state exactly equal to the reference WarpLife program.
+    S_MOV_I s2, 0
+init_words:
+    S_BCAST r2, s2
+    ADD r2, r2, r1
+
+    MUL_I r3, r0, 521
+    ADD r3, r3, r2
+    ADD_I r3, r3, 1
+    MOV r4, r3
+    SHL_I r4, r4, 13
+    XOR r3, r3, r4
+    MOV r4, r3
+    SHR_I r4, r4, 17
+    XOR r3, r3, r4
+    MOV r4, r3
+    SHL_I r4, r4, 5
+    XOR r3, r3, r4
+
+    CMP_LT p0, r0, 2
+    @p0 MOV_I r3, 0
+    STORE r2, r3
+
+    ADD_I r5, r2, WORLD_B_BASE
+    MOV_I r6, 0
+    STORE r5, r6
+
+    S_ADD_I s2, s2, 32
+    S_CMP_LT_I p0, s2, WORLD_WORDS
+    JMP_IF_ANY p0, init_words
+
+    ; The same two diagnostic seeds as warplife.wva.
+    CMP_EQ p0, r0, 0
+    CMP_EQ p1, r0, 1
+    CMP_EQ p2, r1, 0
+
+    ANDMASK p3, p0, p2
+    MOV_I r2, 257
+    MOV_I r3, HIGH_BIT
+    @p3 STORE r2, r3
+    MOV_I r2, 258
+    MOV_I r3, 3
+    @p3 STORE r2, r3
+
+    ANDMASK p3, p1, p2
+    MOV_I r3, 1
+    MOV_I r2, 0
+    @p3 STORE r2, r3
+    MOV_I r2, 508
+    @p3 STORE r2, r3
+    MOV_I r3, HIGH_BIT
+    MOV_I r2, 3
+    @p3 STORE r2, r3
+    MOV_I r2, 511
+    @p3 STORE r2, r3
+
+    S_MOV_I s0, 0
+    S_MOV_I s1, WORLD_B_BASE
+
+generation:
+    ; Lanes are eight groups of four packed words.  Precompute the lane that
+    ; owns the previous and next word within each toroidal 128-cell row.  This
+    ; is refreshed each generation because large immediates in the renderer
+    ; use the assembler-reserved r15 scratch register.
+    LANEID r15
+    MOV r12, r15
+    SHR_I r12, r12, 2
+    SHL_I r12, r12, 2           ; first lane of this four-word row
+    ADD_I r13, r15, 3
+    AND_I r13, r13, 3
+    OR r13, r13, r12            ; previous word lane (wrap 0 -> 3)
+    ADD_I r14, r15, 1
+    AND_I r14, r14, 3
+    OR r14, r14, r12            ; next word lane (wrap 3 -> 0)
+
+    S_MOV_I s2, 0
+
+evolve_batch:
+    ; r0 is one of 32 consecutive packed-word indices in this batch.
+    S_BCAST r0, s2
+    ADD r0, r0, r15
+
+    ; Bit-sliced binary neighbour count: ones, twos, fours, eights.
+    MOV_I r1, 0
+    MOV_I r2, 0
+    MOV_I r3, 0
+    MOV_I r4, 0
+
+    ; Save the current word for its horizontal neighbours and the Life rule.
+    S_BCAST r12, s0
+    ADD r12, r12, r0
+    LOAD r5, r12
+
+    ; ---- row above -------------------------------------------------------
+    ADD_I r12, r0, -4
+    AND_I r12, r12, 511
+    S_BCAST r11, s0
+    ADD r12, r12, r11
+    LOAD r10, r12
+
+    ; Above-left: (word << 1) | (previous_word >> 31).
+    SHUFFLE r11, r10, r13
+    SHL_I r6, r10, 1
+    SHR_I r11, r11, 31
+    OR r6, r6, r11
+    AND r7, r1, r6
+    XOR r1, r1, r6
+    AND r8, r2, r7
+    XOR r2, r2, r7
+    AND r9, r3, r8
+    XOR r3, r3, r8
+    XOR r4, r4, r9
+
+    ; Above.
+    AND r7, r1, r10
+    XOR r1, r1, r10
+    AND r8, r2, r7
+    XOR r2, r2, r7
+    AND r9, r3, r8
+    XOR r3, r3, r8
+    XOR r4, r4, r9
+
+    ; Above-right: (word >> 1) | (next_word << 31).
+    SHUFFLE r11, r10, r14
+    SHR_I r6, r10, 1
+    SHL_I r11, r11, 31
+    OR r6, r6, r11
+    AND r7, r1, r6
+    XOR r1, r1, r6
+    AND r8, r2, r7
+    XOR r2, r2, r7
+    AND r9, r3, r8
+    XOR r3, r3, r8
+    XOR r4, r4, r9
+
+    ; ---- current row (exclude the centre cell) --------------------------
+    SHUFFLE r11, r5, r13
+    SHL_I r6, r5, 1
+    SHR_I r11, r11, 31
+    OR r6, r6, r11
+    AND r7, r1, r6
+    XOR r1, r1, r6
+    AND r8, r2, r7
+    XOR r2, r2, r7
+    AND r9, r3, r8
+    XOR r3, r3, r8
+    XOR r4, r4, r9
+
+    SHUFFLE r11, r5, r14
+    SHR_I r6, r5, 1
+    SHL_I r11, r11, 31
+    OR r6, r6, r11
+    AND r7, r1, r6
+    XOR r1, r1, r6
+    AND r8, r2, r7
+    XOR r2, r2, r7
+    AND r9, r3, r8
+    XOR r3, r3, r8
+    XOR r4, r4, r9
+
+    ; ---- row below -------------------------------------------------------
+    ADD_I r12, r0, 4
+    AND_I r12, r12, 511
+    S_BCAST r11, s0
+    ADD r12, r12, r11
+    LOAD r10, r12
+
+    ; Below-left.
+    SHUFFLE r11, r10, r13
+    SHL_I r6, r10, 1
+    SHR_I r11, r11, 31
+    OR r6, r6, r11
+    AND r7, r1, r6
+    XOR r1, r1, r6
+    AND r8, r2, r7
+    XOR r2, r2, r7
+    AND r9, r3, r8
+    XOR r3, r3, r8
+    XOR r4, r4, r9
+
+    ; Below.
+    AND r7, r1, r10
+    XOR r1, r1, r10
+    AND r8, r2, r7
+    XOR r2, r2, r7
+    AND r9, r3, r8
+    XOR r3, r3, r8
+    XOR r4, r4, r9
+
+    ; Below-right.
+    SHUFFLE r11, r10, r14
+    SHR_I r6, r10, 1
+    SHL_I r11, r11, 31
+    OR r6, r6, r11
+    AND r7, r1, r6
+    XOR r1, r1, r6
+    AND r8, r2, r7
+    XOR r2, r2, r7
+    AND r9, r3, r8
+    XOR r3, r3, r8
+    XOR r4, r4, r9
+
+    ; count==3 | (currently_alive & count==2).  r3|r4 excludes counts 4..8.
+    OR r6, r3, r4
+    NOT r6, r6
+    AND r8, r1, r2
+    AND r8, r8, r6             ; count == 3
+    NOT r9, r1
+    AND r9, r9, r2
+    AND r9, r9, r6             ; count == 2
+    AND r9, r9, r5
+    OR r8, r8, r9
+
+    S_BCAST r12, s1
+    ADD r12, r12, r0
+    STORE r12, r8               ; 32 consecutive packed destination words
+
+    S_ADD_I s2, s2, 32
+    S_CMP_LT_I p3, s2, WORLD_WORDS
+    JMP_IF_ANY p3, evolve_batch
+
+    ; Rendering remains identical in shape to the reference: one packed word
+    ; becomes 32 adjacent ARGB pixels per batch.
+    MOV_I r7, VIDEO_BASE
+    MOV_I r8, BLACK
+    MOV_I r9, WHITE
+    S_MOV_I s2, 0
+
+render_batch:
+    S_BCAST r0, s2
+    S_BCAST r1, s1
+    ADD r1, r1, r0
+    LOAD r2, r1
+    LANEID r3
+    SHR r4, r2, r3
+    AND_I r4, r4, 1
+
+    MOV r5, r8
+    CMP_NE p0, r4, 0
+    @p0 MOV r5, r9
+
+    SHL_I r6, r0, 5
+    ADD r6, r6, r3
+    ADD r6, r6, r7
+    STORE r6, r5
+
+    S_ADD_I s2, s2, 1
+    S_CMP_LT_I p0, s2, WORLD_WORDS
+    JMP_IF_ANY p0, render_batch
+
+    S_MOV s3, s0
+    S_MOV s0, s1
+    S_MOV s1, s3
+    FLIP
+    YIELD
+    JMP generation

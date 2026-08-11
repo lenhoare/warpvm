@@ -429,3 +429,55 @@ materialization only 0.007 ms (0.4%). Actual framebuffer writes contribute
 about 0.078 ms. Replacing all nine static evolution RAM loads gives only a
 0.319 ms upper bound, so most remaining cost is the real serialized
 neighbour/address/arithmetic chain across 512 packed batches.
+
+## 15. Existing lane operations are enough to expose word-level parallelism
+
+**Discovered by:** packed word-per-lane WarpLife implementation and matched
+five-engine benchmark
+
+**Classification:** retained program and compiled-backend completion; no ISA
+change
+
+`programs/warplife_words.wva` maps one packed 32-bit world word to each lane.
+A warp evolves 1,024 cells per batch and completes a 512-word world in 16
+batches rather than assigning one lane to one cell for 512 batches. Existing
+`LOAD`, `STORE`, `LANEID`, `SHUFFLE`, shifts, and Boolean operations express
+the complete algorithm. Horizontal word boundaries wrap within each
+four-lane 128-cell row, and a four-plane bit-sliced binary accumulator counts
+eight neighbours for 32 cells simultaneously.
+
+The program is exactly equivalent at generation 3 for VM IDs 0, 1, 2, and 37
+against the GPU interpreter, CPU interpreter, and independent native CPU
+implementation. All 512 packed words and all 16,384 framebuffer pixels match.
+Compiled checkpoint sharing, mixed execution, and transitions in both
+directions also pass. The minimal PTX backend now lowers the already-defined
+`SHUFFLE` and `SHUFFLE_XOR` instructions; this completes backend coverage used
+by the program and does not alter the ISA.
+
+The exact steady-state census falls from 76,814 to 10,552 bytecodes per
+generation (7.28x fewer). Evolution alone falls from 68,097 to 1,835
+bytecodes (37.1x fewer). Evolution RAM lane-loads fall from 147,456 to 1,536
+(96x fewer), while the final 512 packed-word stores are unchanged. The
+remaining 8,711 rendering bytecodes now account for 82.6% of the stream.
+
+In matched one-second runs, compiled throughput improves by 7.1–7.4x across
+1–256 VMs. At 64 VMs it reaches 3,476 generations/s/VM and 3,645 Mcell/s
+aggregate. At 256 VMs it reaches 2,020 generations/s/VM and 8,472 Mcell/s,
+only 1.19x behind the separately handwritten native CUDA reference in the
+same run. The GPU interpreter also improves, by 6.3x at one VM and 2.1x at 64
+VMs.
+
+Compiled phase bypasses measure a full generation at 0.232 ms. Evolution is
+only 0.024 ms (10.3%), rendering 0.173 ms (74.6%), and checkpoint/launch state
+0.021 ms (8.9%), with a 0.014 ms cross-run residual. Removing all three static
+evolution loads saves at most 0.008 ms. There is therefore no measured reason
+to add `VADD32`, `VLOAD32`, a Life instruction, or another evolution primitive:
+ordinary vector operations and per-lane addresses already supply those
+semantics. If more speed is wanted, first redesign framebuffer expansion with
+the current ISA and measure it. A general graphics conversion primitive should
+only follow evidence from several programs, not this one application.
+
+The packed compiled kernel uses 58 native registers per thread with no stack,
+spills, or local-memory instructions. Its 3,368 static `sm_86` SASS
+instructions contain the expected `SHFL.IDX` operations. This confirms that
+the speedup did not exchange bytecode work for hidden local-memory traffic.

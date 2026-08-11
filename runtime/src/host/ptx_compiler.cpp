@@ -219,6 +219,17 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err) {
       case kLaneId:
         body << predicated << "mov.u32 " << VReg(rd) << ", %t3;\n";
         break;
+      case kShuffle:
+        body << "    and.b32 %t8, " << VReg(rs2) << ", 31;\n"
+             << "    shfl.sync.idx.b32 %t7, " << VReg(rs1)
+             << ", %t8, 0x1f, 0xffffffff;\n"
+             << predicated << "mov.b32 " << VReg(rd) << ", %t7;\n";
+        break;
+      case kShuffleXor:
+        body << "    shfl.sync.bfly.b32 %t7, " << VReg(rs1) << ", "
+             << (lo & 31u) << ", 0x1f, 0xffffffff;\n"
+             << predicated << "mov.b32 " << VReg(rd) << ", %t7;\n";
+        break;
       case kVmid:
         body << predicated << "mov.u32 " << VReg(rd) << ", %vid;\n";
         break;

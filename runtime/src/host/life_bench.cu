@@ -762,6 +762,7 @@ const char* OpcodeName(uint32_t op) {
     case kAdd: return "ADD";
     case kMul: return "MUL";
     case kAnd: return "AND";
+    case kOr: return "OR";
     case kXor: return "XOR";
     case kShl: return "SHL";
     case kShr: return "SHR";
@@ -771,6 +772,7 @@ const char* OpcodeName(uint32_t op) {
     case kAndI: return "AND_I";
     case kShlI: return "SHL_I";
     case kShrI: return "SHR_I";
+    case kNot: return "NOT";
     case kLdw: return "LDW";
     case kSBcast: return "S_BCAST";
     case kCmpEq: return "CMP_EQ";
@@ -783,6 +785,8 @@ const char* OpcodeName(uint32_t op) {
     case kOrMask: return "ORMASK";
     case kBallot: return "BALLOT";
     case kLaneId: return "LANEID";
+    case kShuffle: return "SHUFFLE";
+    case kShuffleXor: return "SHUFFLE_XOR";
     case kReduceOr: return "REDUCE_OR";
     case kVmid: return "VMID";
     case kLoad: return "LOAD";
@@ -1192,6 +1196,81 @@ double MedianGpuCyclesPerFrame(const WvmFile& file, uint32_t num_vms,
 }
 
 }  // namespace
+
+int RunLifeCensus(const char* path) {
+  WvmFile file;
+  std::string err;
+  if (!LoadWvm(path, file, err)) {
+    std::fprintf(stderr, "error: %s: %s\n", path, err.c_str());
+    return 2;
+  }
+
+  uint32_t evolve_pc = 0;
+  uint32_t render_pc = 0;
+  uint32_t publish_pc = 0;
+  if (file.code.size() == 215) {
+    evolve_pc = 51;
+    render_pc = 185;
+    publish_pc = 209;
+  } else if (file.code.size() == 206) {
+    evolve_pc = 51;
+    render_pc = 176;
+    publish_pc = 200;
+  } else {
+    std::fprintf(stderr,
+                 "error: no WarpLife phase map for %zu-word program\n",
+                 file.code.size());
+    return 1;
+  }
+
+  LifeCensus census;
+  if (!CollectLifeCensus(file, census, err, evolve_pc, render_pc,
+                         publish_pc)) {
+    std::fprintf(stderr, "error: %s\n", err.c_str());
+    return 1;
+  }
+  const uint64_t total =
+      census.phases[0] + census.phases[1] + census.phases[2];
+  std::printf("WarpLife dynamic census: %s\n", path);
+  std::printf("  static words:        %8zu\n", file.code.size());
+  std::printf("  retired bytecodes:   %8llu\n",
+              static_cast<unsigned long long>(total));
+  std::printf("  evolution:           %8llu  %5.1f%%\n",
+              static_cast<unsigned long long>(census.phases[0]),
+              100.0 * census.phases[0] / total);
+  std::printf("  rendering:           %8llu  %5.1f%%\n",
+              static_cast<unsigned long long>(census.phases[1]),
+              100.0 * census.phases[1] / total);
+  std::printf("  publish/control:     %8llu  %5.1f%%\n",
+              static_cast<unsigned long long>(census.phases[2]),
+              100.0 * census.phases[2] / total);
+  std::printf("  host-control polls:  %8llu\n",
+              static_cast<unsigned long long>(census.control_polls));
+  std::printf("  RAM load lanes:      %8llu (unique addresses summed: %llu)\n",
+              static_cast<unsigned long long>(census.ram_load_lanes),
+              static_cast<unsigned long long>(
+                  census.ram_load_unique_addresses));
+  std::printf("  RAM store lanes:     %8llu\n",
+              static_cast<unsigned long long>(census.ram_store_lanes));
+  std::printf("  framebuffer writes:  %8llu\n",
+              static_cast<unsigned long long>(
+                  census.framebuffer_store_lanes));
+
+  std::vector<std::pair<uint64_t, uint32_t>> ranked;
+  for (uint32_t op = 0; op < census.opcodes.size(); ++op)
+    if (census.opcodes[op]) ranked.emplace_back(census.opcodes[op], op);
+  std::sort(ranked.begin(), ranked.end(),
+            [](const auto& a, const auto& b) { return a.first > b.first; });
+  std::printf("\n  dynamic opcode mix\n");
+  std::printf("    opcode             count   share\n");
+  for (const auto& [count, op] : ranked) {
+    std::printf("    %-14s %9llu  %5.1f%%\n", OpcodeName(op),
+                static_cast<unsigned long long>(count),
+                100.0 * count / total);
+  }
+  std::printf("life_census: PASS\n");
+  return 0;
+}
 
 int RunLifeBenchmark(const char* path, const std::vector<uint32_t>& vm_counts,
                      int duration_ms, uint32_t cpu_workers) {

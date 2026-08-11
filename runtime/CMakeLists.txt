@@ -114,3 +114,23 @@ add_test(NAME program01_native_cpu_equivalence
           ${WVM_AS} $<TARGET_FILE:warpvm>
           ${CMAKE_SOURCE_DIR}/programs/warplife.wva
           ${CMAKE_BINARY_DIR}/warplife_native_cpu)
+add_test(NAME program01_warplife_words
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warplife.sh
+          ${WVM_AS} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/programs/warplife_words.wva
+          ${CMAKE_BINARY_DIR}/warplife_words)
+add_test(NAME v012_words_cpu_gpu_equivalence
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warplife_equiv.sh
+          ${WVM_AS} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/programs/warplife_words.wva
+          ${CMAKE_BINARY_DIR}/warplife_words_equiv)
+add_test(NAME v013_compiled_warplife_words
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/compiled_life.sh
+          ${WVM_AS} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/programs/warplife_words.wva
+          ${CMAKE_BINARY_DIR}/compiled_warplife_words)
+add_test(NAME program01_words_native_cpu_equivalence
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warplife_native_cpu.sh
+          ${WVM_AS} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/programs/warplife_words.wva
+          ${CMAKE_BINARY_DIR}/warplife_words_native_cpu)

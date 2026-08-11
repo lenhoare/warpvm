@@ -37,6 +37,7 @@ int RunLifeBenchmark(const char* path,
                      const std::vector<uint32_t>& vm_counts,
                      int duration_ms,
                      uint32_t cpu_workers);             // host/life_bench.cu
+int RunLifeCensus(const char* path);                     // host/life_bench.cu
 int RunLifeProfile(const char* path, int duration_ms);  // host/life_bench.cu
 int RunCpuGpuLifeEquivalence(const char* path);         // host/life_bench.cu
 int RunNativeCpuLifeEquivalence(const char* path);      // host/life_bench.cu
@@ -910,16 +911,30 @@ int RunCompiledLifeProfile(const char* path) {
     std::fprintf(stderr, "error: %s: %s\n", path, err.c_str());
     return 2;
   }
-  constexpr uint32_t kEvolvePc = 51;
-  constexpr uint32_t kRenderPc = 185;
-  constexpr uint32_t kFramebufferStorePc = 205;
-  constexpr uint32_t kPublishPc = 209;
-  if (file.code.size() != 215 ||
-      ((file.code[kEvolvePc] >> wvm::kOpcodeShift) & wvm::kOpcodeMask) !=
-          wvm::kSMovI ||
-      ((file.code[kRenderPc] >> wvm::kOpcodeShift) & wvm::kOpcodeMask) !=
+  uint32_t evolve_pc = 0;
+  uint32_t render_pc = 0;
+  uint32_t framebuffer_store_pc = 0;
+  uint32_t publish_pc = 0;
+  uint32_t expected_evolve_op = 0;
+  if (file.code.size() == 215) {
+    evolve_pc = 51;
+    render_pc = 185;
+    framebuffer_store_pc = 205;
+    publish_pc = 209;
+    expected_evolve_op = wvm::kSMovI;
+  } else if (file.code.size() == 206) {
+    evolve_pc = 51;
+    render_pc = 176;
+    framebuffer_store_pc = 196;
+    publish_pc = 200;
+    expected_evolve_op = wvm::kLaneId;
+  }
+  if (evolve_pc == 0 ||
+      ((file.code[evolve_pc] >> wvm::kOpcodeShift) & wvm::kOpcodeMask) !=
+          expected_evolve_op ||
+      ((file.code[render_pc] >> wvm::kOpcodeShift) & wvm::kOpcodeMask) !=
           wvm::kLdw ||
-      ((file.code[kFramebufferStorePc] >> wvm::kOpcodeShift) &
+      ((file.code[framebuffer_store_pc] >> wvm::kOpcodeShift) &
        wvm::kOpcodeMask) != wvm::kStore) {
     std::fprintf(stderr,
                  "error: compiled profile PCs do not match WarpLife\n");
@@ -927,20 +942,20 @@ int RunCompiledLifeProfile(const char* path) {
   }
 
   wvm::WvmFile evolve_publish = file;
-  evolve_publish.code[kRenderPc] =
-      wvm::enc_i(wvm::kJmp, 0, 0, 0, kPublishPc);
+  evolve_publish.code[render_pc] =
+      wvm::enc_i(wvm::kJmp, 0, 0, 0, publish_pc);
   wvm::WvmFile render_publish = file;
-  render_publish.code[kEvolvePc] =
-      wvm::enc_i(wvm::kJmp, 0, 0, 0, kRenderPc);
+  render_publish.code[evolve_pc] =
+      wvm::enc_i(wvm::kJmp, 0, 0, 0, render_pc);
   wvm::WvmFile publish_only = file;
-  publish_only.code[kEvolvePc] =
-      wvm::enc_i(wvm::kJmp, 0, 0, 0, kPublishPc);
+  publish_only.code[evolve_pc] =
+      wvm::enc_i(wvm::kJmp, 0, 0, 0, publish_pc);
   wvm::WvmFile no_framebuffer_write = file;
-  no_framebuffer_write.code[kFramebufferStorePc] =
+  no_framebuffer_write.code[framebuffer_store_pc] =
       wvm::enc_r(wvm::kNop, 0, 0, 0, 0);
   wvm::WvmFile no_evolution_loads = file;
   uint32_t removed_loads = 0;
-  for (uint32_t pc = kEvolvePc; pc < kRenderPc; ++pc) {
+  for (uint32_t pc = evolve_pc; pc < render_pc; ++pc) {
     const uint32_t instruction = no_evolution_loads.code[pc];
     const uint32_t op =
         (instruction >> wvm::kOpcodeShift) & wvm::kOpcodeMask;
@@ -2533,6 +2548,8 @@ void Usage(const char* argv0) {
   std::printf("                  compare GPU/CPU WarpVM and native GPU/CPU\n");
   std::printf("  life_profile <file.wvm> [--ms N]\n");
   std::printf("                  one-VM opcode, phase, and matched-cost profile\n");
+  std::printf("  life_census <file.wvm>\n");
+  std::printf("                  exact steady-state WarpLife bytecode census\n");
   std::printf("  cpu_tests             v0.1.2 CPU interpreter self-tests\n");
   std::printf("  life_equiv <file.wvm> v0.1.2 CPU/GPU WarpLife equivalence\n");
   std::printf("  life_native_cpu_equiv <file.wvm>\n");
@@ -2560,6 +2577,13 @@ int main(int argc, char** argv) {
   // device. Cross-engine commands continue through normal GPU setup below.
   if (std::strcmp(cmd, "cpu_tests") == 0)
     return wvm::RunCpuInterpreterTests();
+  if (std::strcmp(cmd, "life_census") == 0) {
+    if (argc < 3) {
+      std::fprintf(stderr, "error: life_census requires a .wvm file\n");
+      return 2;
+    }
+    return wvm::RunLifeCensus(argv[2]);
+  }
   if (std::strcmp(cmd, "emit_ptx") == 0) {
     if (argc != 5 || std::strcmp(argv[3], "-o") != 0) {
       std::fprintf(stderr, "error: emit_ptx requires <file.wvm> -o <file.ptx>\n");
