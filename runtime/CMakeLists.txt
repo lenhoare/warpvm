@@ -82,6 +82,16 @@ add_test(NAME warpc_strings
           ${WVM_WARPC} $<TARGET_FILE:warpvm>
           ${CMAKE_SOURCE_DIR}/programs/warpc/strings.wc
           ${CMAKE_BINARY_DIR}/warpc_strings warpc_strings)
+add_test(NAME warpc_uniformity
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_acceptance.sh
+          ${WVM_WARPC} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/programs/warpc/uniformity.wc
+          ${CMAKE_BINARY_DIR}/warpc_uniformity warpc_uniformity)
+add_test(NAME warpc_divergent_if
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_acceptance.sh
+          ${WVM_WARPC} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/programs/warpc/divergent_if.wc
+          ${CMAKE_BINARY_DIR}/warpc_divergent_if warpc_divergent_if)
 
 add_test(NAME pipeline_hello
   COMMAND bash ${CMAKE_SOURCE_DIR}/tests/pipeline.sh

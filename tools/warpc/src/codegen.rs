@@ -1,8 +1,8 @@
 use crate::ast::{AssignOp, BinaryOp, UnaryOp};
 use crate::sema::{
-    type_size, FunctionId, GlobalInfo, LValue, LocalId, LocalInfo, StructInfo, SwitchLabel, Type,
-    TypedBlock, TypedExpr, TypedExprKind, TypedForInit, TypedFunction, TypedInitializer,
-    TypedProgram, TypedStmt,
+    type_size, FunctionId, GlobalInfo, Intrinsic, LValue, LocalId, LocalInfo, StructInfo,
+    SwitchLabel, Type, TypedBlock, TypedExpr, TypedExprKind, TypedForInit, TypedFunction,
+    TypedInitializer, TypedProgram, TypedStmt, Uniformity,
 };
 use crate::span::{Diagnostic, Span};
 
@@ -38,6 +38,8 @@ struct Generator<'a> {
     locals: &'a [LocalInfo],
     globals: &'a [GlobalInfo],
     structs: &'a [StructInfo],
+    current_guard: Option<u8>,
+    mask_stack: Vec<u8>,
 }
 
 struct ControlTarget {
@@ -66,6 +68,8 @@ impl<'a> Generator<'a> {
             locals: &program.locals,
             globals: &program.globals,
             structs: &program.structs,
+            current_guard: None,
+            mask_stack: Vec::new(),
         }
     }
 
@@ -83,7 +87,7 @@ impl<'a> Generator<'a> {
                 }
                 self.instr(&format!("MOV r0, {address}"));
                 self.instr(&format!("MOV r1, {word}"));
-                self.instr("@p0 STORE r0, r1");
+                self.guarded_instr(0, false, "STORE r0, r1");
             }
         }
         self.instr(&format!("JMP {}", self.function_labels[program.main]));
@@ -98,6 +102,8 @@ impl<'a> Generator<'a> {
         self.local_regs.fill(None);
         self.controls.clear();
         self.switch_labels.clear();
+        self.current_guard = None;
+        self.mask_stack.clear();
         self.current_function = Some(function.id);
         self.current_return_type = function.return_type;
         self.current_frame_words = function.frame_words;
@@ -254,6 +260,9 @@ impl<'a> Generator<'a> {
         then_branch: &TypedStmt,
         else_branch: Option<&TypedStmt>,
     ) -> Result<(), Diagnostic> {
+        if condition.uniformity == Uniformity::Divergent || self.current_guard.is_some() {
+            return self.masked_if_statement(condition, then_branch, else_branch);
+        }
         let otherwise = self.label("if_else");
         let end = self.label("if_end");
         self.jump_if_zero(condition, &otherwise)?;
@@ -266,6 +275,51 @@ impl<'a> Generator<'a> {
         } else {
             self.line(&format!("{otherwise}:"));
         }
+        Ok(())
+    }
+
+    fn masked_if_statement(
+        &mut self,
+        condition: &TypedExpr,
+        then_branch: &TypedStmt,
+        else_branch: Option<&TypedStmt>,
+    ) -> Result<(), Diagnostic> {
+        let mask = match self.mask_stack.len() {
+            0 => 3,
+            1 => 2,
+            _ => {
+                return Err(Diagnostic::new(
+                    condition.span,
+                    "divergent if nesting exhausted predicate masks",
+                ))
+            }
+        };
+        let parent = self.current_guard;
+        let value = self.expr(condition)?;
+        if let Some(parent) = parent {
+            self.raw_instr(&format!("BALLOT p0, r{}", value.reg));
+            self.raw_instr(&format!("ANDMASK p{mask}, p{parent}, p0"));
+        } else {
+            self.raw_instr(&format!("BALLOT p{mask}, r{}", value.reg));
+        }
+        self.release(value);
+
+        self.mask_stack.push(mask);
+        self.current_guard = Some(mask);
+        self.statement(then_branch)?;
+
+        if let Some(else_branch) = else_branch {
+            if let Some(parent) = parent {
+                self.raw_instr(&format!("NOTMASK p0, p{mask}"));
+                self.raw_instr(&format!("ANDMASK p{mask}, p{parent}, p0"));
+            } else {
+                self.raw_instr(&format!("NOTMASK p{mask}, p{mask}"));
+            }
+            self.statement(else_branch)?;
+        }
+
+        self.mask_stack.pop();
+        self.current_guard = parent;
         Ok(())
     }
 
@@ -503,6 +557,15 @@ impl<'a> Generator<'a> {
             TypedExprKind::StringAddress(address) => {
                 let reg = self.alloc_reg(expr.span)?;
                 self.instr(&format!("MOV r{reg}, {address}"));
+                Ok(Value { reg, owned: true })
+            }
+            TypedExprKind::Intrinsic(Intrinsic::LaneId) => Ok(Value {
+                reg: LANE_REG,
+                owned: false,
+            }),
+            TypedExprKind::Intrinsic(Intrinsic::VmId) => {
+                let reg = self.alloc_reg(expr.span)?;
+                self.instr(&format!("VMID r{reg}"));
                 Ok(Value { reg, owned: true })
             }
             TypedExprKind::LValue(lvalue) => {
@@ -788,7 +851,7 @@ impl<'a> Generator<'a> {
                 let right = self.expr(right_expr)?;
                 self.instr(&format!("CMP_NE p0, r{}, 0", right.reg));
                 self.release(right);
-                self.instr(&format!("@p0 MOV r{out}, 1"));
+                self.guarded_instr(0, false, &format!("MOV r{out}, 1"));
             }
             BinaryOp::LogicalOr => {
                 self.instr(&format!("MOV r{out}, 1"));
@@ -796,7 +859,7 @@ impl<'a> Generator<'a> {
                 let right = self.expr(right_expr)?;
                 self.instr(&format!("CMP_EQ p0, r{}, 0", right.reg));
                 self.release(right);
-                self.instr(&format!("@p0 MOV r{out}, 0"));
+                self.guarded_instr(0, false, &format!("MOV r{out}, 0"));
             }
             _ => unreachable!(),
         }
@@ -912,7 +975,7 @@ impl<'a> Generator<'a> {
             self.instr(&format!("MOV r{temp}, r{left}"));
         }
         self.instr(&format!("CMP_GE p0, r{temp}, {SIGN_BIT}"));
-        self.instr(&format!("@p0 NEG r{out}, r{out}"));
+        self.guarded_instr(0, false, &format!("NEG r{out}, r{out}"));
         self.free_reg(temp);
         Ok(out)
     }
@@ -932,7 +995,7 @@ impl<'a> Generator<'a> {
         self.instr(&format!("NEG r{neg_shift}, r{right}"));
         self.instr(&format!("SHL r{fill}, r{fill}, r{neg_shift}"));
         self.instr(&format!("CMP_EQ p0, r{right}, 0"));
-        self.instr(&format!("@!p0 OR r{out}, r{out}, r{fill}"));
+        self.guarded_instr(0, true, &format!("OR r{out}, r{out}, r{fill}"));
         self.free_reg(neg_shift);
         self.free_reg(fill);
         Ok(out)
@@ -980,7 +1043,7 @@ impl<'a> Generator<'a> {
         }
         let out = self.alloc_reg(span)?;
         self.instr(&format!("MOV r{out}, 0"));
-        self.instr(&format!("@p0 MOV r{out}, 1"));
+        self.guarded_instr(0, false, &format!("MOV r{out}, 1"));
         Ok(out)
     }
 
@@ -1155,6 +1218,29 @@ impl<'a> Generator<'a> {
     }
 
     fn instr(&mut self, text: &str) {
+        if let Some(predicate) = self.current_guard {
+            self.raw_instr(&format!("@p{predicate} {text}"));
+        } else {
+            self.raw_instr(text);
+        }
+    }
+
+    fn guarded_instr(&mut self, predicate: u8, inverted: bool, text: &str) {
+        if let Some(execution) = self.current_guard {
+            if inverted {
+                self.raw_instr(&format!("NOTMASK p1, p{predicate}"));
+                self.raw_instr(&format!("ANDMASK p1, p{execution}, p1"));
+            } else {
+                self.raw_instr(&format!("ANDMASK p1, p{execution}, p{predicate}"));
+            }
+            self.raw_instr(&format!("@p1 {text}"));
+        } else {
+            let bang = if inverted { "!" } else { "" };
+            self.raw_instr(&format!("@{bang}p{predicate} {text}"));
+        }
+    }
+
+    fn raw_instr(&mut self, text: &str) {
         self.assembly.push_str("    ");
         self.line(text);
     }
@@ -1250,5 +1336,27 @@ mod tests {
         assert!(text.contains("LOAD"));
         assert!(text.contains("STORE"));
         assert!(!text.contains("SHL r14, r13, 2"));
+    }
+
+    #[test]
+    fn divergent_if_uses_nested_execution_masks() {
+        let text = assembly(
+            "int main(void) { int lane=warp_lane_id(); int x=0; if (lane<16) { if (lane<8) x=42; else x=42; } else { x=42; } return x; }",
+        );
+        assert!(text.contains("BALLOT p3"));
+        assert!(text.contains("ANDMASK p2, p3, p0"));
+        assert!(text.contains("@p3"));
+        assert!(text.contains("@p2"));
+        assert!(text.contains("NOTMASK p3, p3"));
+    }
+
+    #[test]
+    fn vm_id_is_direct_and_uniform_if_stays_branched() {
+        let text = assembly(
+            "int main(void) { unsigned vm=warp_vm_id(); int x=0; if (vm==0) x=42; else x=42; return x; }",
+        );
+        assert!(text.contains("VMID"));
+        assert!(text.contains("JMP_IF_ANY"));
+        assert!(!text.contains("BALLOT p3"));
     }
 }

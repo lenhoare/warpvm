@@ -1,0 +1,22 @@
+int main(void)
+{
+    int lane = warp_lane_id();
+    int value[1];
+    int result = 0;
+
+    if (lane < 16) {
+        value[0] = 40;
+        if (lane < 8)
+            result = value[0] + 2;
+        else
+            result = 42;
+    } else {
+        value[0] = 41;
+        if (lane < 24)
+            result = value[0] + 1;
+        else
+            result = 42;
+    }
+
+    return result;
+}

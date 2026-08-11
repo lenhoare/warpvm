@@ -282,6 +282,12 @@ pub struct TypedExpr {
     pub span: Span,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Intrinsic {
+    LaneId,
+    VmId,
+}
+
 #[derive(Clone, Debug)]
 pub enum LValue {
     Local(LocalId),
@@ -302,6 +308,7 @@ pub enum LValue {
 pub enum TypedExprKind {
     Literal(u32),
     StringAddress(usize),
+    Intrinsic(Intrinsic),
     LValue(LValue),
     AddressOf(LValue),
     Unary(ast::UnaryOp, Box<TypedExpr>),
@@ -352,6 +359,7 @@ struct FunctionSymbol {
     params: Vec<Type>,
     defined: bool,
     span: Span,
+    divergent_result: bool,
 }
 struct SwitchContext {
     labels: Vec<SwitchLabel>,
@@ -375,6 +383,7 @@ struct Analyzer {
     loop_depth: usize,
     switch_stack: Vec<SwitchContext>,
     next_switch_label: usize,
+    divergent_depth: usize,
 }
 
 impl Analyzer {
@@ -395,6 +404,7 @@ impl Analyzer {
             loop_depth: 0,
             switch_stack: Vec::new(),
             next_switch_label: 0,
+            divergent_depth: 0,
         }
     }
 
@@ -407,6 +417,7 @@ impl Analyzer {
         for function in &program.functions {
             self.register_function(function)?;
         }
+        self.summarize_function_divergence(&program.functions);
         self.call_edges.resize(self.functions.len(), Vec::new());
         let Some(&main) = self.function_ids.get("main") else {
             return Err(Diagnostic::new(
@@ -430,6 +441,7 @@ impl Analyzer {
             let Some(body) = function.body else { continue };
             let id = self.function_ids[&function.name];
             self.current_function = Some(id);
+            self.divergent_depth = 0;
             self.return_type = self.functions[id].return_type;
             let local_start = self.locals.len();
             let mut bindings = HashMap::new();
@@ -643,6 +655,12 @@ impl Analyzer {
     }
 
     fn register_function(&mut self, function: &ast::Function) -> Result<(), Diagnostic> {
+        if matches!(function.name.as_str(), "warp_lane_id" | "warp_vm_id") {
+            return Err(Diagnostic::new(
+                function.span,
+                format!("'{}' is a reserved Warp C intrinsic", function.name),
+            ));
+        }
         if self.global_ids.contains_key(&function.name) {
             return Err(Diagnostic::new(
                 function.span,
@@ -707,8 +725,36 @@ impl Analyzer {
             params,
             defined: function.body.is_some(),
             span: function.span,
+            divergent_result: false,
         });
         Ok(())
+    }
+
+    fn summarize_function_divergence(&mut self, functions: &[ast::Function]) {
+        let mut direct = vec![false; self.functions.len()];
+        let mut edges = vec![Vec::new(); self.functions.len()];
+        for function in functions {
+            let Some(body) = &function.body else { continue };
+            let id = self.function_ids[&function.name];
+            scan_block_divergence(body, &self.function_ids, &mut direct[id], &mut edges[id]);
+        }
+        let mut divergent = direct;
+        loop {
+            let mut changed = false;
+            for id in 0..divergent.len() {
+                let value = divergent[id] || edges[id].iter().any(|callee| divergent[*callee]);
+                if value != divergent[id] {
+                    divergent[id] = value;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        for (symbol, divergent) in self.functions.iter_mut().zip(divergent) {
+            symbol.divergent_result = divergent;
+        }
     }
 
     fn lower_decl_type(
@@ -795,6 +841,12 @@ impl Analyzer {
                 Ok(TypedStmt::Expr(value.map(|e| self.expr(e)).transpose()?))
             }
             ast::Stmt::Return(value, span) => {
+                if self.divergent_depth != 0 {
+                    return Err(Diagnostic::new(
+                        span,
+                        "return inside divergent control flow is not supported in Slice E",
+                    ));
+                }
                 let value = value.map(|e| self.expr(e)).transpose()?;
                 if self.return_type.is_void() {
                     if value.is_some() {
@@ -819,14 +871,28 @@ impl Analyzer {
                 span,
             } => {
                 let condition = self.condition(condition, "if condition")?;
-                let then_branch = Box::new(self.statement(*then_branch)?);
+                let masked =
+                    condition.uniformity == Uniformity::Divergent || self.divergent_depth != 0;
+                if masked && self.divergent_depth >= 2 {
+                    return Err(Diagnostic::new(
+                        span,
+                        "divergent if nesting exceeds the two predicate masks available in Slice E",
+                    ));
+                }
+                if masked {
+                    self.divergent_depth += 1;
+                }
+                let then_branch = self.statement(*then_branch).map(Box::new);
                 let else_branch = else_branch
                     .map(|b| self.statement(*b).map(Box::new))
-                    .transpose()?;
+                    .transpose();
+                if masked {
+                    self.divergent_depth -= 1;
+                }
                 Ok(TypedStmt::If {
                     condition,
-                    then_branch,
-                    else_branch,
+                    then_branch: then_branch?,
+                    else_branch: else_branch?,
                     span,
                 })
             }
@@ -835,7 +901,8 @@ impl Analyzer {
                 body,
                 span,
             } => {
-                let condition = self.condition(condition, "while condition")?;
+                self.reject_divergent_control(span, "while loop")?;
+                let condition = self.uniform_condition(condition, "while condition")?;
                 self.loop_depth += 1;
                 let body = self.statement(*body);
                 self.loop_depth -= 1;
@@ -850,12 +917,13 @@ impl Analyzer {
                 condition,
                 span,
             } => {
+                self.reject_divergent_control(span, "do/while loop")?;
                 self.loop_depth += 1;
                 let body = self.statement(*body);
                 self.loop_depth -= 1;
                 Ok(TypedStmt::DoWhile {
                     body: Box::new(body?),
-                    condition: self.condition(condition, "do/while condition")?,
+                    condition: self.uniform_condition(condition, "do/while condition")?,
                     span,
                 })
             }
@@ -867,6 +935,7 @@ impl Analyzer {
                 span,
             } => self.for_statement(init, condition, step, *body, span),
             ast::Stmt::Break(span) => {
+                self.reject_divergent_control(span, "break")?;
                 if self.loop_depth == 0 && self.switch_stack.is_empty() {
                     return Err(Diagnostic::new(
                         span,
@@ -876,6 +945,7 @@ impl Analyzer {
                 Ok(TypedStmt::Break(span))
             }
             ast::Stmt::Continue(span) => {
+                self.reject_divergent_control(span, "continue")?;
                 if self.loop_depth == 0 {
                     return Err(Diagnostic::new(span, "continue is not inside a loop"));
                 }
@@ -886,7 +956,8 @@ impl Analyzer {
                 body,
                 span,
             } => {
-                let expression = self.condition(expression, "switch expression")?;
+                self.reject_divergent_control(span, "switch")?;
+                let expression = self.uniform_condition(expression, "switch expression")?;
                 self.switch_stack.push(SwitchContext {
                     labels: Vec::new(),
                     values: HashMap::new(),
@@ -993,10 +1064,13 @@ impl Analyzer {
             }
             None => None,
         };
-        let uniformity = match &typed_init {
+        let mut uniformity = match &typed_init {
             Some(TypedInitializer::Expr(v)) => v.uniformity,
             _ => Uniformity::Uniform,
         };
+        if self.divergent_depth != 0 {
+            uniformity = Uniformity::Divergent;
+        }
         let id = self.locals.len();
         self.locals.push(LocalInfo {
             name: name.clone(),
@@ -1022,13 +1096,29 @@ impl Analyzer {
                 format!("{role} must have scalar type"),
             ));
         }
+        Ok(expr)
+    }
+
+    fn uniform_condition(&mut self, expr: ast::Expr, role: &str) -> Result<TypedExpr, Diagnostic> {
+        let expr = self.condition(expr, role)?;
         if expr.uniformity != Uniformity::Uniform {
             return Err(Diagnostic::new(
                 expr.span,
-                format!("{role} must be uniform in the structured-control slice"),
+                format!("{role} must be uniform in Slice E"),
             ));
         }
         Ok(expr)
+    }
+
+    fn reject_divergent_control(&self, span: Span, construct: &str) -> Result<(), Diagnostic> {
+        if self.divergent_depth == 0 {
+            Ok(())
+        } else {
+            Err(Diagnostic::new(
+                span,
+                format!("{construct} inside divergent control flow is not supported in Slice E"),
+            ))
+        }
     }
 
     fn for_statement(
@@ -1039,6 +1129,7 @@ impl Analyzer {
         body: ast::Stmt,
         span: Span,
     ) -> Result<TypedStmt, Diagnostic> {
+        self.reject_divergent_control(span, "for loop")?;
         self.scopes.push(HashMap::new());
         let mut local_ids = Vec::new();
         let init = match init {
@@ -1054,7 +1145,7 @@ impl Analyzer {
             None => None,
         };
         let condition = condition
-            .map(|e| self.condition(e, "for condition"))
+            .map(|e| self.uniform_condition(e, "for condition"))
             .transpose()?;
         let step = step.map(|e| self.expr(e)).transpose()?;
         self.loop_depth += 1;
@@ -1163,6 +1254,31 @@ impl Analyzer {
         args: Vec<ast::Expr>,
         span: Span,
     ) -> Result<TypedExpr, Diagnostic> {
+        let intrinsic = match callee.as_str() {
+            "warp_lane_id" => Some((Intrinsic::LaneId, Uniformity::Divergent)),
+            "warp_vm_id" => Some((Intrinsic::VmId, Uniformity::Uniform)),
+            _ => None,
+        };
+        if let Some((intrinsic, uniformity)) = intrinsic {
+            if !args.is_empty() {
+                return Err(Diagnostic::new(
+                    span,
+                    format!("intrinsic '{callee}' takes no arguments"),
+                ));
+            }
+            return Ok(TypedExpr {
+                kind: TypedExprKind::Intrinsic(intrinsic),
+                ty: Type::U32,
+                uniformity,
+                span,
+            });
+        }
+        if self.divergent_depth != 0 {
+            return Err(Diagnostic::new(
+                span,
+                "function calls inside divergent control flow are not supported in Slice E",
+            ));
+        }
         let Some(&function) = self.function_ids.get(&callee) else {
             return Err(Diagnostic::new(
                 span,
@@ -1184,7 +1300,11 @@ impl Analyzer {
             ));
         }
         let mut typed_args = Vec::new();
-        let mut uniformity = Uniformity::Uniform;
+        let mut uniformity = if symbol.divergent_result {
+            Uniformity::Divergent
+        } else {
+            Uniformity::Uniform
+        };
         for (arg, param) in args.into_iter().zip(&symbol.params) {
             let arg = self.expr(arg)?;
             self.require_assignable(*param, &arg, "function argument")?;
@@ -1260,6 +1380,14 @@ impl Analyzer {
                 ));
             }
             let target = take_lvalue(operand.kind, operand.span, "increment target")?;
+            let uniformity = if self.divergent_depth != 0 {
+                Uniformity::Divergent
+            } else {
+                operand.uniformity
+            };
+            if let LValue::Local(local) = &target {
+                self.locals[*local].uniformity = uniformity;
+            }
             let scale = if ty.is_pointer() {
                 type_size(ty.pointee().unwrap(), &self.structs)
             } else {
@@ -1273,7 +1401,7 @@ impl Analyzer {
                     scale,
                 },
                 ty,
-                uniformity: operand.uniformity,
+                uniformity,
                 span,
             });
         }
@@ -1388,6 +1516,14 @@ impl Analyzer {
         let left_ty = value_type(left.ty);
         let right_ty = value_type(right.ty);
         let uniformity = left.uniformity.join(right.uniformity);
+        if matches!(op, ast::BinaryOp::LogicalAnd | ast::BinaryOp::LogicalOr)
+            && (uniformity == Uniformity::Divergent || self.divergent_depth != 0)
+        {
+            return Err(Diagnostic::new(
+                span,
+                "divergent short-circuit expressions are not supported in Slice E",
+            ));
+        }
         if matches!(op, ast::BinaryOp::Add | ast::BinaryOp::Sub) {
             if left_ty.is_pointer() && right_ty.is_integer() {
                 let scale = type_size(left_ty.pointee().unwrap(), &self.structs);
@@ -1489,6 +1625,7 @@ impl Analyzer {
         span: Span,
     ) -> Result<TypedExpr, Diagnostic> {
         let left = self.expr(left)?;
+        let left_uniformity = left.uniformity;
         let left_ty = value_type(left.ty);
         if !left_ty.is_scalar() {
             return Err(Diagnostic::new(
@@ -1522,6 +1659,16 @@ impl Analyzer {
         } else {
             1
         };
+        let uniformity = if self.divergent_depth != 0 {
+            Uniformity::Divergent
+        } else if op == ast::AssignOp::Assign {
+            right.uniformity
+        } else {
+            left_uniformity.join(right.uniformity)
+        };
+        if let LValue::Local(local) = &target {
+            self.locals[*local].uniformity = uniformity;
+        }
         Ok(TypedExpr {
             kind: TypedExprKind::Assign {
                 target,
@@ -1531,7 +1678,7 @@ impl Analyzer {
                 scale,
             },
             ty: left_ty,
-            uniformity: left.uniformity.join(right.uniformity),
+            uniformity,
             span,
         })
     }
@@ -1598,6 +1745,143 @@ impl Analyzer {
             }
         }
         Ok(())
+    }
+}
+
+fn scan_block_divergence(
+    block: &ast::Block,
+    function_ids: &HashMap<String, FunctionId>,
+    direct: &mut bool,
+    edges: &mut Vec<FunctionId>,
+) {
+    for statement in &block.statements {
+        scan_statement_divergence(statement, function_ids, direct, edges);
+    }
+}
+
+fn scan_statement_divergence(
+    statement: &ast::Stmt,
+    function_ids: &HashMap<String, FunctionId>,
+    direct: &mut bool,
+    edges: &mut Vec<FunctionId>,
+) {
+    match statement {
+        ast::Stmt::Decl { init, .. } => {
+            if let Some(expr) = init {
+                scan_expr_divergence(expr, function_ids, direct, edges);
+            }
+        }
+        ast::Stmt::Expr(expr, _) | ast::Stmt::Return(expr, _) => {
+            if let Some(expr) = expr {
+                scan_expr_divergence(expr, function_ids, direct, edges);
+            }
+        }
+        ast::Stmt::Block(block) => scan_block_divergence(block, function_ids, direct, edges),
+        ast::Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            scan_expr_divergence(condition, function_ids, direct, edges);
+            scan_statement_divergence(then_branch, function_ids, direct, edges);
+            if let Some(branch) = else_branch {
+                scan_statement_divergence(branch, function_ids, direct, edges);
+            }
+        }
+        ast::Stmt::While {
+            condition, body, ..
+        } => {
+            scan_expr_divergence(condition, function_ids, direct, edges);
+            scan_statement_divergence(body, function_ids, direct, edges);
+        }
+        ast::Stmt::DoWhile {
+            body, condition, ..
+        } => {
+            scan_statement_divergence(body, function_ids, direct, edges);
+            scan_expr_divergence(condition, function_ids, direct, edges);
+        }
+        ast::Stmt::For {
+            init,
+            condition,
+            step,
+            body,
+            ..
+        } => {
+            if let Some(init) = init {
+                match init {
+                    ast::ForInit::Decl { init, .. } => {
+                        if let Some(expr) = init {
+                            scan_expr_divergence(expr, function_ids, direct, edges);
+                        }
+                    }
+                    ast::ForInit::Expr(expr) => {
+                        scan_expr_divergence(expr, function_ids, direct, edges);
+                    }
+                }
+            }
+            if let Some(expr) = condition {
+                scan_expr_divergence(expr, function_ids, direct, edges);
+            }
+            if let Some(expr) = step {
+                scan_expr_divergence(expr, function_ids, direct, edges);
+            }
+            scan_statement_divergence(body, function_ids, direct, edges);
+        }
+        ast::Stmt::Switch {
+            expression, body, ..
+        } => {
+            scan_expr_divergence(expression, function_ids, direct, edges);
+            scan_statement_divergence(body, function_ids, direct, edges);
+        }
+        ast::Stmt::Case { value, body, .. } => {
+            scan_expr_divergence(value, function_ids, direct, edges);
+            scan_statement_divergence(body, function_ids, direct, edges);
+        }
+        ast::Stmt::Default { body, .. } => {
+            scan_statement_divergence(body, function_ids, direct, edges);
+        }
+        ast::Stmt::Break(_) | ast::Stmt::Continue(_) => {}
+    }
+}
+
+fn scan_expr_divergence(
+    expr: &ast::Expr,
+    function_ids: &HashMap<String, FunctionId>,
+    direct: &mut bool,
+    edges: &mut Vec<FunctionId>,
+) {
+    match &expr.kind {
+        ast::ExprKind::Call { callee, args } => {
+            if callee == "warp_lane_id" {
+                *direct = true;
+            } else if let Some(id) = function_ids.get(callee) {
+                if !edges.contains(id) {
+                    edges.push(*id);
+                }
+            }
+            for arg in args {
+                scan_expr_divergence(arg, function_ids, direct, edges);
+            }
+        }
+        ast::ExprKind::Unary(_, operand) => {
+            scan_expr_divergence(operand, function_ids, direct, edges);
+        }
+        ast::ExprKind::SizeofExpr(_) => {}
+        ast::ExprKind::Binary(_, left, right)
+        | ast::ExprKind::Assign(_, left, right)
+        | ast::ExprKind::Index(left, right) => {
+            scan_expr_divergence(left, function_ids, direct, edges);
+            scan_expr_divergence(right, function_ids, direct, edges);
+        }
+        ast::ExprKind::Member { base, .. } => {
+            scan_expr_divergence(base, function_ids, direct, edges);
+        }
+        ast::ExprKind::Number(_)
+        | ast::ExprKind::Char(_)
+        | ast::ExprKind::String(_)
+        | ast::ExprKind::Name(_)
+        | ast::ExprKind::SizeofType(_) => {}
     }
 }
 
@@ -1949,5 +2233,45 @@ mod tests {
         let err = source("int f(void); int main(void){return f();} int f(void){return f();}")
             .unwrap_err();
         assert!(err.message.contains("recursive"));
+    }
+
+    #[test]
+    fn warp_intrinsics_propagate_uniformity() {
+        let p = source(
+            "int main(void) { unsigned vm=warp_vm_id(); unsigned lane=warp_lane_id(); unsigned mixed=lane+vm+1; int i=0; for (; i<3; ++i) {} if (mixed<32) i=42; return 42; }",
+        )
+        .unwrap();
+        assert_eq!(p.locals[0].uniformity, Uniformity::Uniform);
+        assert_eq!(p.locals[1].uniformity, Uniformity::Divergent);
+        assert_eq!(p.locals[2].uniformity, Uniformity::Divergent);
+        assert_eq!(p.locals[3].uniformity, Uniformity::Divergent);
+    }
+
+    #[test]
+    fn rejects_unsupported_divergent_control() {
+        let err = source(
+            "int main(void) { int lane=warp_lane_id(); while (lane<16) ++lane; return 42; }",
+        )
+        .unwrap_err();
+        assert!(err.message.contains("while condition must be uniform"));
+        let err = source(
+            "int f(void) { return 1; } int main(void) { int lane=warp_lane_id(); int x=0; if (lane<16) x=f(); return 42; }",
+        )
+        .unwrap_err();
+        assert!(err.message.contains("function calls inside divergent"));
+    }
+
+    #[test]
+    fn divergent_function_summary_crosses_forward_calls() {
+        let p = source(
+            "int lane_value(void); int main(void) { int x=lane_value(); if (x<16) x=42; else x=42; return x; } int lane_value(void) { return warp_lane_id(); }",
+        )
+        .unwrap();
+        assert_eq!(p.locals[0].uniformity, Uniformity::Divergent);
+        let main = p.functions.iter().find(|f| f.id == p.main).unwrap();
+        let TypedStmt::If { condition, .. } = &main.body.statements[1] else {
+            panic!()
+        };
+        assert_eq!(condition.uniformity, Uniformity::Divergent);
     }
 }

@@ -5,8 +5,8 @@ a lexer, parser, typed semantic tree, uniformity analysis, and direct WarpVM
 assembly lowering. The generated assembly is passed to the existing Rust
 assembler library in-process, producing a canonical `.wvm` file.
 
-This document describes the implemented v0.1.4 Slice A through D checkpoints.
-Later slices in `project_spec_01_04.md` will add lane divergence and graphics.
+This document describes the implemented v0.1.4 Slice A through E checkpoints.
+Later slices in `project_spec_01_04.md` will add graphics support.
 
 ## Command line
 
@@ -32,7 +32,7 @@ Implemented types and memory objects:
 - `int`: signed 32-bit two's-complement value;
 - `unsigned`: unsigned 32-bit value;
 - `char`: unsigned value occupying one 32-bit WarpVM word;
-- `void`: accepted for the `main` parameter list.
+- `void`: accepted for the `main` parameter list;
 - word-addressed pointers, fixed-size one-dimensional arrays, and structures;
 - globals, address-taken automatic scalars, automatic arrays and structures;
 - one-word-per-character, zero-terminated string literals.
@@ -42,9 +42,10 @@ Implemented expressions include decimal and hexadecimal integer literals,
 arithmetic, bitwise and logical operators, comparisons, shifts, comma, simple
 and compound assignment, and pre/post increment and decrement. Normal C
 precedence and associativity apply. `&&` and `||` short-circuit. Memory
-expressions include `&`, `*`, pointer arithmetic, subscripting, `.`, `->`, and `sizeof` on both
-types and expressions. Pointer arithmetic scales by the pointed-to object's
-word size; `char *` and `int *` therefore advance by one word.
+expressions include `&`, `*`, pointer arithmetic, subscripting, `.`, `->`, and
+`sizeof` on both types and expressions. Pointer arithmetic scales by the
+pointed-to object's word size; `char *` and `int *` therefore advance by one
+word.
 
 Implemented statements include:
 
@@ -64,7 +65,7 @@ exceed WarpVM's eight-entry architectural call stack.
 
 Slice B requires controlling expressions to be uniform. This is checked in
 the typed semantic layer rather than inferred from the current lowering.
-Divergent conditions will be added with explicit mask lowering in Slice E.
+Slice E relaxes that restriction specifically for structured `if` / `else`.
 
 The deliberately small declarator subset currently supports one array suffix,
 ordinary pointer stars, and top-level named structure definitions. Brace
@@ -72,6 +73,12 @@ initializers, structure assignment/return, casts, conditional expressions,
 variadic functions, and graphics intrinsics are not yet accepted. Character
 arrays may be initialized directly from strings; scalar globals require
 constant integer or string-pointer initializers.
+
+The compiler injects two zero-argument Warp intrinsics directly, without a
+preprocessor or header dependency:
+
+- `warp_lane_id()` returns lane 0–31 and is divergent;
+- `warp_vm_id()` returns the current VM ID and is uniform within a VM.
 
 ## Integer semantics
 
@@ -131,10 +138,31 @@ currently returns zero deterministically. Uninitialized locals are likewise
 zeroed for deterministic execution; neither behaviour is a promise about an
 eventual broader C implementation.
 
-The compiler already records every expression and local as `Uniform` or
-`Divergent`. All Slice A–D inputs are logically uniform. The representation
-decision is kept explicit so later `warp_lane_id()` and divergent control-flow
-lowering do not require replacing the frontend.
+## Uniformity and divergent control
+
+The typed semantic tree records every expression and local as `Uniform` or
+`Divergent`. Literals, `warp_vm_id()`, and ordinary loop counters begin
+uniform. `warp_lane_id()` is divergent, and binary expressions join their
+operands. Initializers, assignments, increments, and function arguments
+propagate the result. An order-independent call-graph summary marks a function
+result divergent when that function, or a transitive callee, uses the lane ID;
+forward prototypes cannot hide divergence.
+
+Uniform `if` statements retain the original comparison-and-jump lowering.
+For a divergent condition, the compiler ballots the materialized condition
+into `p3`, emits the then side guarded by `@p3`, complements the mask for the
+else side, and reconverges simply by returning to unguarded emission. A nested
+divergent `if` intersects its condition with the parent mask in `p2`. `p0` and
+`p1` remain comparison/temporary masks. Both branch bodies are linear in the
+bytecode and only their selected lanes write registers or memory.
+
+Slice E deliberately supports two nested divergent mask levels. It diagnoses
+deeper nesting, divergent loop conditions and switches, calls or returns
+inside divergent regions, divergent `break` / `continue`, and divergent
+short-circuit expressions. Those constructs need either more predicate
+storage or mask-aware control-transfer semantics; they are rejected rather
+than guessed. Uniform loops, switches, calls, returns, and short-circuit
+expressions are unchanged.
 
 ## Verification
 
@@ -163,3 +191,11 @@ an address-taken scalar, pointer increment, fixed arrays, structure layout,
 `"hello\0"` shape and zero terminator, and reads a globally initialized string
 pointer. Both return 42 and pass exact interpreter/PTX state and RAM
 equivalence.
+
+`warpc_uniformity` checks direct `VMID` lowering, lane-ID propagation through
+arithmetic, an ordinary uniform loop counter, a uniform branch that remains a
+normal jump, and a divergent branch that becomes a ballot mask.
+`warpc_divergent_if` covers both sides of an outer lane split, nested splits in
+each half, masked lane-private RAM stores/loads, complementary else masks, and
+reconvergence to `r0 = 42` in all lanes. Both match complete interpreter/PTX
+state, predicate masks, and RAM.

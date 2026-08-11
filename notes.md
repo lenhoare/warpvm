@@ -601,3 +601,38 @@ That is transparent and correct but intentionally not treated as optimized.
 Future compiler work can retain frame bases or common addresses in registers;
 these results provide no evidence for byte loads/stores, `PUSH`/`POP`, string
 instructions, or another memory opcode.
+
+## 20. Existing predicate guards express structured lane divergence
+
+**Discovered by:** Warp C v0.1.4 Slice E
+
+**Classification:** compiler control-flow implementation; no ISA change
+
+`warp_lane_id()` exposes the already-defined `LANEID` value as divergent Warp
+C data, while `warp_vm_id()` lowers directly to `VMID` and remains uniform
+within one machine. Semantic propagation follows arithmetic, assignments, and
+transitive function calls. Ordinary uniform loops and branches retain their
+existing jump lowering.
+
+A divergent `if` needs no architectural active-mask stack. The compiler
+ballots its condition into `p3`, emits the then instructions under `@p3`,
+complements the same predicate for the else instructions, and resumes
+unguarded emission at reconvergence. One nested level intersects the child
+condition with its parent in `p2`; `p0` and `p1` remain available for ordinary
+comparisons and temporary mask combinations. This is the normal predicated
+SIMT shape expressed explicitly in inspectable WarpVM bytecode.
+
+The 47-word uniformity program verifies that VM ID and ordinary counters stay
+uniform while lane arithmetic becomes divergent; its uniform branch remains a
+jump and its lane-varying branch becomes a ballot. The 90-word divergent
+program splits lanes at 16, splits each half again, performs masked
+lane-private RAM accesses, and reconverges every lane to 42. Both match full
+interpreter/PTX state, predicates, and RAM.
+
+Slice E deliberately diagnoses more than two nested divergent masks,
+divergent loop/switch control, function calls or returns inside a divergent
+region, and divergent short-circuit expressions. Correctly generalizing those
+constructs may motivate predicate spilling or a compiler-managed mask stack,
+but the current programs do not justify an opcode. Two-level structured
+divergence already works using `BALLOT`, `NOTMASK`, `ANDMASK`, and ordinary
+instruction guards.
