@@ -64,6 +64,7 @@ struct Control {
 
 // ---- device-side accessors ------------------------------------------------
 
+#ifdef __CUDACC__
 __device__ inline uint32_t ReadOnce(const volatile uint32_t* p) { return *p; }
 __device__ inline uint64_t ReadOnce64(const volatile uint64_t* p) { return *p; }
 __device__ inline void WriteOnce(volatile uint32_t* p, uint32_t v) { *p = v; }
@@ -133,5 +134,6 @@ __device__ inline void LogAppend(Control* ctrl, uint32_t vm_id, uint32_t tag,
   const uint32_t slot = atomicAdd(const_cast<uint32_t*>(&ctrl->log_head), 1u);
   ctrl->log[slot % kLogCapacity] = LogEntry{vm_id, tag, value};
 }
+#endif
 
 }  // namespace wvm

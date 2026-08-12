@@ -12,6 +12,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -31,8 +32,10 @@
 namespace wvm {
 __global__ void Slice1Kernel(uint32_t* lane_out, uint32_t* sum_out);
 __global__ void VmArrayKernel(const VmDesc* descs, VmState* states);
-int ViewSingleVm(const char* path, uint32_t vm_index);  // host/view_sdl.cu
-int ViewVmGrid(const char* path, uint32_t n_vms);       // host/view_sdl.cu
+int ViewSingleVm(const char* path, uint32_t vm_index,
+                 bool compiled);  // host/view_sdl.cu
+int ViewVmGrid(const char* path, uint32_t n_vms,
+               bool compiled);  // host/view_sdl.cu
 int RunLifeBenchmark(const char* path,
                      const std::vector<uint32_t>& vm_counts,
                      int duration_ms,
@@ -583,6 +586,189 @@ int RunCompiledSlice1() {
   std::printf("\n");
   ok &= fault_equal;
 
+  // Messaging is device-resident state shared by every compiled VM in the
+  // launch. VM 0 sends while VM 1 polls; the result never passes through the
+  // host between those operations.
+  wvm::WvmFile messaging;
+  messaging.code = {
+      wvm::enc_r(wvm::kVmid, 0, 0, 0, 0),
+      wvm::enc_i(wvm::kCmpEqI, 0, 0, 0, 0),
+      wvm::enc_i(wvm::kJmpIfAny, 1, 0, 0, 6),
+      wvm::enc_i(wvm::kCmpEqI, 0, 1, 0, 1),
+      wvm::enc_i(wvm::kJmpIfAny, 2, 0, 0, 11),
+      wvm::enc_r(wvm::kHalt, 0, 0, 0, 0),
+      wvm::enc_i(wvm::kMovI, 0, 1, 0, 1),
+      wvm::enc_i(wvm::kMovI, 0, 2, 0, 7),
+      wvm::enc_i(wvm::kMovI, 0, 3, 0, 1234),
+      wvm::enc_r(wvm::kSend, 0, 1, 2, 3),
+      wvm::enc_r(wvm::kHalt, 0, 0, 0, 0),
+      wvm::enc_r(wvm::kTryRecv, 0, 2, 4, 5),
+      wvm::enc_r(wvm::kNotMask, 0, 3, 2, 0),
+      wvm::enc_i(wvm::kJmpIfAny, 4, 0, 0, 11),
+      wvm::enc_i(wvm::kMovI, 0, 6, 0, 0),
+      wvm::enc_r(wvm::kStore, 0, 6, 4, 0),
+      wvm::enc_r(wvm::kHalt, 0, 0, 0, 0),
+  };
+  if (!compiled.Compile(messaging, err)) {
+    std::printf("compiled messaging: PTX compile FAIL: %s\n", err.c_str());
+    return 1;
+  }
+  std::vector<wvm::VmState> messaging_states(4);
+  for (uint32_t vm = 0; vm < messaging_states.size(); ++vm) {
+    messaging_states[vm].vm_id = vm;
+    messaging_states[vm].status = wvm::kRunning;
+    messaging_states[vm].rng_state = vm * 0x9E3779B9u + 0x1234567u;
+  }
+  std::vector<uint32_t> messaging_memory(4 * 16, 0);
+  if (!compiled.Launch(messaging_states, messaging_memory, 16,
+                       no_framebuffer, no_frame_seq, err)) {
+    std::printf("compiled messaging: launch FAIL: %s\n", err.c_str());
+    return 1;
+  }
+  bool messaging_ok = messaging_memory[16] == 1234;
+  for (const wvm::VmState& state : messaging_states)
+    messaging_ok &= state.status == wvm::kHalted &&
+                    state.fault_code == wvm::kFaultOk;
+  std::printf("compiled messaging: resident ring delivery %s\n",
+              messaging_ok ? "PASS" : "FAIL");
+  ok &= messaging_ok;
+
+  // A false guard suppresses the receive side effect; the following
+  // unguarded receive must still consume the self-sent message.
+  wvm::WvmFile guarded_receive;
+  guarded_receive.code = {
+      wvm::enc_r(wvm::kVmid, 0, 0, 0, 0),
+      wvm::enc_i(wvm::kMovI, 0, 1, 0, 0),
+      wvm::enc_i(wvm::kMovI, 0, 2, 0, 7),
+      wvm::enc_i(wvm::kMovI, 0, 3, 0, 1234),
+      wvm::enc_r(wvm::kSend, 0, 1, 2, 3),
+      wvm::enc_i(wvm::kCmpEqI, 0, 0, 0, 1),
+      wvm::enc_r(wvm::kTryRecv, 1, 1, 4, 5),
+      wvm::enc_r(wvm::kTryRecv, 0, 2, 6, 7),
+      wvm::enc_r(wvm::kHalt, 0, 0, 0, 0),
+  };
+  if (!compiled.Compile(guarded_receive, err)) {
+    std::printf("compiled messaging guard: compile FAIL: %s\n", err.c_str());
+    return 1;
+  }
+  std::vector<wvm::VmState> guarded_states(1);
+  guarded_states[0].status = wvm::kRunning;
+  guarded_states[0].rng_state = 0x1234567u;
+  std::vector<uint32_t> guarded_memory(16, 0);
+  if (!compiled.Launch(guarded_states, guarded_memory, 16,
+                       no_framebuffer, no_frame_seq, err)) {
+    std::printf("compiled messaging guard: launch FAIL: %s\n", err.c_str());
+    return 1;
+  }
+  const bool guard_ok = guarded_states[0].status == wvm::kHalted &&
+                        guarded_states[0].preds[1] == 0 &&
+                        guarded_states[0].preds[2] == wvm::kFullMask &&
+                        guarded_states[0].vregs[6 * wvm::kLanes] == 1234;
+  std::printf("compiled messaging: guarded receive %s\n",
+              guard_ok ? "PASS" : "FAIL");
+  ok &= guard_ok;
+
+  // Fill, drain, and reuse every ring slot twice. This checks FIFO payloads,
+  // metadata, wraparound publication sequences, and the exact 16-slot limit.
+  wvm::WvmFile mailbox_fifo;
+  auto& fifo_code = mailbox_fifo.code;
+  fifo_code.push_back(wvm::enc_i(wvm::kMovI, 0, 0, 0, 0));  // self dest
+  fifo_code.push_back(wvm::enc_i(wvm::kMovI, 0, 1, 0, 9));  // type
+  fifo_code.push_back(wvm::enc_i(wvm::kMovI, 0, 2, 0, 1));  // payload
+  fifo_code.push_back(wvm::enc_i(wvm::kMovI, 0, 3, 0, 0));  // address
+  fifo_code.push_back(wvm::enc_i(wvm::kMovI, 0, 7, 0, 0));  // sum
+  for (uint32_t cycle = 0; cycle < 2; ++cycle) {
+    for (uint32_t message = 0; message < wvm::kMailboxSlots; ++message) {
+      fifo_code.push_back(wvm::enc_r(wvm::kSend, 0, 0, 1, 2));
+      fifo_code.push_back(wvm::enc_i(wvm::kAddI, 0, 2, 2, 1));
+    }
+    for (uint32_t message = 0; message < wvm::kMailboxSlots; ++message) {
+      fifo_code.push_back(wvm::enc_r(wvm::kTryRecv, 0, 0, 4, 5));
+      fifo_code.push_back(wvm::enc_r(wvm::kAdd, 0, 7, 7, 4));
+      fifo_code.push_back(wvm::enc_r(wvm::kStore, 0, 3, 4, 0));
+      fifo_code.push_back(wvm::enc_i(wvm::kAddI, 0, 3, 3, 1));
+    }
+  }
+  fifo_code.push_back(wvm::enc_r(wvm::kHalt, 0, 0, 0, 0));
+  if (!compiled.Compile(mailbox_fifo, err)) {
+    std::printf("compiled mailbox FIFO: compile FAIL: %s\n", err.c_str());
+    return 1;
+  }
+  std::vector<wvm::VmState> fifo_states(1);
+  fifo_states[0].status = wvm::kRunning;
+  fifo_states[0].rng_state = 0x1234567u;
+  std::vector<uint32_t> fifo_memory(64, 0);
+  if (!compiled.Launch(fifo_states, fifo_memory, 64,
+                       no_framebuffer, no_frame_seq, err)) {
+    std::printf("compiled mailbox FIFO: launch FAIL: %s\n", err.c_str());
+    return 1;
+  }
+  bool fifo_ok = fifo_states[0].status == wvm::kHalted &&
+                 fifo_states[0].vregs[7 * wvm::kLanes] == 528 &&
+                 fifo_states[0].vregs[5 * wvm::kLanes] == (9u << 16);
+  for (uint32_t word = 0; word < 32; ++word)
+    fifo_ok &= fifo_memory[word] == word + 1;
+  std::printf("compiled messaging: FIFO capacity/reuse %s\n",
+              fifo_ok ? "PASS" : "FAIL");
+  ok &= fifo_ok;
+
+  wvm::WvmFile mailbox_full;
+  mailbox_full.code = {
+      wvm::enc_i(wvm::kMovI, 0, 0, 0, 0),
+      wvm::enc_i(wvm::kMovI, 0, 1, 0, 1),
+      wvm::enc_i(wvm::kMovI, 0, 2, 0, 99),
+  };
+  for (uint32_t message = 0; message <= wvm::kMailboxSlots; ++message)
+    mailbox_full.code.push_back(wvm::enc_r(wvm::kSend, 0, 0, 1, 2));
+  mailbox_full.code.push_back(wvm::enc_r(wvm::kHalt, 0, 0, 0, 0));
+  if (!compiled.Compile(mailbox_full, err)) {
+    std::printf("compiled mailbox full: compile FAIL: %s\n", err.c_str());
+    return 1;
+  }
+  std::vector<wvm::VmState> full_states(1);
+  full_states[0].status = wvm::kRunning;
+  full_states[0].rng_state = 0x1234567u;
+  std::vector<uint32_t> full_memory(16, 0);
+  if (!compiled.Launch(full_states, full_memory, 16,
+                       no_framebuffer, no_frame_seq, err)) {
+    std::printf("compiled mailbox full: launch FAIL: %s\n", err.c_str());
+    return 1;
+  }
+  const bool full_ok = full_states[0].status == wvm::kFaulted &&
+                       full_states[0].fault_code == wvm::kFaultMsg;
+  std::printf("compiled messaging: full-mailbox fault %s\n",
+              full_ok ? "PASS" : "FAIL");
+  ok &= full_ok;
+
+  wvm::WvmFile invalid_destination;
+  invalid_destination.code = {
+      wvm::enc_i(wvm::kMovI, 0, 0, 0, 1),
+      wvm::enc_i(wvm::kMovI, 0, 1, 0, 1),
+      wvm::enc_i(wvm::kMovI, 0, 2, 0, 99),
+      wvm::enc_r(wvm::kSend, 0, 0, 1, 2),
+      wvm::enc_r(wvm::kHalt, 0, 0, 0, 0),
+  };
+  if (!compiled.Compile(invalid_destination, err)) {
+    std::printf("compiled invalid destination: compile FAIL: %s\n",
+                err.c_str());
+    return 1;
+  }
+  std::vector<wvm::VmState> invalid_states(1);
+  invalid_states[0].status = wvm::kRunning;
+  invalid_states[0].rng_state = 0x1234567u;
+  std::vector<uint32_t> invalid_memory(16, 0);
+  if (!compiled.Launch(invalid_states, invalid_memory, 16,
+                       no_framebuffer, no_frame_seq, err)) {
+    std::printf("compiled invalid destination: launch FAIL: %s\n",
+                err.c_str());
+    return 1;
+  }
+  const bool invalid_ok = invalid_states[0].status == wvm::kFaulted &&
+                          invalid_states[0].fault_code == wvm::kFaultMsg;
+  std::printf("compiled messaging: invalid-destination fault %s\n",
+              invalid_ok ? "PASS" : "FAIL");
+  ok &= invalid_ok;
+
   // Unsupported bytecode must stop at compilation, never become a partial
   // instruction-level fallback inside native execution.
   wvm::WvmFile unsupported;
@@ -695,6 +881,82 @@ int RunCompiledHaltEquivalence(const char* path) {
               state_equal ? "" : " difference=", state_equal ? "" : difference.c_str());
   std::printf(pass ? "compiled halt equivalence: PASS\n" :
                      "compiled halt equivalence: FAIL\n");
+  return pass ? 0 : 1;
+}
+
+int RunCompiledResident(const char* path, uint32_t num_vms,
+                        int seconds = 3) {
+  if (num_vms == 0 || num_vms > wvm::kMaxVms) {
+    std::fprintf(stderr, "compiled_resident: VM count must be 1..%u\n",
+                 wvm::kMaxVms);
+    return 2;
+  }
+  wvm::WvmFile file;
+  std::string err;
+  if (!wvm::LoadWvm(path, file, err)) {
+    std::fprintf(stderr, "compiled_resident: %s\n", err.c_str());
+    return 2;
+  }
+  std::vector<wvm::VmImage> images(num_vms);
+  for (wvm::VmImage& image : images) {
+    image.code = file.code;
+    image.literals = file.literals;
+    image.mem_size_words = 16384;
+  }
+  wvm::PersistentRuntime runtime;
+  wvm::PtxResidentProgram program;
+  if (!runtime.Init(images, err) || !runtime.EnsureStream(err) ||
+      !program.Compile(file, err) ||
+      !program.Launch(
+          reinterpret_cast<CUdeviceptr>(runtime.DeviceStates()), num_vms,
+          reinterpret_cast<CUdeviceptr>(runtime.DeviceDescs()),
+          reinterpret_cast<CUdeviceptr>(runtime.DeviceControl()),
+          reinterpret_cast<CUdeviceptr>(runtime.DeviceMailboxes()),
+          reinterpret_cast<CUstream>(runtime.Stream()), err)) {
+    std::fprintf(stderr, "compiled_resident: setup failed: %s\n", err.c_str());
+    return 1;
+  }
+  runtime.BootAll();
+  for (uint32_t vm = 0; vm < num_vms; ++vm) {
+    for (int waited = 0; waited < 2000 && runtime.Status(vm) == wvm::kIdle;
+         ++waited)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  std::this_thread::sleep_for(std::chrono::seconds(seconds));
+
+  bool running = true;
+  for (uint32_t vm = 0; vm < num_vms; ++vm)
+    running &= runtime.Status(vm) == wvm::kRunning &&
+               runtime.Fault(vm) == wvm::kFaultOk;
+  const uint32_t frame_before_pause = runtime.FrameSeq(0);
+  std::vector<uint32_t> memory;
+  const bool memory_ok = runtime.ReadMem(0, 96, 7, memory) &&
+                         memory.size() == 7;
+  const uint32_t received = memory_ok ? memory[2] : 0;
+
+  const bool paused = runtime.Pause(0);
+  wvm::VmState paused_state{};
+  const bool state_ok = paused && runtime.ReadState(0, paused_state) &&
+                        paused_state.status == wvm::kPaused;
+  runtime.SendCmd(0, wvm::kCmdRun);
+  std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  const bool resumed = runtime.Status(0) == wvm::kRunning &&
+                       runtime.FrameSeq(0) > frame_before_pause;
+
+  runtime.ShutdownAll();
+  const cudaError_t sync = runtime.Sync();
+  const bool pass = running && frame_before_pause > 0 &&
+                    (num_vms == 1 || received > 0) && state_ok && resumed &&
+                    sync == cudaSuccess;
+  std::printf("compiled resident: VMs=%u running=%s frames=%u received=%u "
+              "pause=%s resume=%s shutdown=%s JIT=%.3fms\n",
+              num_vms, running ? "PASS" : "FAIL", frame_before_pause,
+              received, state_ok ? "PASS" : "FAIL",
+              resumed ? "PASS" : "FAIL",
+              sync == cudaSuccess ? "PASS" : "FAIL",
+              program.jit_milliseconds());
+  std::printf(pass ? "compiled resident: PASS\n" :
+                     "compiled resident: FAIL\n");
   return pass ? 0 : 1;
 }
 
@@ -1321,7 +1583,112 @@ void PrintVmTable(const wvm::PersistentRuntime& rt);
 // `warpvm serve <file.wvm> [--vms N] [--for SECONDS]` — launch the persistent
 // kernel with N copies of the program, boot them, print a `list` table once a
 // second, then shut down. Bounded by design (display-GPU friendly).
-int CmdServe(const char* path, uint32_t n_vms, int seconds) {
+bool LaunchPersistentEngine(wvm::PersistentRuntime& runtime,
+                            const wvm::WvmFile& file, bool compiled,
+                            std::unique_ptr<wvm::PtxResidentProgram>& artifact,
+                            std::string& err) {
+  if (!compiled) return runtime.Launch(err);
+  artifact = std::make_unique<wvm::PtxResidentProgram>();
+  return runtime.EnsureStream(err) && artifact->Compile(file, err) &&
+         artifact->Launch(
+             reinterpret_cast<CUdeviceptr>(runtime.DeviceStates()),
+             runtime.num_vms(),
+             reinterpret_cast<CUdeviceptr>(runtime.DeviceDescs()),
+             reinterpret_cast<CUdeviceptr>(runtime.DeviceControl()),
+             reinterpret_cast<CUdeviceptr>(runtime.DeviceMailboxes()),
+             reinterpret_cast<CUstream>(runtime.Stream()), err);
+}
+
+struct ResidentMeasurement {
+  double frames_per_second = 0.0;
+  uint64_t messages_received = 0;
+  bool healthy = false;
+};
+
+bool MeasureResidentEngine(const wvm::WvmFile& file, uint32_t num_vms,
+                           int duration_ms, bool compiled,
+                           ResidentMeasurement& measurement,
+                           std::string& err) {
+  std::vector<wvm::VmImage> images(num_vms);
+  for (wvm::VmImage& image : images) {
+    image.code = file.code;
+    image.literals = file.literals;
+    image.mem_size_words = 16384;
+  }
+  wvm::PersistentRuntime runtime;
+  std::unique_ptr<wvm::PtxResidentProgram> artifact;
+  if (!runtime.Init(images, err) ||
+      !LaunchPersistentEngine(runtime, file, compiled, artifact, err))
+    return false;
+  runtime.BootAll();
+  for (uint32_t vm = 0; vm < num_vms; ++vm) {
+    for (int waited = 0; waited < 5000 && runtime.Status(vm) == wvm::kIdle;
+         ++waited)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  std::vector<uint32_t> before(num_vms);
+  for (uint32_t vm = 0; vm < num_vms; ++vm) before[vm] = runtime.FrameSeq(vm);
+  const auto start = std::chrono::steady_clock::now();
+  std::this_thread::sleep_for(std::chrono::milliseconds(duration_ms));
+  const auto stop = std::chrono::steady_clock::now();
+  uint64_t frames = 0;
+  measurement.healthy = true;
+  for (uint32_t vm = 0; vm < num_vms; ++vm) {
+    frames += runtime.FrameSeq(vm) - before[vm];
+    measurement.healthy &= runtime.Status(vm) == wvm::kRunning &&
+                           runtime.Fault(vm) == wvm::kFaultOk;
+    std::vector<uint32_t> words;
+    if (runtime.ReadMem(vm, 98, 1, words) && !words.empty())
+      measurement.messages_received += words[0];
+  }
+  const double seconds =
+      std::chrono::duration<double>(stop - start).count();
+  measurement.frames_per_second =
+      static_cast<double>(frames) / num_vms / seconds;
+  runtime.ShutdownAll();
+  if (runtime.Sync() != cudaSuccess) {
+    err = "resident benchmark shutdown failed";
+    return false;
+  }
+  return true;
+}
+
+int RunResidentBenchmark(const char* path, uint32_t num_vms,
+                         int duration_ms) {
+  wvm::WvmFile file;
+  std::string err;
+  if (!wvm::LoadWvm(path, file, err)) {
+    std::fprintf(stderr, "resident_bench: %s\n", err.c_str());
+    return 2;
+  }
+  ResidentMeasurement interpreted, compiled;
+  if (!MeasureResidentEngine(file, num_vms, duration_ms, false, interpreted,
+                             err) ||
+      !MeasureResidentEngine(file, num_vms, duration_ms, true, compiled,
+                             err)) {
+    std::fprintf(stderr, "resident_bench: %s\n", err.c_str());
+    return 1;
+  }
+  const double speedup = compiled.frames_per_second /
+                         interpreted.frames_per_second;
+  const bool pass = interpreted.healthy && compiled.healthy &&
+                    interpreted.frames_per_second > 0 &&
+                    compiled.frames_per_second > 0 &&
+                    compiled.messages_received > 0;
+  std::printf("resident messaging/graphics benchmark: %u VMs, %.3fs\n",
+              num_vms, duration_ms / 1000.0);
+  std::printf("  interpreted       %9.2f average frames/s  messages=%llu\n",
+              interpreted.frames_per_second,
+              static_cast<unsigned long long>(interpreted.messages_received));
+  std::printf("  compiled resident %9.2f average frames/s  messages=%llu\n",
+              compiled.frames_per_second,
+              static_cast<unsigned long long>(compiled.messages_received));
+  std::printf("  compiled speedup  %9.2fx\n", speedup);
+  std::printf(pass ? "resident_bench PASS\n" : "resident_bench FAIL\n");
+  return pass ? 0 : 1;
+}
+
+int CmdServe(const char* path, uint32_t n_vms, int seconds, bool compiled) {
   wvm::WvmFile file;
   std::string err;
   if (!wvm::LoadWvm(path, file, err)) {
@@ -1341,12 +1708,16 @@ int CmdServe(const char* path, uint32_t n_vms, int seconds) {
   }
 
   wvm::PersistentRuntime rt;
-  if (!rt.Init(images, err) || !rt.Launch(err)) {
+  std::unique_ptr<wvm::PtxResidentProgram> compiled_artifact;
+  if (!rt.Init(images, err) ||
+      !LaunchPersistentEngine(rt, file, compiled, compiled_artifact, err)) {
     std::fprintf(stderr, "error: %s\n", err.c_str());
     return 1;
   }
   rt.BootAll();
-  std::printf("serving %u VMs from %s for %ds\n", n_vms, path, seconds);
+  std::printf("serving %u %s VMs from %s for %ds\n", n_vms,
+              compiled ? "compiled resident" : "interpreted", path,
+              seconds);
 
   for (int t = 1; t <= seconds; ++t) {
     std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -1394,7 +1765,7 @@ std::vector<std::string> Tokenize(const std::string& line) {
 
 // `warpvm attach <file.wvm> [--vms N]` — launch the persistent kernel, boot
 // the VMs, then run an interactive console reading commands from stdin.
-int CmdAttach(const char* path, uint32_t n_vms) {
+int CmdAttach(const char* path, uint32_t n_vms, bool compiled) {
   wvm::WvmFile file;
   std::string err;
   if (!wvm::LoadWvm(path, file, err)) {
@@ -1412,7 +1783,9 @@ int CmdAttach(const char* path, uint32_t n_vms) {
     images[i].mem_size_words = 16384;
   }
   wvm::PersistentRuntime rt;
-  if (!rt.Init(images, err) || !rt.Launch(err)) {
+  std::unique_ptr<wvm::PtxResidentProgram> compiled_artifact;
+  if (!rt.Init(images, err) ||
+      !LaunchPersistentEngine(rt, file, compiled, compiled_artifact, err)) {
     std::fprintf(stderr, "error: %s\n", err.c_str());
     return 1;
   }
@@ -1424,7 +1797,8 @@ int CmdAttach(const char* path, uint32_t n_vms) {
     for (int w = 0; w < 2000 && rt.Status(i) == wvm::kIdle; ++w)
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
-  std::printf("attached: %u VMs from %s\n", n_vms, path);
+  std::printf("attached: %u %s VMs from %s\n", n_vms,
+              compiled ? "compiled resident" : "interpreted", path);
   std::printf("type 'help' for commands, 'quit' to exit\n");
 
   uint32_t cur = 0;
@@ -1477,6 +1851,10 @@ int CmdAttach(const char* path, uint32_t n_vms) {
       rt.SendCmd(cur, wvm::kCmdRun);
       std::printf("resuming\n");
     } else if (c == "step") {
+      if (compiled) {
+        std::printf("single-step requires the interpreter engine\n");
+        continue;
+      }
       if (!ensure_paused(cur)) { std::printf("could not pause\n"); continue; }
       int n = tok.size() >= 2 ? std::atoi(tok[1].c_str()) : 1;
       if (n < 1) n = 1;
@@ -2088,6 +2466,40 @@ int RunSlice7() {
   rt.ShutdownAll();
   const cudaError_t e = rt.Sync();
   ok &= e == cudaSuccess;
+
+  // A false guard suppresses consumption, so the subsequent unguarded
+  // receive must still observe the self-sent message.
+  const std::vector<uint32_t> guarded_prog = {
+      enc_i(wvm::kMovI, 0, 0, 0, 0),
+      enc_i(wvm::kMovI, 0, 1, 0, 7),
+      enc_i(wvm::kMovI, 0, 2, 0, 1234),
+      enc_r(wvm::kSend, 0, 0, 1, 2),
+      enc_i(wvm::kCmpEqI, 0, 0, 0, 1),
+      enc_r(wvm::kTryRecv, 1, 1, 3, 4),
+      enc_r(wvm::kTryRecv, 0, 2, 5, 6),
+      enc_i(wvm::kMovI, 0, 7, 0, 0),
+      enc_r(wvm::kStore, 0, 7, 5, 0),
+      enc_r(wvm::kHalt, 0, 0, 0, 0),
+  };
+  std::vector<wvm::VmImage> guarded_images(1);
+  guarded_images[0].code = guarded_prog;
+  guarded_images[0].mem_size_words = 16;
+  wvm::PersistentRuntime guarded_rt;
+  if (!guarded_rt.Init(guarded_images, err) || !guarded_rt.Launch(err)) {
+    std::printf("  %-22s FAIL (%s)\n", "guarded_receive", err.c_str());
+    return 1;
+  }
+  guarded_rt.BootAll();
+  guarded_rt.WaitStatus(0, wvm::kHalted, 2000);
+  std::vector<uint32_t> guarded_mem;
+  const bool guarded_ok = guarded_rt.Status(0) == wvm::kHalted &&
+                          guarded_rt.ReadMem(0, 0, 1, guarded_mem) &&
+                          guarded_mem[0] == 1234;
+  std::printf("  %-22s %s\n", "guarded_receive",
+              guarded_ok ? "PASS" : "FAIL");
+  ok &= guarded_ok;
+  guarded_rt.ShutdownAll();
+  ok &= guarded_rt.Sync() == cudaSuccess;
 
   std::printf(ok ? "slice7: PASS\n" : "slice7: FAIL\n");
   return ok ? 0 : 1;
@@ -2782,9 +3194,9 @@ int CmdDemo(const char* path, uint32_t n_vms) {
 void Usage(const char* argv0) {
   std::printf("usage: %s <command>\n", argv0);
   std::printf("  run <file.wvm>  run a .wvm program to completion on one warp\n");
-  std::printf("  serve <file.wvm> [--vms N] [--for S]\n");
+  std::printf("  serve <file.wvm> [--vms N] [--for S] [--compiled]\n");
   std::printf("                  boot N resident VMs, print `list` for S seconds\n");
-  std::printf("  attach <file.wvm> [--vms N]\n");
+  std::printf("  attach <file.wvm> [--vms N] [--compiled]\n");
   std::printf("                  boot N resident VMs, interactive console on stdin\n");
   std::printf("  demo <file.wvm> [--vms N]\n");
   std::printf("                  v0.1 capstone: N VMs compute + ring-message + stay live\n");
@@ -2793,7 +3205,7 @@ void Usage(const char* argv0) {
   std::printf("  gfxsmoke <file.wvm>    headless framebuffer-copy smoke test\n");
   std::printf("  gfx_cap <file.wvm> [--vms N]\n");
   std::printf("                  v0.1.1 capstone: N VMs render distinct images\n");
-  std::printf("  view <file.wvm> [--vm N | --vms N]\n");
+  std::printf("  view <file.wvm> [--vm N | --vms N] [--compiled]\n");
   std::printf("                  show one VM or a tiled grid of N resident VMs\n");
   std::printf("  life_test <file.wvm> Program 01 packed-Life correctness test\n");
   std::printf("  life_bench <file.wvm> [--vms N] [--ms N] [--workers N]\n");
@@ -2809,6 +3221,10 @@ void Usage(const char* argv0) {
   std::printf("  compiled_tests        v0.1.3 minimal PTX backend tests\n");
   std::printf("  compiled_run <file.wvm>\n");
   std::printf("                  exact CPU/compiled equivalence through HALT\n");
+  std::printf("  compiled_resident <file.wvm> [--vms N] [--for S]\n");
+  std::printf("                  continuously resident compiled VMs\n");
+  std::printf("  resident_bench <file.wvm> [--vms N] [--ms N]\n");
+  std::printf("                  interpreted/compiled resident frame benchmark\n");
   std::printf("  warpc_bench <sequential.wvm> <warp.wvm>\n");
   std::printf("                  v0.1.5 sequential/warp-native data benchmark\n");
   std::printf("  compiled_life <file.wvm>\n");
@@ -2860,6 +3276,50 @@ int main(int argc, char** argv) {
       return 2;
     }
     return RunCompiledHaltEquivalence(argv[2]);
+  }
+  if (std::strcmp(cmd, "compiled_resident") == 0) {
+    if (argc < 3) {
+      std::fprintf(stderr, "error: compiled_resident requires a .wvm file\n");
+      return 2;
+    }
+    uint32_t num_vms = 64;
+    int seconds = 3;
+    for (int i = 3; i < argc; ++i) {
+      if (std::strcmp(argv[i], "--vms") == 0 && i + 1 < argc)
+        num_vms = static_cast<uint32_t>(std::atoi(argv[++i]));
+      else if (std::strcmp(argv[i], "--for") == 0 && i + 1 < argc)
+        seconds = std::max(1, std::atoi(argv[++i]));
+      else {
+        std::fprintf(stderr, "error: unknown compiled_resident option '%s'\n",
+                     argv[i]);
+        return 2;
+      }
+    }
+    return RunCompiledResident(argv[2], num_vms, seconds);
+  }
+  if (std::strcmp(cmd, "resident_bench") == 0) {
+    if (argc < 3) {
+      std::fprintf(stderr, "error: resident_bench requires a .wvm file\n");
+      return 2;
+    }
+    uint32_t num_vms = 64;
+    int duration_ms = 2000;
+    for (int i = 3; i < argc; ++i) {
+      if (std::strcmp(argv[i], "--vms") == 0 && i + 1 < argc)
+        num_vms = static_cast<uint32_t>(std::atoi(argv[++i]));
+      else if (std::strcmp(argv[i], "--ms") == 0 && i + 1 < argc)
+        duration_ms = std::max(1, std::atoi(argv[++i]));
+      else {
+        std::fprintf(stderr, "error: unknown resident_bench option '%s'\n",
+                     argv[i]);
+        return 2;
+      }
+    }
+    if (num_vms == 0 || num_vms > wvm::kMaxVms) {
+      std::fprintf(stderr, "error: --vms must be 1..%u\n", wvm::kMaxVms);
+      return 2;
+    }
+    return RunResidentBenchmark(argv[2], num_vms, duration_ms);
   }
   if (std::strcmp(cmd, "warpc_bench") == 0) {
     if (argc != 4) {
@@ -2932,7 +3392,12 @@ int main(int argc, char** argv) {
     uint32_t n_vms = 0;
     bool select_vm = false;
     bool select_grid = false;
+    bool compiled = false;
     for (int i = 3; i < argc; ++i) {
+      if (std::strcmp(argv[i], "--compiled") == 0) {
+        compiled = true;
+        continue;
+      }
       const bool is_vm = std::strcmp(argv[i], "--vm") == 0;
       const bool is_vms = std::strcmp(argv[i], "--vms") == 0;
       if ((is_vm || is_vms) && i + 1 >= argc) {
@@ -2965,8 +3430,8 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "error: --vm and --vms are mutually exclusive\n");
       return 2;
     }
-    if (select_grid) return wvm::ViewVmGrid(argv[2], n_vms);
-    return wvm::ViewSingleVm(argv[2], vm_index);
+    if (select_grid) return wvm::ViewVmGrid(argv[2], n_vms, compiled);
+    return wvm::ViewSingleVm(argv[2], vm_index, compiled);
   }
   if (std::strcmp(cmd, "life_test") == 0) {
     if (argc < 3) {
@@ -3064,17 +3529,20 @@ int main(int argc, char** argv) {
     }
     uint32_t n_vms = 8;
     int seconds = 3;
+    bool compiled = false;
     for (int i = 3; i < argc; ++i) {
       if (std::strcmp(argv[i], "--vms") == 0 && i + 1 < argc) {
         n_vms = static_cast<uint32_t>(std::atoi(argv[++i]));
       } else if (std::strcmp(argv[i], "--for") == 0 && i + 1 < argc) {
         seconds = std::atoi(argv[++i]);
+      } else if (std::strcmp(argv[i], "--compiled") == 0) {
+        compiled = true;
       } else {
         std::fprintf(stderr, "error: unknown serve option '%s'\n", argv[i]);
         return 2;
       }
     }
-    return CmdServe(argv[2], n_vms, seconds);
+    return CmdServe(argv[2], n_vms, seconds, compiled);
   }
   if (std::strcmp(cmd, "attach") == 0) {
     if (argc < 3) {
@@ -3082,11 +3550,18 @@ int main(int argc, char** argv) {
       return 2;
     }
     uint32_t n_vms = 4;
+    bool compiled = false;
     for (int i = 3; i < argc; ++i) {
       if (std::strcmp(argv[i], "--vms") == 0 && i + 1 < argc)
         n_vms = static_cast<uint32_t>(std::atoi(argv[++i]));
+      else if (std::strcmp(argv[i], "--compiled") == 0)
+        compiled = true;
+      else {
+        std::fprintf(stderr, "error: unknown attach option '%s'\n", argv[i]);
+        return 2;
+      }
     }
-    return CmdAttach(argv[2], n_vms);
+    return CmdAttach(argv[2], n_vms, compiled);
   }
   if (std::strcmp(cmd, "demo") == 0) {
     if (argc < 3) {

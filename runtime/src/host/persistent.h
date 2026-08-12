@@ -162,13 +162,34 @@ class PersistentRuntime {
       err = "cudaMalloc states failed";
       return false;
     }
-    cudaMemset(d_states_, 0, num_vms_ * sizeof(VmState));
+    std::vector<VmState> states(num_vms_);
+    for (uint32_t vm = 0; vm < num_vms_; ++vm) {
+      states[vm].vm_id = vm;
+      states[vm].status = kIdle;
+      states[vm].rng_state = vm * 0x9E3779B9u + 0x1234567u;
+    }
+    if (cudaMemcpy(d_states_, states.data(), num_vms_ * sizeof(VmState),
+                   cudaMemcpyHostToDevice) != cudaSuccess) {
+      err = "initial state upload failed";
+      return false;
+    }
     if (cudaMalloc(reinterpret_cast<void**>(&d_mailboxes_),
                    num_vms_ * sizeof(Mailbox)) != cudaSuccess) {
       err = "cudaMalloc mailboxes failed";
       return false;
     }
-    cudaMemset(d_mailboxes_, 0, num_vms_ * sizeof(Mailbox));
+    std::vector<Mailbox> mailboxes(num_vms_);
+    for (Mailbox& mailbox : mailboxes) {
+      std::memset(&mailbox, 0, sizeof(mailbox));
+      for (uint32_t slot = 0; slot < kMailboxSlots; ++slot)
+        mailbox.slots[slot].sequence = slot;
+    }
+    if (cudaMemcpy(d_mailboxes_, mailboxes.data(),
+                   num_vms_ * sizeof(Mailbox), cudaMemcpyHostToDevice) !=
+        cudaSuccess) {
+      err = "mailbox initialization upload failed";
+      return false;
+    }
     return true;
   }
 
@@ -255,6 +276,22 @@ class PersistentRuntime {
     launched_ = true;
     return true;
   }
+
+  bool EnsureStream(std::string& err) {
+    if (stream_ != nullptr) return true;
+    if (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) !=
+        cudaSuccess) {
+      err = "cudaStreamCreate failed";
+      return false;
+    }
+    return true;
+  }
+
+  void* DeviceDescs() const { return d_descs_; }
+  void* DeviceStates() const { return d_states_; }
+  void* DeviceControl() const { return d_ctrl_; }
+  void* DeviceMailboxes() const { return d_mailboxes_; }
+  cudaStream_t Stream() const { return stream_; }
 
   // ---- host commands -----------------------------------------------------
   void SendCmd(uint32_t vm, VmCmd cmd) { h_ctrl_->cmd[vm] = cmd; }

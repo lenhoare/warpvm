@@ -132,10 +132,20 @@ full-frame graphics, and real neighbour messaging in each of 64 resident VMs:
 build/tools-rust/release/warpc programs/warpc/warp_native_demo.wc \
   -o build/warp_native_demo.wvm
 build/runtime/warpvm view build/warp_native_demo.wvm --vms 64
+build/runtime/warpvm view build/warp_native_demo.wvm --vms 64 --compiled
 ```
 
+`--compiled` selects continuously resident direct PTX execution. The VMs are
+booted once and keep running while the viewer exchanges framebuffer sequence
+counters, mailbox traffic, and control asynchronously; it is not a
+launch/synchronize/download loop. The same engine is available with
+`serve ... --compiled` and `attach ... --compiled` (live inspection plus
+pause/resume/reset; single-instruction stepping remains an interpreter tool).
+
 The paired sequential/warp-native copy, fill, and add benchmark is documented
-in [`benchmarks/warpc_015.md`](benchmarks/warpc_015.md).
+in [`benchmarks/warpc_015.md`](benchmarks/warpc_015.md). The matched persistent
+interpreter/compiled messaging-and-graphics result is in
+[`benchmarks/compiled_resident.md`](benchmarks/compiled_resident.md).
 
 ## Program 01: WarpLife
 
@@ -200,6 +210,7 @@ control-poll, and memory breakdown is in
 | v0.1.4-E | uniformity propagation, lane/VM intrinsics, and masked divergent `if` / `else` | done |
 | v0.1.4-F | built-in `warp.h`, ARGB/framebuffer helpers, and `FLIP` | done |
 | v0.1.5 | `WARP`, collectives, cooperative memory, warp-native graphics/capstone, benchmark | done |
+| v0.1.6 | publication-safe mailboxes and continuously resident compiled messaging/control/viewer | done |
 
 ## v0.1 milestone
 

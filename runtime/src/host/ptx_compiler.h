@@ -1,8 +1,10 @@
-// Minimal whole-program PTX backend for WarpVM v0.1.3.
+// Whole-program PTX backends for WarpVM.
 //
 // The bytecode remains canonical. This object owns a CUDA-driver module JITed
 // from generated PTX and can execute any number of independent VmState
-// instances of that one program, one hardware warp per VM.
+// instances of that one program, one hardware warp per VM. The resident form
+// is the live-machine engine; PtxCompiledProgram remains the bounded
+// equivalence/benchmark harness.
 #pragma once
 
 #include <cstddef>
@@ -23,6 +25,35 @@ namespace wvm {
 // inspected on build-only hosts.
 bool TranslateWvmToPtx(const WvmFile& file, std::string& ptx,
                        std::string& err);
+bool TranslateWvmToResidentPtx(const WvmFile& file, std::string& ptx,
+                               std::string& err);
+
+// Direct whole-program code running as continuously resident VM warps. The
+// caller owns the canonical runtime pools; this object owns only the JITed
+// program artifact and launches it asynchronously into the supplied stream.
+class PtxResidentProgram {
+ public:
+  PtxResidentProgram() = default;
+  ~PtxResidentProgram();
+  PtxResidentProgram(const PtxResidentProgram&) = delete;
+  PtxResidentProgram& operator=(const PtxResidentProgram&) = delete;
+
+  bool Compile(const WvmFile& file, std::string& err);
+  bool Launch(CUdeviceptr states, uint32_t num_vms, CUdeviceptr descs,
+              CUdeviceptr control, CUdeviceptr mailboxes, CUstream stream,
+              std::string& err) const;
+  const std::string& ptx() const { return ptx_; }
+  double jit_milliseconds() const { return jit_milliseconds_; }
+
+ private:
+  CUdevice device_ = 0;
+  CUcontext context_ = nullptr;
+  bool retained_primary_context_ = false;
+  CUmodule module_ = nullptr;
+  CUfunction function_ = nullptr;
+  std::string ptx_;
+  double jit_milliseconds_ = 0.0;
+};
 
 class PtxCompiledProgram {
  public:
@@ -32,12 +63,10 @@ class PtxCompiledProgram {
   PtxCompiledProgram(const PtxCompiledProgram&) = delete;
   PtxCompiledProgram& operator=(const PtxCompiledProgram&) = delete;
 
-  // Slice 1 accepts a deliberately small, straight-line arithmetic subset.
   // Unsupported bytecode is rejected with a source-PC error.
   bool Compile(const WvmFile& file, std::string& err);
 
-  // Execute from the canonical states supplied by the caller. Slice 1 starts
-  // only at pc=0 and runs through a final HALT; later slices add continuations.
+  // Execute from canonical states supplied by the caller through a safe exit.
   bool Launch(std::vector<VmState>& states, std::string& err) const;
 
   // Execute with canonical private RAM and framebuffer storage. Buffers are
@@ -46,9 +75,9 @@ class PtxCompiledProgram {
               uint32_t memory_words, std::vector<uint32_t>& framebuffers,
               std::vector<uint32_t>& frame_seq, std::string& err) const;
 
-  // Keep the batch resident and run one native kernel per HALT/YIELD
-  // checkpoint. Timing excludes allocation and host/device copies, but
-  // includes host launch scheduling and device execution.
+  // Bounded test harness: run one native launch per HALT/YIELD checkpoint.
+  // This is not the normal resident VM scheduler. Timing excludes allocation
+  // and host/device copies but includes launches and device execution.
   bool LaunchCheckpoints(std::vector<VmState>& states,
                          std::vector<uint32_t>& memory,
                          uint32_t memory_words,
@@ -71,10 +100,12 @@ class PtxCompiledProgram {
   mutable CUdeviceptr scratch_memory_ = 0;
   mutable CUdeviceptr scratch_framebuffers_ = 0;
   mutable CUdeviceptr scratch_frame_seq_ = 0;
+  mutable CUdeviceptr scratch_mailboxes_ = 0;
   mutable size_t scratch_states_bytes_ = 0;
   mutable size_t scratch_memory_bytes_ = 0;
   mutable size_t scratch_framebuffers_bytes_ = 0;
   mutable size_t scratch_frame_seq_bytes_ = 0;
+  mutable size_t scratch_mailboxes_bytes_ = 0;
   std::string ptx_;
   double jit_milliseconds_ = 0.0;
 };

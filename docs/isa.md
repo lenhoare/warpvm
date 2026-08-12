@@ -253,8 +253,10 @@ u32 header      // src_vm in low 16 bits, msg_type in high 16 bits
 u32 payload[3]
 ```
 
-Each VM has an inbound mailbox: a ring of 16 message slots. Producers claim a
-slot by atomically advancing `head`; the owner consumes from `tail`.
+Each VM has an inbound mailbox: a ring of 16 message slots. Multiple producers
+reserve positions through `head`; the owner consumes through `tail`. A
+per-slot publication sequence makes reservation, complete-message visibility,
+and slot reuse distinct ordered events.
 
 | Op | Name | Form | Semantics |
 |---|---|---|---|
@@ -364,10 +366,13 @@ literals: u32[literals_len]   // constant pool, referenced by LDW / S_LDW
 
 ## 8. Mailboxes
 
-Each VM has an inbound ring of 16 message slots (16 bytes each) with
-u32 `head` (writer, atomic) and `tail` (reader). Outbound traffic goes
-directly to the destination's inbound ring via `SEND`. Full mailbox:
-`SEND` faults (`FAULT_MSG`) in v0.1 (no blocking semantics yet).
+Each VM has an inbound ring of 16 logical message slots with u32 `head`
+(multi-producer reservation), `tail` (single owner), and one publication
+sequence per physical slot. A producer writes the message before publishing
+the sequence with release ordering; the receiver observes publication with
+acquire ordering before reading and releasing the slot. Outbound traffic goes
+directly to the destination's inbound ring via `SEND`. Full mailbox: `SEND`
+faults (`FAULT_MSG`) in v0.1 (no blocking semantics yet).
 
 ## 9. Assembly format (`.wva`)
 

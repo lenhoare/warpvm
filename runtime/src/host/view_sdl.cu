@@ -13,6 +13,7 @@
 
 #include "gpu/warpvm.cuh"
 #include "host/persistent.h"
+#include "host/ptx_compiler.h"
 #include "host/vm_image.h"
 #include "host/wvm_file.h"
 
@@ -56,7 +57,7 @@ SDL_Rect FitToWindow(SDL_Renderer* renderer, const ViewerLayout& layout) {
 }
 
 int RunViewer(const char* path, uint32_t resident_vms, uint32_t first_vm,
-              const ViewerLayout& layout) {
+              const ViewerLayout& layout, bool compiled) {
   WvmFile file;
   std::string err;
   if (!LoadWvm(path, file, err)) {
@@ -71,7 +72,21 @@ int RunViewer(const char* path, uint32_t resident_vms, uint32_t first_vm,
     image.mem_size_words = 16384;  // standard v0.1 VM RAM (64 KiB)
   }
   PersistentRuntime rt;
-  if (!rt.Init(images, err) || !rt.Launch(err)) {
+  PtxResidentProgram resident_program;
+  bool launched = rt.Init(images, err);
+  if (launched && compiled) {
+    launched = rt.EnsureStream(err) && resident_program.Compile(file, err) &&
+               resident_program.Launch(
+                   reinterpret_cast<CUdeviceptr>(rt.DeviceStates()),
+                   resident_vms,
+                   reinterpret_cast<CUdeviceptr>(rt.DeviceDescs()),
+                   reinterpret_cast<CUdeviceptr>(rt.DeviceControl()),
+                   reinterpret_cast<CUdeviceptr>(rt.DeviceMailboxes()),
+                   reinterpret_cast<CUstream>(rt.Stream()), err);
+  } else if (launched) {
+    launched = rt.Launch(err);
+  }
+  if (!launched) {
     std::fprintf(stderr, "error: %s\n", err.c_str());
     return 1;
   }
@@ -166,12 +181,13 @@ int RunViewer(const char* path, uint32_t resident_vms, uint32_t first_vm,
   }
 
   if (grid) {
-    std::printf("view: %u VMs from %s in a %ux%u grid "
+    std::printf("view%s: %u VMs from %s in a %ux%u grid "
                 "(close window or Esc to exit)\n",
+                compiled ? " (compiled resident)" : "",
                 layout.displayed_vms, path, layout.columns, layout.rows);
   } else {
-    std::printf("view: VM %u from %s (close window or Esc to exit)\n",
-                first_vm, path);
+    std::printf("view%s: VM %u from %s (close window or Esc to exit)\n",
+                compiled ? " (compiled resident)" : "", first_vm, path);
   }
 
   std::vector<uint32_t> framebuffers;
@@ -245,13 +261,13 @@ int RunViewer(const char* path, uint32_t resident_vms, uint32_t first_vm,
 
 }  // namespace
 
-int ViewSingleVm(const char* path, uint32_t vm_index) {
+int ViewSingleVm(const char* path, uint32_t vm_index, bool compiled) {
   // Boot enough VMs that the selected logical VM exists.
-  return RunViewer(path, vm_index + 1, vm_index, MakeSingleLayout());
+  return RunViewer(path, vm_index + 1, vm_index, MakeSingleLayout(), compiled);
 }
 
-int ViewVmGrid(const char* path, uint32_t n_vms) {
-  return RunViewer(path, n_vms, 0, MakeGridLayout(n_vms));
+int ViewVmGrid(const char* path, uint32_t n_vms, bool compiled) {
+  return RunViewer(path, n_vms, 0, MakeGridLayout(n_vms), compiled);
 }
 
 }  // namespace wvm

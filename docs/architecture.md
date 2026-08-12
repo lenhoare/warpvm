@@ -69,6 +69,10 @@ control.
 `warpvm attach` boots resident VMs and drives one through a console:
 `pause / step / resume / reset / regs / sregs / mem / pc / disasm / log`.
 
+With `attach ... --compiled`, inspection, pause/resume, reset, memory,
+framebuffer, and status use the same console. Single-instruction stepping is
+currently interpreter-only.
+
 - Inspection reads the VM's spilled `VmState` and its private RAM with
   `cudaMemcpy` while the kernel is resident (valid because a stopped VM's
   state is stable).
@@ -99,15 +103,14 @@ without terminating the kernel.
 Fixed 16-byte messages. The header packs `src_vm` (low 16 bits) and
 `msg_type` (high 16 bits); of the 3 payload words, v0.1 `SEND` transmits only
 `payload[0]` (`payload[1..2]` reserved). Each VM has a 16-slot inbound ring in
-a global mailbox array: `SEND` claims a slot with an atomic on the
-destination's `head`, the owner consumes from `tail`. v0.1: mailbox full ⇒
-`FAULT_MSG` (no blocking). `TRY_RECV` is non-blocking and returns a
+a global mailbox array. Each slot carries a publication sequence: a producer
+atomically reserves `head`, writes the complete message, performs a device
+release fence, then publishes the slot sequence. The single owner observes
+that sequence before reading and releases the slot for the next ring cycle.
+This prevents both over-reservation and observing a slot before its message is
+complete. v0.1: mailbox full ⇒ `FAULT_MSG` (no blocking). `TRY_RECV` is
+non-blocking and returns a
 got-message predicate.
-
-The claim-then-write / read-then-advance scheme has a small producer/consumer
-race window (a receiver could read a slot a sender is still filling). v0.1
-accepts this for cooperative traffic; a two-phase commit or per-slot flag is a
-later hardening if messaging becomes load-bearing.
 
 ## Graphics (v0.1.1)
 
@@ -143,6 +146,22 @@ Logical `vm_id` is stable; physical warp/SM placement is not part of VM
 identity. v0.1 does not migrate VMs, but state layout must not preclude it:
 everything a VM needs (program, RAM, state, mailbox) is reachable by
 pointer from the VM state block.
+
+The direct PTX engine has the same resident topology. Generated program code
+runs continuously in one warp per VM and receives pointers to the canonical
+descriptor/state array, VM RAM, framebuffer, mapped control plane, and shared
+mailbox pool. Backward branches and explicit `YIELD` instructions are safe
+control points; they publish live PC/instruction progress and observe
+pause/shutdown without ending normal execution. `FLIP`, `SEND`, and
+`TRY_RECV` operate directly on resident device state.
+
+Pausing spills registers and architectural state, then waits inside the same
+resident kernel. Resume continues from the saved PC; reset reconstructs the
+power-on register state and clears the framebuffer. HALT and faults publish
+their terminal state but the warp remains available for reset/run/exit until
+the runtime shuts down. Host/device transfers are therefore inspection and
+presentation operations, not the VM scheduler. The older checkpoint launcher
+remains only a bounded equivalence and benchmark harness.
 
 ## Display-GPU constraint
 

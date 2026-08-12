@@ -133,6 +133,11 @@ add_test(NAME warpc_015_live_capstone
           ${WVM_WARPC} $<TARGET_FILE:warpvm>
           ${CMAKE_SOURCE_DIR}/programs/warpc/warp_native_demo.wc
           ${CMAKE_BINARY_DIR}/warpc_015_live_capstone)
+add_test(NAME warpc_compiled_resident
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_compiled_resident.sh
+          ${WVM_WARPC} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/programs/warpc/warp_native_demo.wc
+          ${CMAKE_BINARY_DIR}/warpc_compiled_resident)
 add_test(NAME warpc_015_bench
   COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_015_bench.sh
           ${WVM_WARPC} $<TARGET_FILE:warpvm>

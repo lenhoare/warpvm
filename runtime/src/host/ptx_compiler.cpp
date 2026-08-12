@@ -3,9 +3,12 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <iomanip>
 #include <sstream>
 #include <string>
+
+#include "gpu/control.cuh"
 
 namespace wvm {
 namespace {
@@ -26,7 +29,8 @@ uint32_t SignExt13(uint32_t value) {
 
 std::string VReg(uint32_t index) { return "%v" + std::to_string(index); }
 
-bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err) {
+bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err,
+             bool resident = false) {
   if (file.code.empty()) {
     err = "cannot compile an empty program";
     return false;
@@ -34,6 +38,36 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err) {
 
   std::ostringstream body;
   bool found_safe_exit = false;
+  auto emit_resident_control_poll = [&](uint32_t resume_pc) {
+    if (!resident) return;
+    body << "    mov.u32 %t7, " << resume_pc << ";\n"
+         << "    mov.u32 %t10, 0;\n"
+         << "    mov.u32 %t11, 0;\n"
+         << "    setp.eq.u32 %p7, %t3, 0;\n"
+         << "    @%p7 ld.global.u32 %t10, [%rd17+"
+         << offsetof(Control, shutdown) << "];\n"
+         << "    @%p7 mul.wide.u32 %rd18, %vid, 4;\n"
+         << "    @%p7 add.u64 %rd18, %rd17, %rd18;\n"
+         << "    @%p7 st.global.u32 [%rd18+" << offsetof(Control, pc)
+         << "], %t7;\n"
+         << "    @%p7 st.global.u32 [%rd18+" << offsetof(Control, status)
+         << "], " << kRunning << ";\n"
+         << "    @%p7 mul.wide.u32 %rd19, %vid, 8;\n"
+         << "    @%p7 add.u64 %rd19, %rd17, %rd19;\n"
+         << "    @%p7 st.global.u64 [%rd19+" << offsetof(Control, instrs)
+         << "], %ic;\n"
+         << "    @%p7 ld.global.u32 %t11, [%rd18+"
+         << offsetof(Control, cmd) << "];\n"
+         << "    shfl.sync.idx.b32 %t10, %t10, 0, 0x1f, 0xffffffff;\n"
+         << "    shfl.sync.idx.b32 %t11, %t11, 0, 0x1f, 0xffffffff;\n"
+         << "    setp.ne.u32 %p8, %t10, 0;\n"
+         << "    @%p8 bra L_resident_shutdown;\n"
+         << "    setp.eq.u32 %p8, %t11, " << kCmdPause << ";\n"
+         << "    and.pred %p9, %p7, %p8;\n"
+         << "    @%p9 st.global.u32 [%rd18+" << offsetof(Control, cmd)
+         << "], 0;\n"
+         << "    @%p8 bra L_resident_pause;\n";
+  };
   for (uint32_t pc = 0; pc < file.code.size(); ++pc) {
     const uint32_t instruction = file.code[pc];
     const uint32_t op =
@@ -413,8 +447,135 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err) {
              << "    @%p3 add.u32 %t8, %t8, 1;\n"
              << "    @%p3 st.global.u32 [%rd11], %t8;\n";
         break;
+      case kSend: {
+        const std::string retry = "L_send_retry_" + std::to_string(pc);
+        const std::string full = "L_send_full_" + std::to_string(pc);
+        const std::string done = "L_send_done_" + std::to_string(pc);
+        body << "    mov.u32 %t10, 0;\n"
+             << "    setp.eq.u32 %p3, %t3, 0;\n"
+             << "    and.pred %p3, %p3, %p2;\n"
+             << "    @!%p3 bra " << done << ";\n"
+             << "    setp.eq.u64 %p4, %rd14, 0;\n"
+             << "    @%p4 bra " << full << ";\n"
+             << "    setp.ge.u32 %p4, " << VReg(rd) << ", %t0;\n"
+             << "    @%p4 bra " << full << ";\n"
+             << "    mul.wide.u32 %rd15, " << VReg(rd) << ", "
+             << sizeof(Mailbox) << ";\n"
+             << "    add.u64 %rd15, %rd14, %rd15;\n"
+             << retry << ":\n"
+             << "    atom.global.add.u32 %t11, [%rd15+"
+             << offsetof(Mailbox, head) << "], 0;\n"
+             << "    and.b32 %t12, %t11, " << (kMailboxSlots - 1) << ";\n"
+             << "    mul.wide.u32 %rd16, %t12, " << sizeof(MailboxSlot)
+             << ";\n"
+             << "    add.u64 %rd16, %rd15, %rd16;\n"
+             << "    add.u64 %rd16, %rd16, " << offsetof(Mailbox, slots)
+             << ";\n"
+             << "    atom.global.add.u32 %t13, [%rd16+"
+             << offsetof(MailboxSlot, sequence) << "], 0;\n"
+             << "    sub.s32 %t14, %t13, %t11;\n"
+             << "    setp.lt.s32 %p4, %t14, 0;\n"
+             << "    @%p4 bra " << full << ";\n"
+             << "    setp.gt.s32 %p4, %t14, 0;\n"
+             << "    @%p4 bra " << retry << ";\n"
+             << "    add.u32 %t13, %t11, 1;\n"
+             << "    atom.global.cas.b32 %t12, [%rd15+"
+             << offsetof(Mailbox, head) << "], %t11, %t13;\n"
+             << "    setp.ne.u32 %p4, %t12, %t11;\n"
+             << "    @%p4 bra " << retry << ";\n"
+             << "    and.b32 %t12, %vid, 65535;\n"
+             << "    and.b32 %t13, " << VReg(rs1) << ", 65535;\n"
+             << "    shl.b32 %t13, %t13, 16;\n"
+             << "    or.b32 %t12, %t12, %t13;\n"
+             << "    st.global.u32 [%rd16+"
+             << (offsetof(MailboxSlot, message) + offsetof(Message, header))
+             << "], %t12;\n"
+             << "    st.global.u32 [%rd16+"
+             << (offsetof(MailboxSlot, message) + offsetof(Message, payload))
+             << "], " << VReg(rs2) << ";\n"
+             << "    st.global.u32 [%rd16+"
+             << (offsetof(MailboxSlot, message) + offsetof(Message, payload) + 4)
+             << "], 0;\n"
+             << "    st.global.u32 [%rd16+"
+             << (offsetof(MailboxSlot, message) + offsetof(Message, payload) + 8)
+             << "], 0;\n"
+             << "    membar.gl;\n"
+             << "    add.u32 %t13, %t11, 1;\n"
+             << "    atom.global.exch.b32 %t12, [%rd16+"
+             << offsetof(MailboxSlot, sequence) << "], %t13;\n"
+             << "    bra " << done << ";\n"
+             << full << ":\n"
+             << "    mov.u32 %t10, 1;\n"
+             << done << ":\n"
+             << "    shfl.sync.idx.b32 %t10, %t10, 0, 0x1f, 0xffffffff;\n"
+             << "    setp.ne.u32 %p3, %t10, 0;\n"
+             << "    @%p3 sub.u64 %ic, %ic, 1;\n"
+             << "    @%p3 mov.u32 %t6, " << kFaulted << ";\n"
+             << "    @%p3 mov.u32 %t7, " << pc << ";\n"
+             << "    @%p3 mov.u32 %t4, " << kFaultMsg << ";\n"
+             << "    @%p3 bra L_save_fault;\n";
+        break;
+      }
+      case kTryRecv: {
+        if (rd >= kPredRegs) return reject("invalid receive predicate");
+        const std::string done = "L_recv_done_" + std::to_string(pc);
+        body << "    mov.u32 %t10, 0;\n"
+             << "    mov.u32 %t11, 0;\n"
+             << "    mov.u32 %t12, 0;\n"
+             << "    setp.eq.u32 %p3, %t3, 0;\n"
+             << "    and.pred %p3, %p3, %p2;\n"
+             << "    setp.ne.u64 %p4, %rd14, 0;\n"
+             << "    and.pred %p3, %p3, %p4;\n"
+             << "    @!%p3 bra " << done << ";\n"
+             << "    mul.wide.u32 %rd15, %vid, " << sizeof(Mailbox)
+             << ";\n"
+             << "    add.u64 %rd15, %rd14, %rd15;\n"
+             << "    atom.global.add.u32 %t13, [%rd15+"
+             << offsetof(Mailbox, tail) << "], 0;\n"
+             << "    and.b32 %t14, %t13, " << (kMailboxSlots - 1) << ";\n"
+             << "    mul.wide.u32 %rd16, %t14, " << sizeof(MailboxSlot)
+             << ";\n"
+             << "    add.u64 %rd16, %rd15, %rd16;\n"
+             << "    add.u64 %rd16, %rd16, " << offsetof(Mailbox, slots)
+             << ";\n"
+             << "    atom.global.add.u32 %t14, [%rd16+"
+             << offsetof(MailboxSlot, sequence) << "], 0;\n"
+             << "    add.u32 %t15, %t13, 1;\n"
+             << "    setp.ne.u32 %p4, %t14, %t15;\n"
+             << "    @%p4 bra " << done << ";\n"
+             << "    membar.gl;\n"
+             << "    ld.global.u32 %t12, [%rd16+"
+             << (offsetof(MailboxSlot, message) + offsetof(Message, header))
+             << "];\n"
+             << "    ld.global.u32 %t11, [%rd16+"
+             << (offsetof(MailboxSlot, message) + offsetof(Message, payload))
+             << "];\n"
+             << "    membar.gl;\n"
+             << "    add.u32 %t14, %t13, " << kMailboxSlots << ";\n"
+             << "    atom.global.exch.b32 %t15, [%rd16+"
+             << offsetof(MailboxSlot, sequence) << "], %t14;\n"
+             << "    add.u32 %t13, %t13, 1;\n"
+             << "    atom.global.exch.b32 %t15, [%rd15+"
+             << offsetof(Mailbox, tail) << "], %t13;\n"
+             << "    mov.u32 %t10, 1;\n"
+             << done << ":\n"
+             << "    shfl.sync.idx.b32 %t10, %t10, 0, 0x1f, 0xffffffff;\n"
+             << "    shfl.sync.idx.b32 %t11, %t11, 0, 0x1f, 0xffffffff;\n"
+             << "    shfl.sync.idx.b32 %t12, %t12, 0, 0x1f, 0xffffffff;\n"
+             << "    setp.ne.u32 %p3, %t10, 0;\n"
+             << "    selp.u32 %t13, 0xffffffff, 0, %p3;\n"
+             << "    not.b32 %t14, %t9;\n"
+             << "    and.b32 %m" << rd << ", %m" << rd << ", %t14;\n"
+             << "    and.b32 %t13, %t13, %t9;\n"
+             << "    or.b32 %m" << rd << ", %m" << rd << ", %t13;\n"
+             << "    and.pred %p3, %p3, %p2;\n"
+             << "    @%p3 mov.b32 " << VReg(rs1) << ", %t11;\n"
+             << "    @%p3 mov.b32 " << VReg(rs2) << ", %t12;\n";
+        break;
+      }
       case kJmp:
         if (lo >= file.code.size()) return reject("jump target is out of range");
+        if (lo <= pc) emit_resident_control_poll(lo);
         body << "    bra.uni L_pc_" << lo << ";\n";
         break;
       case kJmpIfAny: case kJmpIfAll: {
@@ -424,8 +585,15 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err) {
         const char* relation = op == kJmpIfAny ? "ne" : "eq";
         const uint32_t value = op == kJmpIfAny ? 0u : kFullMask;
         body << "    setp." << relation << ".u32 %p1, %t9, "
-             << value << ";\n"
-             << "    @%p1 bra L_pc_" << lo << ";\n";
+             << value << ";\n";
+        if (resident && lo <= pc) {
+          body << "    @!%p1 bra L_branch_fallthrough_" << pc << ";\n";
+          emit_resident_control_poll(lo);
+          body << "    bra.uni L_pc_" << lo << ";\n"
+               << "L_branch_fallthrough_" << pc << ":\n";
+        } else {
+          body << "    @%p1 bra L_pc_" << lo << ";\n";
+        }
         break;
       }
       case kCall:
@@ -470,49 +638,129 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err) {
         break;
       case kYield:
         found_safe_exit = true;
-        body << "    mov.u32 %t6, " << kPaused << ";\n"
-             << "    mov.u32 %t7, " << (pc + 1) << ";\n"
-             << "    bra.uni L_save;\n";
+        if (resident) {
+          emit_resident_control_poll(pc);
+        } else {
+          body << "    mov.u32 %t6, " << kPaused << ";\n"
+               << "    mov.u32 %t7, " << (pc + 1) << ";\n"
+               << "    bra.uni L_save;\n";
+        }
         break;
       default:
         return reject("unsupported by the minimal PTX backend");
     }
   }
-  if (!found_safe_exit) {
+  if (!found_safe_exit && !resident) {
     err = "compiled programs require at least one HALT or YIELD safe point";
     return false;
   }
 
+  auto emit_state_spill = [&](std::ostringstream& target) {
+    for (uint32_t reg = 0; reg < kVectorRegs; ++reg) {
+      const size_t offset = offsetof(VmState, vregs) +
+                            reg * kLanes * sizeof(uint32_t);
+      target << "    add.u64 %rd4, %rd2, " << offset << ";\n"
+             << "    add.u64 %rd4, %rd4, %rd3;\n"
+             << "    st.global.u32 [%rd4], " << VReg(reg) << ";\n";
+    }
+    target << "\n    setp.eq.u32 %p1, %t3, 0;\n";
+    for (uint32_t pred = 0; pred < kPredRegs; ++pred) {
+      const size_t offset = offsetof(VmState, preds) +
+                            pred * sizeof(uint32_t);
+      target << "    @%p1 st.global.u32 [%rd2+" << offset << "], %m"
+             << pred << ";\n";
+    }
+    for (uint32_t scalar = 0; scalar < kScalarRegs; ++scalar) {
+      const size_t offset = offsetof(VmState, sregs) +
+                            scalar * sizeof(uint32_t);
+      target << "    @%p1 st.global.u32 [%rd2+" << offset << "], %s"
+             << scalar << ";\n";
+    }
+    for (uint32_t depth = 0; depth < kCallDepth; ++depth) {
+      const size_t offset = offsetof(VmState, call_stack) +
+                            depth * sizeof(uint32_t);
+      target << "    @%p1 st.global.u32 [%rd2+" << offset << "], %cs"
+             << depth << ";\n";
+    }
+    target << "    @%p1 st.global.u32 [%rd2+"
+           << offsetof(VmState, call_depth) << "], %cd;\n"
+           << "    @%p1 st.global.u32 [%rd2+" << offsetof(VmState, vm_id)
+           << "], %vid;\n"
+           << "    @%p1 st.global.u32 [%rd2+" << offsetof(VmState, status)
+           << "], %t6;\n"
+           << "    @%p1 st.global.u32 [%rd2+" << offsetof(VmState, pc)
+           << "], %t7;\n"
+           << "    @%p1 st.global.u32 [%rd2+" << offsetof(VmState, fault_code)
+           << "], %t4;\n"
+           << "    @%p1 st.global.u64 [%rd2+"
+           << offsetof(VmState, instruction_counter) << "], %ic;\n";
+  };
+
+  auto emit_control_status = [&](std::ostringstream& target) {
+    target << "    @%p1 mul.wide.u32 %rd18, %vid, 4;\n"
+           << "    @%p1 add.u64 %rd18, %rd17, %rd18;\n"
+           << "    @%p1 st.global.u32 [%rd18+" << offsetof(Control, fault)
+           << "], %t4;\n"
+           << "    @%p1 st.global.u32 [%rd18+" << offsetof(Control, pc)
+           << "], %t7;\n"
+           << "    @%p1 mul.wide.u32 %rd19, %vid, 8;\n"
+           << "    @%p1 add.u64 %rd19, %rd17, %rd19;\n"
+           << "    @%p1 st.global.u64 [%rd19+" << offsetof(Control, instrs)
+           << "], %ic;\n"
+           << "    @%p1 st.global.u32 [%rd18+" << offsetof(Control, status)
+           << "], %t6;\n";
+  };
+
   std::ostringstream out;
   out << ".version 7.0\n"
       << ".target sm_70\n"
-      << ".address_size 64\n\n"
-      << ".visible .entry warpvm_compiled(\n"
-      << "    .param .u64 states_param,\n"
-      << "    .param .u32 num_vms_param,\n"
-      << "    .param .u64 memory_param,\n"
-      << "    .param .u32 memory_words_param,\n"
-      << "    .param .u64 framebuffer_param,\n"
-      << "    .param .u64 frame_seq_param\n"
-      << ")\n"
+      << ".address_size 64\n\n";
+  if (resident) {
+    out << ".visible .entry warpvm_compiled_resident(\n"
+        << "    .param .u64 states_param,\n"
+        << "    .param .u32 num_vms_param,\n"
+        << "    .param .u64 descs_param,\n"
+        << "    .param .u64 control_param,\n"
+        << "    .param .u64 mailboxes_param\n"
+        << ")\n";
+  } else {
+    out << ".visible .entry warpvm_compiled(\n"
+        << "    .param .u64 states_param,\n"
+        << "    .param .u32 num_vms_param,\n"
+        << "    .param .u64 memory_param,\n"
+        << "    .param .u32 memory_words_param,\n"
+        << "    .param .u64 framebuffer_param,\n"
+        << "    .param .u64 frame_seq_param,\n"
+        << "    .param .u64 mailboxes_param\n"
+        << ")\n";
+  }
+  out
       << ".maxntid 256, 1, 1\n"
       << "{\n"
-      << "    .reg .pred %p<8>;\n"
-      << "    .reg .b32 %t<10>;\n"
+      << "    .reg .pred %p<12>;\n"
+      << "    .reg .b32 %t<20>;\n"
       << "    .reg .b32 %v<16>;\n"
       << "    .reg .b32 %m<4>;\n"
       << "    .reg .b32 %s<8>;\n"
       << "    .reg .b32 %cs<8>;\n"
       << "    .reg .b32 %cd;\n"
       << "    .reg .b32 %vid;\n"
-      << "    .reg .b64 %rd<14>;\n"
+      << "    .reg .b64 %rd<20>;\n"
       << "    .reg .b64 %ic;\n\n"
       << "    ld.param.u64 %rd0, [states_param];\n"
-      << "    ld.param.u32 %t0, [num_vms_param];\n"
-      << "    ld.param.u64 %rd6, [memory_param];\n"
-      << "    ld.param.u32 %t5, [memory_words_param];\n"
-      << "    ld.param.u64 %rd8, [framebuffer_param];\n"
-      << "    ld.param.u64 %rd10, [frame_seq_param];\n"
+      << "    ld.param.u32 %t0, [num_vms_param];\n";
+  if (resident) {
+    out << "    ld.param.u64 %rd6, [descs_param];\n"
+        << "    ld.param.u64 %rd17, [control_param];\n"
+        << "    ld.param.u64 %rd14, [mailboxes_param];\n";
+  } else {
+    out << "    ld.param.u64 %rd6, [memory_param];\n"
+        << "    ld.param.u32 %t5, [memory_words_param];\n"
+        << "    ld.param.u64 %rd8, [framebuffer_param];\n"
+        << "    ld.param.u64 %rd10, [frame_seq_param];\n"
+        << "    ld.param.u64 %rd14, [mailboxes_param];\n";
+  }
+  out
       << "    mov.u32 %t1, %tid.x;\n"
       << "    mov.u32 %t4, %ctaid.x;\n"
       << "    mov.u32 %t2, %ntid.x;\n"
@@ -527,12 +775,25 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err) {
       << "];\n"
       << "    mul.wide.u32 %rd3, %t3, 4;\n\n";
 
-  out << "    mul.lo.u32 %t6, %t2, %t5;\n"
-      << "    mul.wide.u32 %rd5, %t6, 4;\n"
-      << "    add.u64 %rd7, %rd6, %rd5;\n"
-      << "    mul.wide.u32 %rd5, %t2, " << (kVideoWords * sizeof(uint32_t))
-      << ";\n"
-      << "    add.u64 %rd9, %rd8, %rd5;\n\n";
+  if (resident) {
+    out << "    mul.wide.u32 %rd19, %t2, " << sizeof(VmDesc) << ";\n"
+        << "    add.u64 %rd19, %rd6, %rd19;\n"
+        << "    ld.global.u64 %rd7, [%rd19+" << offsetof(VmDesc, mem)
+        << "];\n"
+        << "    ld.global.u32 %t5, [%rd19+"
+        << offsetof(VmDesc, mem_size_words) << "];\n"
+        << "    ld.global.u64 %rd9, [%rd19+" << offsetof(VmDesc, fb)
+        << "];\n"
+        << "    add.u64 %rd10, %rd17, " << offsetof(Control, frame_seq)
+        << ";\n\n";
+  } else {
+    out << "    mul.lo.u32 %t6, %t2, %t5;\n"
+        << "    mul.wide.u32 %rd5, %t6, 4;\n"
+        << "    add.u64 %rd7, %rd6, %rd5;\n"
+        << "    mul.wide.u32 %rd5, %t2, "
+        << (kVideoWords * sizeof(uint32_t)) << ";\n"
+        << "    add.u64 %rd9, %rd8, %rd5;\n\n";
+  }
 
   for (uint32_t reg = 0; reg < kVectorRegs; ++reg) {
     const size_t offset = offsetof(VmState, vregs) +
@@ -564,6 +825,39 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err) {
       << offsetof(VmState, instruction_counter) << "];\n";
   out << "    ld.global.u32 %t7, [%rd2+" << offsetof(VmState, pc)
       << "];\n";
+  if (resident) {
+    out << "    setp.eq.u32 %p7, %t3, 0;\n"
+        << "    @%p7 mul.wide.u32 %rd18, %vid, 4;\n"
+        << "    @%p7 add.u64 %rd18, %rd17, %rd18;\n"
+        << "    @%p7 st.global.u32 [%rd18+" << offsetof(Control, status)
+        << "], " << kIdle << ";\n"
+        << "L_resident_idle_wait:\n"
+        << "    mov.u32 %t10, 0;\n"
+        << "    mov.u32 %t11, 0;\n"
+        << "    @%p7 ld.global.u32 %t10, [%rd17+"
+        << offsetof(Control, shutdown) << "];\n"
+        << "    @%p7 mul.wide.u32 %rd18, %vid, 4;\n"
+        << "    @%p7 add.u64 %rd18, %rd17, %rd18;\n"
+        << "    @%p7 ld.global.u32 %t11, [%rd18+"
+        << offsetof(Control, cmd) << "];\n"
+        << "    shfl.sync.idx.b32 %t10, %t10, 0, 0x1f, 0xffffffff;\n"
+        << "    shfl.sync.idx.b32 %t11, %t11, 0, 0x1f, 0xffffffff;\n"
+        << "    setp.ne.u32 %p8, %t10, 0;\n"
+        << "    @%p8 bra L_resident_return_idle;\n"
+        << "    setp.eq.u32 %p8, %t11, " << kCmdRun << ";\n"
+        << "    and.pred %p9, %p7, %p8;\n"
+        << "    @%p9 st.global.u32 [%rd18+" << offsetof(Control, cmd)
+        << "], 0;\n"
+        << "    @%p8 mov.u32 %t16, 1;\n"
+        << "    @%p8 bra L_resident_reset;\n"
+        << "    nanosleep.u32 1000;\n"
+        << "    bra.uni L_resident_idle_wait;\n"
+        << "L_resident_start:\n"
+        << "    @%p7 st.global.u32 [%rd18+" << offsetof(Control, fault)
+        << "], 0;\n"
+        << "    @%p7 st.global.u32 [%rd18+" << offsetof(Control, status)
+        << "], " << kRunning << ";\n";
+  }
   out << "L_dispatch:\n";
   for (uint32_t pc = 0; pc < file.code.size(); ++pc) {
     out << "    setp.eq.u32 %p1, %t7, " << pc << ";\n"
@@ -571,53 +865,126 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err) {
   }
   out << "    bra.uni L_fault_jump;\n\n"
       << body.str()
-      << "\n    bra.uni L_fault_jump;\n\n"
-      << "L_fault_jump:\n"
+      << "\n    bra.uni L_fault_jump;\n\n";
+  if (resident) {
+    out << "L_resident_pause:\n"
+        << "    mov.u32 %t6, " << kPaused << ";\n"
+        << "    mov.u32 %t4, 0;\n";
+    emit_state_spill(out);
+    emit_control_status(out);
+    out << "L_resident_paused_wait:\n"
+        << "    mov.u32 %t10, 0;\n"
+        << "    mov.u32 %t11, 0;\n"
+        << "    @%p1 ld.global.u32 %t10, [%rd17+"
+        << offsetof(Control, shutdown) << "];\n"
+        << "    @%p1 ld.global.u32 %t11, [%rd18+"
+        << offsetof(Control, cmd) << "];\n"
+        << "    shfl.sync.idx.b32 %t10, %t10, 0, 0x1f, 0xffffffff;\n"
+        << "    shfl.sync.idx.b32 %t11, %t11, 0, 0x1f, 0xffffffff;\n"
+        << "    setp.ne.u32 %p8, %t10, 0;\n"
+        << "    @%p8 bra L_resident_shutdown;\n"
+        << "    setp.eq.u32 %p8, %t11, " << kCmdRun << ";\n"
+        << "    and.pred %p9, %p1, %p8;\n"
+        << "    @%p9 st.global.u32 [%rd18+" << offsetof(Control, cmd)
+        << "], 0;\n"
+        << "    @%p9 st.global.u32 [%rd18+" << offsetof(Control, status)
+        << "], " << kRunning << ";\n"
+        << "    @%p8 bra L_dispatch;\n"
+        << "    setp.eq.u32 %p8, %t11, " << kCmdReset << ";\n"
+        << "    and.pred %p9, %p1, %p8;\n"
+        << "    @%p9 st.global.u32 [%rd18+" << offsetof(Control, cmd)
+        << "], 0;\n"
+        << "    @%p8 mov.u32 %t16, 0;\n"
+        << "    @%p8 bra L_resident_reset;\n"
+        << "    setp.eq.u32 %p8, %t11, " << kCmdExit << ";\n"
+        << "    @%p8 bra L_resident_shutdown;\n"
+        << "    nanosleep.u32 1000;\n"
+        << "    bra.uni L_resident_paused_wait;\n"
+        << "L_resident_reset:\n";
+    for (uint32_t reg = 0; reg < kVectorRegs; ++reg)
+      out << "    mov.u32 " << VReg(reg) << ", 0;\n";
+    for (uint32_t pred = 0; pred < kPredRegs; ++pred)
+      out << "    mov.u32 %m" << pred << ", 0;\n";
+    for (uint32_t scalar = 0; scalar < kScalarRegs; ++scalar)
+      out << "    mov.u32 %s" << scalar << ", 0;\n";
+    for (uint32_t depth = 0; depth < kCallDepth; ++depth)
+      out << "    mov.u32 %cs" << depth << ", 0;\n";
+    out << "    mov.u32 %cd, 0;\n"
+        << "    mov.u64 %ic, 0;\n"
+        << "    mov.u32 %t7, 0;\n"
+        << "    mov.u32 %t4, 0;\n"
+        << "    mov.u32 %t6, " << kIdle << ";\n"
+        << "    mov.u32 %t12, %t3;\n"
+        << "L_resident_reset_frame:\n"
+        << "    setp.ge.u32 %p8, %t12, " << kVideoWords << ";\n"
+        << "    @%p8 bra L_resident_reset_frame_done;\n"
+        << "    mul.wide.u32 %rd16, %t12, 4;\n"
+        << "    add.u64 %rd16, %rd9, %rd16;\n"
+        << "    st.global.u32 [%rd16], " << kVideoResetColor << ";\n"
+        << "    add.u32 %t12, %t12, " << kLanes << ";\n"
+        << "    bra.uni L_resident_reset_frame;\n"
+        << "L_resident_reset_frame_done:\n";
+    emit_state_spill(out);
+    emit_control_status(out);
+    out << "    setp.ne.u32 %p8, %t16, 0;\n"
+        << "    @%p8 mov.u32 %t6, " << kRunning << ";\n"
+        << "    and.pred %p9, %p1, %p8;\n"
+        << "    @%p9 st.global.u32 [%rd18+" << offsetof(Control, status)
+        << "], " << kRunning << ";\n"
+        << "    @%p8 bra L_dispatch;\n"
+        << "    bra.uni L_resident_idle_wait;\n"
+        << "L_resident_shutdown:\n"
+        << "    mov.u32 %t6, " << kIdle << ";\n"
+        << "    mov.u32 %t4, 0;\n"
+        << "    bra.uni L_save_fault;\n"
+        << "L_resident_return_idle:\n"
+        << "    mov.u32 %t6, " << kIdle << ";\n"
+        << "    mov.u32 %t4, 0;\n"
+        << "    bra.uni L_save_fault;\n\n";
+  }
+  out << "L_fault_jump:\n"
       << "    mov.u32 %t6, " << kFaulted << ";\n"
       << "    mov.u32 %t4, " << kFaultJump << ";\n"
       << "    bra.uni L_save_fault;\n\n"
       << "L_save:\n"
       << "    mov.u32 %t4, 0;\n"
       << "L_save_fault:\n";
-  for (uint32_t reg = 0; reg < kVectorRegs; ++reg) {
-    const size_t offset = offsetof(VmState, vregs) +
-                          reg * kLanes * sizeof(uint32_t);
-    out << "    add.u64 %rd4, %rd2, " << offset << ";\n"
-        << "    add.u64 %rd4, %rd4, %rd3;\n"
-        << "    st.global.u32 [%rd4], " << VReg(reg) << ";\n";
+  emit_state_spill(out);
+  if (resident) {
+    emit_control_status(out);
+    out << "    setp.eq.u32 %p8, %t6, " << kIdle << ";\n"
+        << "    @%p8 ret;\n"
+        << "L_resident_stopped_wait:\n"
+        << "    mov.u32 %t10, 0;\n"
+        << "    mov.u32 %t11, 0;\n"
+        << "    @%p1 ld.global.u32 %t10, [%rd17+"
+        << offsetof(Control, shutdown) << "];\n"
+        << "    @%p1 mul.wide.u32 %rd18, %vid, 4;\n"
+        << "    @%p1 add.u64 %rd18, %rd17, %rd18;\n"
+        << "    @%p1 ld.global.u32 %t11, [%rd18+"
+        << offsetof(Control, cmd) << "];\n"
+        << "    shfl.sync.idx.b32 %t10, %t10, 0, 0x1f, 0xffffffff;\n"
+        << "    shfl.sync.idx.b32 %t11, %t11, 0, 0x1f, 0xffffffff;\n"
+        << "    setp.ne.u32 %p8, %t10, 0;\n"
+        << "    @%p8 bra L_resident_shutdown;\n"
+        << "    setp.eq.u32 %p8, %t11, " << kCmdRun << ";\n"
+        << "    and.pred %p9, %p1, %p8;\n"
+        << "    @%p9 st.global.u32 [%rd18+" << offsetof(Control, cmd)
+        << "], 0;\n"
+        << "    @%p8 mov.u32 %t16, 1;\n"
+        << "    @%p8 bra L_resident_reset;\n"
+        << "    setp.eq.u32 %p8, %t11, " << kCmdReset << ";\n"
+        << "    and.pred %p9, %p1, %p8;\n"
+        << "    @%p9 st.global.u32 [%rd18+" << offsetof(Control, cmd)
+        << "], 0;\n"
+        << "    @%p8 mov.u32 %t16, 0;\n"
+        << "    @%p8 bra L_resident_reset;\n"
+        << "    setp.eq.u32 %p8, %t11, " << kCmdExit << ";\n"
+        << "    @%p8 bra L_resident_shutdown;\n"
+        << "    nanosleep.u32 1000;\n"
+        << "    bra.uni L_resident_stopped_wait;\n";
   }
-  out << "\n    setp.eq.u32 %p1, %t3, 0;\n";
-  for (uint32_t pred = 0; pred < kPredRegs; ++pred) {
-    const size_t offset = offsetof(VmState, preds) +
-                          pred * sizeof(uint32_t);
-    out << "    @%p1 st.global.u32 [%rd2+" << offset << "], %m"
-        << pred << ";\n";
-  }
-  for (uint32_t scalar = 0; scalar < kScalarRegs; ++scalar) {
-    const size_t offset = offsetof(VmState, sregs) +
-                          scalar * sizeof(uint32_t);
-    out << "    @%p1 st.global.u32 [%rd2+" << offset << "], %s"
-        << scalar << ";\n";
-  }
-  for (uint32_t depth = 0; depth < kCallDepth; ++depth) {
-    const size_t offset = offsetof(VmState, call_stack) + depth * sizeof(uint32_t);
-    out << "    @%p1 st.global.u32 [%rd2+" << offset << "], %cs" << depth
-        << ";\n";
-  }
-  out << "    @%p1 st.global.u32 [%rd2+" << offsetof(VmState, call_depth)
-      << "], %cd;\n";
-
-  out << "    @%p1 st.global.u32 [%rd2+" << offsetof(VmState, vm_id)
-      << "], %vid;\n"
-      << "    @%p1 st.global.u32 [%rd2+" << offsetof(VmState, status)
-      << "], %t6;\n"
-      << "    @%p1 st.global.u32 [%rd2+" << offsetof(VmState, pc)
-      << "], %t7;\n"
-      << "    @%p1 st.global.u32 [%rd2+" << offsetof(VmState, fault_code)
-      << "], %t4;\n"
-      << "    @%p1 st.global.u64 [%rd2+"
-      << offsetof(VmState, instruction_counter) << "], %ic;\n"
-      << "    ret;\n"
+  out << "    ret;\n"
       << "}\n";
   ptx = out.str();
   return true;
@@ -627,11 +994,108 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err) {
 
 bool TranslateWvmToPtx(const WvmFile& file, std::string& ptx,
                        std::string& err) {
-  return EmitPtx(file, ptx, err);
+  return EmitPtx(file, ptx, err, false);
+}
+
+bool TranslateWvmToResidentPtx(const WvmFile& file, std::string& ptx,
+                               std::string& err) {
+  return EmitPtx(file, ptx, err, true);
+}
+
+PtxResidentProgram::~PtxResidentProgram() {
+  if (context_ != nullptr) cuCtxSetCurrent(context_);
+  if (module_ != nullptr) cuModuleUnload(module_);
+  if (retained_primary_context_) cuDevicePrimaryCtxRelease(device_);
+}
+
+bool PtxResidentProgram::Compile(const WvmFile& file, std::string& err) {
+  if (module_ != nullptr) {
+    cuModuleUnload(module_);
+    module_ = nullptr;
+    function_ = nullptr;
+  }
+  if (!TranslateWvmToResidentPtx(file, ptx_, err)) return false;
+  CUresult result = cuInit(0);
+  if (result != CUDA_SUCCESS) {
+    err = "CUDA driver initialization failed: " + DriverError(result);
+    return false;
+  }
+  if (!retained_primary_context_) {
+    result = cuDeviceGet(&device_, 0);
+    if (result != CUDA_SUCCESS) {
+      err = "CUDA device lookup failed: " + DriverError(result);
+      return false;
+    }
+    result = cuDevicePrimaryCtxRetain(&context_, device_);
+    if (result != CUDA_SUCCESS) {
+      err = "CUDA primary-context creation failed: " + DriverError(result);
+      context_ = nullptr;
+      return false;
+    }
+    retained_primary_context_ = true;
+  }
+  result = cuCtxSetCurrent(context_);
+  if (result != CUDA_SUCCESS) {
+    err = "CUDA context activation failed: " + DriverError(result);
+    return false;
+  }
+  const auto start = std::chrono::steady_clock::now();
+  char error_log[8192] = {};
+  CUjit_option options[] = {CU_JIT_ERROR_LOG_BUFFER,
+                            CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES};
+  void* values[] = {
+      error_log,
+      reinterpret_cast<void*>(static_cast<uintptr_t>(sizeof(error_log)))};
+  result = cuModuleLoadDataEx(&module_, ptx_.c_str(), 2, options, values);
+  const auto stop = std::chrono::steady_clock::now();
+  jit_milliseconds_ =
+      std::chrono::duration<double, std::milli>(stop - start).count();
+  if (result != CUDA_SUCCESS) {
+    err = "resident PTX JIT failed: " + DriverError(result);
+    if (error_log[0] != '\0') err += "\n" + std::string(error_log);
+    module_ = nullptr;
+    return false;
+  }
+  result = cuModuleGetFunction(&function_, module_,
+                               "warpvm_compiled_resident");
+  if (result != CUDA_SUCCESS) {
+    err = "resident compiled kernel lookup failed: " + DriverError(result);
+    cuModuleUnload(module_);
+    module_ = nullptr;
+    function_ = nullptr;
+    return false;
+  }
+  return true;
+}
+
+bool PtxResidentProgram::Launch(CUdeviceptr states, uint32_t num_vms,
+                                CUdeviceptr descs, CUdeviceptr control,
+                                CUdeviceptr mailboxes, CUstream stream,
+                                std::string& err) const {
+  if (function_ == nullptr || num_vms == 0) {
+    err = "resident compiled launch requires a program and VMs";
+    return false;
+  }
+  CUresult result = cuCtxSetCurrent(context_);
+  if (result != CUDA_SUCCESS) {
+    err = "CUDA context activation failed: " + DriverError(result);
+    return false;
+  }
+  void* parameters[] = {&states, &num_vms, &descs, &control, &mailboxes};
+  constexpr uint32_t block = 256;
+  const uint32_t grid = (num_vms * kLanes + block - 1) / block;
+  result = cuLaunchKernel(function_, grid, 1, 1, block, 1, 1, 0, stream,
+                          parameters, nullptr);
+  if (result != CUDA_SUCCESS) {
+    err = "resident compiled kernel launch failed: " + DriverError(result);
+    return false;
+  }
+  return true;
 }
 
 PtxCompiledProgram::~PtxCompiledProgram() {
   if (context_ != nullptr) cuCtxSetCurrent(context_);
+  if (scratch_mailboxes_ != 0) cuMemFree(scratch_mailboxes_);
   if (scratch_frame_seq_ != 0) cuMemFree(scratch_frame_seq_);
   if (scratch_framebuffers_ != 0) cuMemFree(scratch_framebuffers_);
   if (scratch_memory_ != 0) cuMemFree(scratch_memory_);
@@ -804,6 +1268,7 @@ bool PtxCompiledProgram::LaunchCheckpoints(
   const size_t memory_bytes = memory.size() * sizeof(uint32_t);
   const size_t framebuffer_bytes = framebuffers.size() * sizeof(uint32_t);
   const size_t frame_seq_bytes = frame_seq.size() * sizeof(uint32_t);
+  const size_t mailbox_bytes = states.size() * sizeof(Mailbox);
   if (!reserve(scratch_states_, scratch_states_bytes_, bytes,
                "compiled-state") ||
       !reserve(scratch_memory_, scratch_memory_bytes_, memory_bytes,
@@ -811,13 +1276,16 @@ bool PtxCompiledProgram::LaunchCheckpoints(
       !reserve(scratch_framebuffers_, scratch_framebuffers_bytes_,
                framebuffer_bytes, "compiled-framebuffer") ||
       !reserve(scratch_frame_seq_, scratch_frame_seq_bytes_, frame_seq_bytes,
-               "compiled-frame-counter"))
+               "compiled-frame-counter") ||
+      !reserve(scratch_mailboxes_, scratch_mailboxes_bytes_, mailbox_bytes,
+               "compiled-mailboxes"))
     return false;
   CUdeviceptr device_states = scratch_states_;
   CUdeviceptr device_memory = memory.empty() ? 0 : scratch_memory_;
   CUdeviceptr device_framebuffers =
       framebuffers.empty() ? 0 : scratch_framebuffers_;
   CUdeviceptr device_frame_seq = frame_seq.empty() ? 0 : scratch_frame_seq_;
+  CUdeviceptr device_mailboxes = scratch_mailboxes_;
   auto fail = [&](const char* operation, CUresult failure) {
     err = std::string(operation) + ": " + DriverError(failure);
     return false;
@@ -839,11 +1307,20 @@ bool PtxCompiledProgram::LaunchCheckpoints(
     if (result != CUDA_SUCCESS)
       return fail("compiled-frame-counter upload failed", result);
   }
+  std::vector<Mailbox> mailboxes(states.size());
+  for (Mailbox& mailbox : mailboxes) {
+    std::memset(&mailbox, 0, sizeof(mailbox));
+    for (uint32_t slot = 0; slot < kMailboxSlots; ++slot)
+      mailbox.slots[slot].sequence = slot;
+  }
+  result = cuMemcpyHtoD(device_mailboxes, mailboxes.data(), mailbox_bytes);
+  if (result != CUDA_SUCCESS)
+    return fail("compiled-mailbox upload failed", result);
 
   uint32_t num_vms = static_cast<uint32_t>(states.size());
   void* parameters[] = {&device_states, &num_vms, &device_memory,
                         &memory_words, &device_framebuffers,
-                        &device_frame_seq};
+                        &device_frame_seq, &device_mailboxes};
   constexpr uint32_t kBlockThreads = 256;
   const uint32_t grid =
       (num_vms * kLanes + kBlockThreads - 1) / kBlockThreads;

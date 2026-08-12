@@ -104,8 +104,10 @@ The same built-in header exposes the existing VM mailboxes as
 `warp_try_recv(&payload, &metadata)`. Successful receives return nonzero and
 write metadata as `(type << 16) | source_vm`. Both operations are VM-wide and
 therefore rejected inside divergent control flow. Mailboxes exist on resident
-VMs; a program using them should run through `view`, `serve`, or `attach`, not
-the mailbox-free one-shot runner or the current PTX backend.
+VMs. A program using them may run through `view`, `serve`, or `attach` in the
+interpreter, or through the continuously resident PTX engine selected with
+`--compiled`. The one-shot compiled runner supports bounded messaging tests,
+but it is not the normal live-machine execution model.
 
 No implicit clipping or bounds check is added to `warp_set_pixel`; invalid
 coordinates retain the architecture's normal memory-fault behaviour.
@@ -279,8 +281,9 @@ ballot masks; cooperative copy/fill tails at lengths 0, 1, 31, 32, 33, 63,
 64, 65, and 100; and full-frame cooperative graphics. A bounded,
 messaging-free native demo combines all four features and must match complete
 interpreter/PTX state, RAM, framebuffer, and frame sequence. Its persistent
-counterpart boots 64 communicating VMs, and the live check requires all to
-remain healthy, publish frames, and receive a real neighbour message.
+counterpart boots 64 communicating VMs in either engine, and the live checks
+require all to remain healthy, publish frames, receive a real neighbour
+message, and respond to explicit pause/resume control.
 
 The paired sequential/cooperative data benchmark checks every direct-compiled
 sample against the logical interpreter before recording timings. On the RTX

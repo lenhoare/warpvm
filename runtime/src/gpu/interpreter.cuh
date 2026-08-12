@@ -656,22 +656,13 @@ __device__ StopReason VmRun(VmCtx& ctx, Control* ctrl = nullptr,
             if (dest >= ctx.num_vms) {
               err = 1;
             } else {
-              Mailbox& mb = ctx.mailboxes[dest];
-              const uint32_t h = mb.head;
-              const uint32_t t = mb.tail;
-              if (h - t >= kMailboxSlots) {
-                err = 1;  // mailbox full
-              } else {
-                const uint32_t slot =
-                    atomicAdd(const_cast<uint32_t*>(&mb.head), 1u);
-                Message m;
-                m.header = (ctx.vm_id & 0xFFFFu) |
-                           ((vregs.Get(rs1) & 0xFFFFu) << 16);
-                m.payload[0] = vregs.Get(rs2);
-                m.payload[1] = 0;
-                m.payload[2] = 0;
-                mb.slots[slot % kMailboxSlots] = m;
-              }
+              Message m;
+              m.header = (ctx.vm_id & 0xFFFFu) |
+                         ((vregs.Get(rs1) & 0xFFFFu) << 16);
+              m.payload[0] = vregs.Get(rs2);
+              m.payload[1] = 0;
+              m.payload[2] = 0;
+              if (!MailboxTrySend(ctx.mailboxes[dest], m)) err = 1;
             }
           }
         }
@@ -688,13 +679,9 @@ __device__ StopReason VmRun(VmCtx& ctx, Control* ctrl = nullptr,
           break;
         }
         uint32_t got = 0, payload = 0, meta = 0;
-        if (ctx.lane == 0 && ctx.mailboxes != nullptr) {
-          Mailbox& mb = ctx.mailboxes[ctx.vm_id];
-          const uint32_t h = mb.head;
-          const uint32_t t = mb.tail;
-          if (h != t) {
-            const Message m = mb.slots[t % kMailboxSlots];
-            mb.tail = t + 1;
+        if (active && ctx.lane == 0 && ctx.mailboxes != nullptr) {
+          Message m;
+          if (MailboxTryReceive(ctx.mailboxes[ctx.vm_id], m)) {
             got = 1;
             payload = m.payload[0];
             meta = m.header;

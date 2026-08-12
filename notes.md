@@ -757,9 +757,40 @@ fill, reduction, ballot, full 128x128 graphics, VM identity, and genuine ring
 mailbox traffic. In the initial live run all 64 machines remained `RUNNING / OK`;
 VM 0 published 163 frames in four seconds and had received two messages.
 
-Messaging remains intentionally limited to the persistent interpreter because
-the direct PTX execution path has no resident mailbox system. A bounded,
-messaging-free three-frame counterpart exercises every other feature and
-matches complete interpreter/PTX state, RAM, framebuffer, and frame sequence.
-This is an execution-mode boundary rather than a missing collective or ISA
-primitive.
+The original v0.1.5 checkpoint intentionally left messaging to the persistent
+interpreter while the direct PTX path lacked a resident mailbox system. The
+bounded, messaging-free three-frame counterpart established equivalence for
+all other features and isolated that runtime boundary for the following work.
+
+## 27. Compiled VMs must be resident machines, not checkpoint batches
+
+**Discovered by:** compiled messaging integration
+
+**Classification:** runtime/compiled ABI implementation; no ISA change
+
+The original PTX `LaunchCheckpoints` interface is useful for finite
+interpreter-equivalence tests, but upload/run-to-YIELD/synchronize/download is
+not WarpVM's machine model. The compiled engine now launches generated PTX
+once and keeps one warp per VM resident. RAM, framebuffer, mailbox, control,
+and canonical state pools remain device-accessible while execution continues.
+Backward branches and `YIELD` are asynchronous control observation points;
+state spills occur for explicit pause, reset, halt, fault, or shutdown rather
+than every frame or scheduling quantum.
+
+`SEND` and `TRY_RECV` now lower directly in PTX against the same mailbox ABI as
+the interpreter. Tests cover cross-VM delivery, false-guard non-consumption,
+FIFO order, two complete ring cycles, exact 16-slot capacity, and invalid/full
+faults. `view`, `serve`, and `attach` select this engine with `--compiled`.
+
+The integration also exposed a pre-existing mailbox publication race. Merely
+incrementing `head` before filling the slot allowed a receiver to observe an
+incomplete message, while check-then-increment could over-reserve the final
+slot under multiple producers. Per-slot sequence numbers now separate atomic
+reservation, release publication, acquire consumption, and reuse. This is a
+shared implementation correction, not a change to the ISA's FIFO/full/error
+semantics.
+
+On the 64-VM warp-native graphics/message capstone, the interpreter averaged
+43.46 published frames/s per VM and compiled resident PTX averaged 792.55,
+an 18.24x improvement. All machines remained healthy, exchanged messages,
+published frames, accepted pause/resume, and shut down cleanly.

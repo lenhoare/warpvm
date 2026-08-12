@@ -37,13 +37,68 @@ struct Message {
   uint32_t payload[3];
 };
 
-// Per-VM inbound mailbox: a ring of kMailboxSlots messages. Producers claim a
-// slot by atomically advancing head; the owner consumes from tail.
+// One publication-controlled ring slot. `sequence` follows the bounded
+// multi-producer/single-consumer queue convention: an empty slot at logical
+// position p contains p, and a published slot contains p+1. This prevents a
+// consumer from observing head advancement before the message is complete.
+struct MailboxSlot {
+  volatile uint32_t sequence;
+  Message message;
+};
+
+// Per-VM inbound mailbox. Multiple VMs may send concurrently; only the owner
+// consumes. head reserves positions, tail is the owner's next position, and
+// per-slot sequences provide capacity control plus publication ordering.
 struct Mailbox {
   volatile uint32_t head;
   volatile uint32_t tail;
-  Message slots[kMailboxSlots];
+  MailboxSlot slots[kMailboxSlots];
 };
+
+#ifdef __CUDACC__
+// Non-blocking MPSC enqueue. The sequence CAS prevents over-reservation when
+// multiple producers encounter the final free slot concurrently.
+__device__ inline bool MailboxTrySend(Mailbox& mailbox,
+                                      const Message& message) {
+  for (;;) {
+    const uint32_t position =
+        atomicAdd(const_cast<uint32_t*>(&mailbox.head), 0u);
+    MailboxSlot& slot = mailbox.slots[position % kMailboxSlots];
+    const uint32_t sequence =
+        atomicAdd(const_cast<uint32_t*>(&slot.sequence), 0u);
+    const int32_t difference =
+        static_cast<int32_t>(sequence - position);
+    if (difference < 0) return false;  // ring is full
+    if (difference > 0) continue;      // another producer moved head
+    if (atomicCAS(const_cast<uint32_t*>(&mailbox.head), position,
+                  position + 1u) != position)
+      continue;
+
+    slot.message = message;
+    __threadfence();
+    atomicExch(const_cast<uint32_t*>(&slot.sequence), position + 1u);
+    return true;
+  }
+}
+
+// Non-blocking single-consumer dequeue. A reserved but not yet published slot
+// is indistinguishable from an empty mailbox at this instant, which is valid
+// for TRY_RECV: the concurrent SEND has not completed yet.
+__device__ inline bool MailboxTryReceive(Mailbox& mailbox, Message& message) {
+  const uint32_t position = mailbox.tail;
+  MailboxSlot& slot = mailbox.slots[position % kMailboxSlots];
+  const uint32_t sequence =
+      atomicAdd(const_cast<uint32_t*>(&slot.sequence), 0u);
+  if (sequence != position + 1u) return false;
+  __threadfence();
+  message = slot.message;
+  __threadfence();
+  atomicExch(const_cast<uint32_t*>(&slot.sequence),
+             position + kMailboxSlots);
+  atomicExch(const_cast<uint32_t*>(&mailbox.tail), position + 1u);
+  return true;
+}
+#endif
 
 // ---- VM status (isa.md §6) ---------------------------------------------
 enum Status : uint32_t {
