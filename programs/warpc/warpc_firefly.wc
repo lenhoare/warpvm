@@ -107,7 +107,7 @@ int main(void)
 
         /* 512 iterations x 32 lanes = one complete 128x128 framebuffer. */
         for (unsigned batch = 0; batch < 512; ++batch) {
-            unsigned index = batch * 32 + warp_lane_id();
+            unsigned index = batch * 32 + WARP;
             unsigned pixel_x = index & 127;
             unsigned pixel_y = index >> 7;
             int offset_x = pixel_x - firefly_x;

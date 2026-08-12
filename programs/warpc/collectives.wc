@@ -1,0 +1,51 @@
+#include <warp.h>
+
+int main(void)
+{
+    int lane = WARP;
+    int result = 42;
+    int selected_lane = 7 + (warp_vm_id() & 0);
+
+    if (warp_broadcast(lane * 3, 7) != 21)
+        result = 0;
+    if (warp_broadcast(lane * 3, selected_lane) != 21)
+        result = 0;
+    if (warp_shuffle(lane * 3, 31 - lane) != (31 - lane) * 3)
+        result = 0;
+    if (warp_shuffle_xor(lane, 1) != (lane ^ 1))
+        result = 0;
+
+    if (warp_ballot(lane < 16) != 0x0000ffffu)
+        result = 0;
+    if (!warp_any(lane == 31))
+        result = 0;
+    if (warp_any(lane == 32))
+        result = 0;
+    if (!warp_all(lane < 32))
+        result = 0;
+    if (warp_all(lane < 31))
+        result = 0;
+
+    if (warp_reduce_add(lane) != 496)
+        result = 0;
+    if (warp_reduce_add_u(lane) != 496u)
+        result = 0;
+    if (warp_reduce_min(lane - 16) != -16)
+        result = 0;
+    if (warp_reduce_max(lane - 16) != 15)
+        result = 0;
+    if (warp_reduce_min_u(lane) != 0u)
+        result = 0;
+    if (warp_reduce_max_u(lane) != 31u)
+        result = 0;
+
+    unsigned bits = 0xffffffe0u | lane;
+    if (warp_reduce_and(bits) != 0xffffffe0u)
+        result = 0;
+    if (warp_reduce_or(lane) != 31u)
+        result = 0;
+    if (warp_reduce_xor(lane) != 0u)
+        result = 0;
+
+    return result;
+}

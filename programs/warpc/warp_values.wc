@@ -1,0 +1,20 @@
+#include <warp.h>
+
+/* Globals are shared by the 32 lanes. Automatic arrays remain lane-private. */
+unsigned lane_values[32];
+unsigned lane_squares[32];
+
+int main(void)
+{
+    lane_values[WARP] = WARP;
+    lane_squares[WARP] = WARP * WARP;
+
+    int result = 42;
+    if (WARP != warp_lane_id())
+        result = 0;
+    if (lane_values[WARP] != WARP)
+        result = 0;
+    if (lane_squares[WARP] != WARP * WARP)
+        result = 0;
+    return result;
+}

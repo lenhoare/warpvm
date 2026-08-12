@@ -1,0 +1,53 @@
+#include <warp.h>
+
+unsigned source_words[128];
+unsigned target_words[128];
+
+int test_length(unsigned words)
+{
+    unsigned sentinel = 0xdeadbeefu;
+    unsigned fill = 0x12345678u;
+    int ok = 1;
+
+    for (unsigned base = 0; base < 128; base += 32) {
+        unsigned i = base + WARP;
+        source_words[i] = 1000u + i;
+        target_words[i] = sentinel;
+    }
+
+    warp_memcpy(target_words, source_words, words);
+    for (unsigned base = 0; base < 128; base += 32) {
+        unsigned i = base + WARP;
+        unsigned expected = sentinel;
+        if (i < words)
+            expected = source_words[i];
+        if (target_words[i] != expected)
+            ok = 0;
+    }
+
+    warp_memset(target_words, fill, words);
+    for (unsigned base = 0; base < 128; base += 32) {
+        unsigned i = base + WARP;
+        unsigned expected = sentinel;
+        if (i < words)
+            expected = fill;
+        if (target_words[i] != expected)
+            ok = 0;
+    }
+    return ok;
+}
+
+int main(void)
+{
+    int ok = 1;
+    ok &= test_length(0);
+    ok &= test_length(1);
+    ok &= test_length(31);
+    ok &= test_length(32);
+    ok &= test_length(33);
+    ok &= test_length(63);
+    ok &= test_length(64);
+    ok &= test_length(65);
+    ok &= test_length(100);
+    return ok * 42;
+}

@@ -1,0 +1,58 @@
+#include <warp.h>
+
+unsigned activity[32];
+unsigned history[64];
+unsigned current_energy;
+unsigned bright_mask;
+
+int main(void)
+{
+    unsigned *fb = warp_framebuffer();
+    unsigned vm = warp_vm_id();
+    int result = 42;
+    warp_memset(history, 0, 64);
+
+    for (unsigned frame = 0; frame < 3; ++frame) {
+        warp_memcpy(history + 32, history, 32);
+        activity[WARP] = (frame + WARP * 11 + vm * 7) & 31;
+        history[WARP] = activity[WARP];
+
+        current_energy = warp_reduce_add_u(activity[WARP]);
+        bright_mask = warp_ballot(activity[WARP] > 23);
+        for (unsigned y = 0; y < WARP_VIDEO_HEIGHT; ++y) {
+            for (unsigned base = 0; base < WARP_VIDEO_WIDTH; base += 32) {
+                unsigned x = base + WARP;
+                unsigned memory = history[WARP];
+                memory += history[32 + WARP];
+                unsigned blue = x;
+                blue ^= y;
+                blue ^= frame;
+                blue &= 63;
+                unsigned lane_bit = x & 31;
+                lane_bit = bright_mask >> lane_bit;
+                if (lane_bit & 1)
+                    blue += 96;
+                unsigned red = x;
+                red += vm * 5;
+                red += memory;
+                red &= 255;
+                lane_bit = current_energy;
+                lane_bit >>= 4;
+                lane_bit += y;
+                lane_bit &= 255;
+                memory = 0xff000000u;
+                red <<= 16;
+                lane_bit <<= 8;
+                memory |= red;
+                memory |= lane_bit;
+                memory |= blue;
+                fb[y * WARP_VIDEO_WIDTH + x] = memory;
+            }
+        }
+        warp_flip();
+    }
+
+    if (warp_reduce_add_u(activity[WARP]) == 0)
+        result = 0;
+    return result;
+}

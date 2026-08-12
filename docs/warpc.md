@@ -5,7 +5,8 @@ a lexer, parser, typed semantic tree, uniformity analysis, and direct WarpVM
 assembly lowering. The generated assembly is passed to the existing Rust
 assembler library in-process, producing a canonical `.wvm` file.
 
-This document describes the implemented v0.1.4 Slice A through F checkpoints.
+This document describes the implemented v0.1.4 Slice A through F compiler and
+the v0.1.5 warp-native language/library slice.
 
 ## Command line
 
@@ -78,6 +79,14 @@ The compiler injects the Warp intrinsics directly:
 - `warp_lane_id()` returns lane 0–31 and is divergent;
 - `warp_vm_id()` returns the current VM ID and is uniform within a VM.
 
+v0.1.5 also makes `WARP` a predefined `int` expression containing the current
+lane ID. It is divergent, cannot be declared, assigned, incremented, or have
+its address taken, and has no backing memory object. Generated entry code
+initializes the reserved lane register once. `WARP` is deliberately not an
+integer constant expression, so it cannot be used as an array bound or case
+label. Automatic arrays remain private to each lane; cooperative arrays should
+therefore be globals or reached through pointers to shared VM RAM.
+
 Slice F also accepts `#include <warp.h>` as its one built-in include. This is
 deliberately not a general preprocessor: other `#` directives are diagnosed.
 The interface and its matching documentation header at `include/warp.h`
@@ -102,6 +111,34 @@ No implicit clipping or bounds check is added to `warp_set_pixel`; invalid
 coordinates retain the architecture's normal memory-fault behaviour.
 `warp_flip()` is rejected inside divergent control because publication is one
 VM-wide event, while framebuffer stores may be lane-predicated normally.
+
+## Warp-wide collectives and cooperative memory
+
+The v0.1.5 `<warp.h>` interface exposes the existing warp-wide execution
+machinery as C values:
+
+- `warp_broadcast(value, lane)`, `warp_shuffle(value, lane)`, and
+  `warp_shuffle_xor(value, mask)`;
+- `warp_ballot(predicate)`, `warp_any(predicate)`, and `warp_all(predicate)`;
+- signed/unsigned sum, minimum, and maximum reductions;
+- unsigned AND, OR, and XOR reductions.
+
+All lanes must reach a collective under uniform control, though its value and,
+for `warp_shuffle`, source-lane arguments may vary by lane. A broadcast source
+lane must be uniform. `warp_shuffle_xor` currently requires a compile-time mask
+from 0 to 31. Signed minimum and maximum use an explicit sign-bit transform
+around the ISA's unsigned reductions. Ballot and C-valued votes are synthesized
+with lane shifts, predicate selection, and bitwise reductions because WarpVM
+predicate registers do not move directly into vector registers. These
+restrictions and lowerings are compiler contracts, not new ISA operations.
+
+`warp_memcpy(dst, src, words)` and `warp_memset(dst, value, words)` are ordinary
+Warp C routines injected on demand by the compiler. They process uniform
+32-word batches at `base + WARP` and predicate the final partial batch with an
+ordinary divergent `if`. Lengths zero and either side of the 32-lane boundary
+therefore need no scalar fallback. Because these are source routines rather
+than opaque intrinsics, `--emit-asm` leaves their calls, loops, loads, stores,
+and tail masks inspectable.
 
 ## Integer semantics
 
@@ -231,7 +268,23 @@ then verifies the 128x128 ARGB8888 format, `frame_seq = 1`, and known red,
 green, blue, and white pixels through the attach inspection path.
 
 `warpc_firefly` runs 64 persistent copies of the Warp C firefly demo. Its
-uniform 512-iteration render loop combines each batch with `warp_lane_id()`,
+uniform 512-iteration render loop combines each batch with `WARP`,
 so every framebuffer store writes 32 distinct pixels. The acceptance check
 requires all 64 VMs to remain running without faults, a positive frame
 sequence, and a positive received-message counter in VM-private RAM.
+
+The v0.1.5 acceptance set additionally proves exact `WARP` values with no
+backing load/store; collective results including signed extrema and exact
+ballot masks; cooperative copy/fill tails at lengths 0, 1, 31, 32, 33, 63,
+64, 65, and 100; and full-frame cooperative graphics. A bounded,
+messaging-free native demo combines all four features and must match complete
+interpreter/PTX state, RAM, framebuffer, and frame sequence. Its persistent
+counterpart boots 64 communicating VMs, and the live check requires all to
+remain healthy, publish frames, and receive a real neighbour message.
+
+The paired sequential/cooperative data benchmark checks every direct-compiled
+sample against the logical interpreter before recording timings. On the RTX
+3060, large-array direct-compiled copy/fill/add improve by approximately
+20x--26x. The full methodology, the smaller cases, and the important caveat
+that the shared sequential C loop is redundantly executed by all lanes are in
+[`benchmarks/warpc_015.md`](../benchmarks/warpc_015.md).

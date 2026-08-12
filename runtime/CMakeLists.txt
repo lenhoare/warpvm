@@ -102,6 +102,43 @@ add_test(NAME warpc_firefly
           ${WVM_WARPC} $<TARGET_FILE:warpvm>
           ${CMAKE_SOURCE_DIR}/programs/warpc/warpc_firefly.wc
           ${CMAKE_BINARY_DIR}/warpc_firefly)
+add_test(NAME warpc_warp_values
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_warp_values.sh
+          ${WVM_WARPC} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/programs/warpc/warp_values.wc
+          ${CMAKE_SOURCE_DIR}/programs/warpc/warp_no_storage.wc
+          ${CMAKE_BINARY_DIR}/warpc_warp_values)
+add_test(NAME warpc_collectives
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_acceptance.sh
+          ${WVM_WARPC} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/programs/warpc/collectives.wc
+          ${CMAKE_BINARY_DIR}/warpc_collectives warpc_collectives)
+add_test(NAME warpc_warp_memory
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_acceptance.sh
+          ${WVM_WARPC} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/programs/warpc/warp_memory.wc
+          ${CMAKE_BINARY_DIR}/warpc_warp_memory warpc_warp_memory)
+add_test(NAME warpc_warp_graphics
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_acceptance.sh
+          ${WVM_WARPC} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/programs/warpc/warp_graphics.wc
+          ${CMAKE_BINARY_DIR}/warpc_warp_graphics warpc_warp_graphics)
+add_test(NAME warpc_015_dual_mode
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_acceptance.sh
+          ${WVM_WARPC} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/programs/warpc/warp_native_compiled.wc
+          ${CMAKE_BINARY_DIR}/warpc_015_dual_mode warpc_015_dual_mode)
+add_test(NAME warpc_015_live_capstone
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_native_demo.sh
+          ${WVM_WARPC} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/programs/warpc/warp_native_demo.wc
+          ${CMAKE_BINARY_DIR}/warpc_015_live_capstone)
+add_test(NAME warpc_015_bench
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_015_bench.sh
+          ${WVM_WARPC} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/programs/warpc/bench_sequential.wc
+          ${CMAKE_SOURCE_DIR}/programs/warpc/bench_warp_native.wc
+          ${CMAKE_BINARY_DIR}/warpc_015_bench)
 
 add_test(NAME pipeline_hello
   COMMAND bash ${CMAKE_SOURCE_DIR}/tests/pipeline.sh

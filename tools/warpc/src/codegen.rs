@@ -797,6 +797,133 @@ impl<'a> Generator<'a> {
                     owned: true,
                 })
             }
+            Intrinsic::Broadcast => {
+                let value = self.expr(&args[0])?;
+                let out = self.alloc_reg(span)?;
+                if let TypedExprKind::Literal(lane) = args[1].kind {
+                    self.instr(&format!("BROADCAST r{out}, r{}, {lane}", value.reg));
+                } else {
+                    let lane = self.expr(&args[1])?;
+                    self.instr(&format!("SHUFFLE r{out}, r{}, r{}", value.reg, lane.reg));
+                    self.release(lane);
+                }
+                self.release(value);
+                Ok(Value {
+                    reg: out,
+                    owned: true,
+                })
+            }
+            Intrinsic::Shuffle => {
+                let value = self.expr(&args[0])?;
+                let lane = self.expr(&args[1])?;
+                let out = self.alloc_reg(span)?;
+                self.instr(&format!("SHUFFLE r{out}, r{}, r{}", value.reg, lane.reg));
+                self.release(value);
+                self.release(lane);
+                Ok(Value {
+                    reg: out,
+                    owned: true,
+                })
+            }
+            Intrinsic::ShuffleXor => {
+                let value = self.expr(&args[0])?;
+                let TypedExprKind::Literal(mask) = args[1].kind else {
+                    return Err(Diagnostic::new(
+                        span,
+                        "internal error: non-constant shuffle mask",
+                    ));
+                };
+                let out = self.alloc_reg(span)?;
+                self.instr(&format!("SHUFFLE_XOR r{out}, r{}, {mask}", value.reg));
+                self.release(value);
+                Ok(Value {
+                    reg: out,
+                    owned: true,
+                })
+            }
+            Intrinsic::Ballot => {
+                let predicate = self.expr(&args[0])?;
+                let bit = self.alloc_reg(span)?;
+                let selected = self.alloc_reg(span)?;
+                self.instr(&format!("MOV r{bit}, 1"));
+                self.instr(&format!("SHL r{bit}, r{bit}, r{LANE_REG}"));
+                self.instr(&format!("CMP_NE p0, r{}, 0", predicate.reg));
+                self.release(predicate);
+                self.instr(&format!("MOV r{selected}, 0"));
+                self.guarded_instr(0, false, &format!("MOV r{selected}, r{bit}"));
+                self.free_reg(bit);
+                let out = self.alloc_reg(span)?;
+                self.instr(&format!("REDUCE_OR r{out}, r{selected}"));
+                self.free_reg(selected);
+                Ok(Value {
+                    reg: out,
+                    owned: true,
+                })
+            }
+            Intrinsic::Any | Intrinsic::All => {
+                let value = self.expr(&args[0])?;
+                let normalized = self.alloc_reg(span)?;
+                self.instr(&format!("CMP_NE p0, r{}, 0", value.reg));
+                self.release(value);
+                self.instr(&format!("MOV r{normalized}, 0"));
+                self.guarded_instr(0, false, &format!("MOV r{normalized}, 1"));
+                let out = self.alloc_reg(span)?;
+                let mnemonic = if intrinsic == Intrinsic::Any {
+                    "REDUCE_OR"
+                } else {
+                    "REDUCE_AND"
+                };
+                self.instr(&format!("{mnemonic} r{out}, r{normalized}"));
+                self.free_reg(normalized);
+                Ok(Value {
+                    reg: out,
+                    owned: true,
+                })
+            }
+            Intrinsic::ReduceAdd
+            | Intrinsic::ReduceAddUnsigned
+            | Intrinsic::ReduceMinUnsigned
+            | Intrinsic::ReduceMaxUnsigned
+            | Intrinsic::ReduceAnd
+            | Intrinsic::ReduceOr
+            | Intrinsic::ReduceXor => {
+                let value = self.expr(&args[0])?;
+                let out = self.alloc_reg(span)?;
+                let mnemonic = match intrinsic {
+                    Intrinsic::ReduceAdd | Intrinsic::ReduceAddUnsigned => "REDUCE_ADD",
+                    Intrinsic::ReduceMinUnsigned => "REDUCE_MIN",
+                    Intrinsic::ReduceMaxUnsigned => "REDUCE_MAX",
+                    Intrinsic::ReduceAnd => "REDUCE_AND",
+                    Intrinsic::ReduceOr => "REDUCE_OR",
+                    Intrinsic::ReduceXor => "REDUCE_XOR",
+                    _ => unreachable!(),
+                };
+                self.instr(&format!("{mnemonic} r{out}, r{}", value.reg));
+                self.release(value);
+                Ok(Value {
+                    reg: out,
+                    owned: true,
+                })
+            }
+            Intrinsic::ReduceMinSigned | Intrinsic::ReduceMaxSigned => {
+                let value = self.expr(&args[0])?;
+                let biased = self.alloc_reg(span)?;
+                self.instr(&format!("XOR r{biased}, r{}, {SIGN_BIT}", value.reg));
+                self.release(value);
+                let out = self.alloc_reg(span)?;
+                let mnemonic = if intrinsic == Intrinsic::ReduceMinSigned {
+                    "REDUCE_MIN"
+                } else {
+                    "REDUCE_MAX"
+                };
+                self.instr(&format!("{mnemonic} r{out}, r{biased}"));
+                self.free_reg(biased);
+                self.instr(&format!("XOR r{out}, r{out}, {SIGN_BIT}"));
+                Ok(Value {
+                    reg: out,
+                    owned: true,
+                })
+            }
         }
     }
 

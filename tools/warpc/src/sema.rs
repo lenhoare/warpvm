@@ -292,6 +292,21 @@ pub enum Intrinsic {
     SetPixel,
     Send,
     TryRecv,
+    Broadcast,
+    Shuffle,
+    ShuffleXor,
+    Ballot,
+    Any,
+    All,
+    ReduceAdd,
+    ReduceAddUnsigned,
+    ReduceMinSigned,
+    ReduceMaxSigned,
+    ReduceMinUnsigned,
+    ReduceMaxUnsigned,
+    ReduceAnd,
+    ReduceOr,
+    ReduceXor,
 }
 
 #[derive(Clone, Debug)]
@@ -462,6 +477,7 @@ impl Analyzer {
                         "function definitions require parameter names",
                     ));
                 };
+                reject_warp_declaration(&name, parameter.span)?;
                 if bindings.contains_key(&name) {
                     return Err(Diagnostic::new(
                         parameter.span,
@@ -588,6 +604,7 @@ impl Analyzer {
 
     fn register_global(&mut self, global: ast::Global) -> Result<(), Diagnostic> {
         let name = global.ty.declarator.name.clone().unwrap();
+        reject_warp_declaration(&name, global.span)?;
         if self.global_ids.contains_key(&name) {
             return Err(Diagnostic::new(
                 global.span,
@@ -664,6 +681,7 @@ impl Analyzer {
     }
 
     fn register_function(&mut self, function: &ast::Function) -> Result<(), Diagnostic> {
+        reject_warp_declaration(&function.name, function.span)?;
         if matches!(
             function.name.as_str(),
             "warp_lane_id"
@@ -674,6 +692,21 @@ impl Analyzer {
                 | "warp_set_pixel"
                 | "warp_send"
                 | "warp_try_recv"
+                | "warp_broadcast"
+                | "warp_shuffle"
+                | "warp_shuffle_xor"
+                | "warp_ballot"
+                | "warp_any"
+                | "warp_all"
+                | "warp_reduce_add"
+                | "warp_reduce_add_u"
+                | "warp_reduce_min"
+                | "warp_reduce_max"
+                | "warp_reduce_min_u"
+                | "warp_reduce_max_u"
+                | "warp_reduce_and"
+                | "warp_reduce_or"
+                | "warp_reduce_xor"
         ) {
             return Err(Diagnostic::new(
                 function.span,
@@ -698,6 +731,9 @@ impl Analyzer {
         }
         let mut params = Vec::new();
         for parameter in &function.params {
+            if let Some(name) = &parameter.ty.declarator.name {
+                reject_warp_declaration(name, parameter.span)?;
+            }
             let mut ty = self.lower_decl_type(&parameter.ty, None)?;
             if ty.is_array() {
                 ty = ty.decay();
@@ -1049,6 +1085,7 @@ impl Analyzer {
         span: Span,
     ) -> Result<TypedStmt, Diagnostic> {
         let name = decl.declarator.name.clone().unwrap();
+        reject_warp_declaration(&name, span)?;
         if self.scopes.last().unwrap().contains_key(&name) {
             return Err(Diagnostic::new(span, format!("duplicate local '{name}'")));
         }
@@ -1209,7 +1246,17 @@ impl Analyzer {
                 })
             }
             ast::ExprKind::Name(name) => {
-                if let Some(value) = builtin_constant(&name) {
+                if name == "WARP" {
+                    Ok(TypedExpr {
+                        kind: TypedExprKind::Intrinsic {
+                            intrinsic: Intrinsic::LaneId,
+                            args: Vec::new(),
+                        },
+                        ty: Type::I32,
+                        uniformity: Uniformity::Divergent,
+                        span,
+                    })
+                } else if let Some(value) = builtin_constant(&name) {
                     Ok(TypedExpr {
                         kind: TypedExprKind::Literal(value),
                         ty: Type::U32,
@@ -1294,6 +1341,46 @@ impl Analyzer {
             "warp_set_pixel" => Some((Intrinsic::SetPixel, 3, Type::VOID, Uniformity::Uniform)),
             "warp_send" => Some((Intrinsic::Send, 3, Type::VOID, Uniformity::Uniform)),
             "warp_try_recv" => Some((Intrinsic::TryRecv, 2, Type::I32, Uniformity::Uniform)),
+            "warp_broadcast" => Some((Intrinsic::Broadcast, 2, Type::I32, Uniformity::Uniform)),
+            "warp_shuffle" => Some((Intrinsic::Shuffle, 2, Type::I32, Uniformity::Uniform)),
+            "warp_shuffle_xor" => Some((Intrinsic::ShuffleXor, 2, Type::I32, Uniformity::Uniform)),
+            "warp_ballot" => Some((Intrinsic::Ballot, 1, Type::U32, Uniformity::Uniform)),
+            "warp_any" => Some((Intrinsic::Any, 1, Type::I32, Uniformity::Uniform)),
+            "warp_all" => Some((Intrinsic::All, 1, Type::I32, Uniformity::Uniform)),
+            "warp_reduce_add" => Some((Intrinsic::ReduceAdd, 1, Type::I32, Uniformity::Uniform)),
+            "warp_reduce_add_u" => Some((
+                Intrinsic::ReduceAddUnsigned,
+                1,
+                Type::U32,
+                Uniformity::Uniform,
+            )),
+            "warp_reduce_min" => Some((
+                Intrinsic::ReduceMinSigned,
+                1,
+                Type::I32,
+                Uniformity::Uniform,
+            )),
+            "warp_reduce_max" => Some((
+                Intrinsic::ReduceMaxSigned,
+                1,
+                Type::I32,
+                Uniformity::Uniform,
+            )),
+            "warp_reduce_min_u" => Some((
+                Intrinsic::ReduceMinUnsigned,
+                1,
+                Type::U32,
+                Uniformity::Uniform,
+            )),
+            "warp_reduce_max_u" => Some((
+                Intrinsic::ReduceMaxUnsigned,
+                1,
+                Type::U32,
+                Uniformity::Uniform,
+            )),
+            "warp_reduce_and" => Some((Intrinsic::ReduceAnd, 1, Type::U32, Uniformity::Uniform)),
+            "warp_reduce_or" => Some((Intrinsic::ReduceOr, 1, Type::U32, Uniformity::Uniform)),
+            "warp_reduce_xor" => Some((Intrinsic::ReduceXor, 1, Type::U32, Uniformity::Uniform)),
             _ => None,
         };
         if let Some((intrinsic, arity, ty, base_uniformity)) = signature {
@@ -1306,10 +1393,42 @@ impl Analyzer {
                     ),
                 ));
             }
-            if matches!(
+            let shuffle_xor_mask = if intrinsic == Intrinsic::ShuffleXor {
+                match constant_ast(&args[1]) {
+                    Ok(mask) if mask < 32 => Some(mask),
+                    _ => {
+                        return Err(Diagnostic::new(
+                            args[1].span,
+                            "warp_shuffle_xor mask must be a constant from 0 to 31",
+                        ))
+                    }
+                }
+            } else {
+                None
+            };
+            let collective = matches!(
+                intrinsic,
+                Intrinsic::Broadcast
+                    | Intrinsic::Shuffle
+                    | Intrinsic::ShuffleXor
+                    | Intrinsic::Ballot
+                    | Intrinsic::Any
+                    | Intrinsic::All
+                    | Intrinsic::ReduceAdd
+                    | Intrinsic::ReduceAddUnsigned
+                    | Intrinsic::ReduceMinSigned
+                    | Intrinsic::ReduceMaxSigned
+                    | Intrinsic::ReduceMinUnsigned
+                    | Intrinsic::ReduceMaxUnsigned
+                    | Intrinsic::ReduceAnd
+                    | Intrinsic::ReduceOr
+                    | Intrinsic::ReduceXor
+            );
+            if (matches!(
                 intrinsic,
                 Intrinsic::Flip | Intrinsic::Send | Intrinsic::TryRecv
-            ) && self.divergent_depth != 0
+            ) || collective)
+                && self.divergent_depth != 0
             {
                 return Err(Diagnostic::new(
                     span,
@@ -1333,6 +1452,33 @@ impl Analyzer {
                 uniformity = uniformity.join(arg.uniformity);
                 typed_args.push(arg);
             }
+            if let Some(mask) = shuffle_xor_mask {
+                typed_args[1].kind = TypedExprKind::Literal(mask);
+                typed_args[1].uniformity = Uniformity::Uniform;
+            }
+            if intrinsic == Intrinsic::Broadcast && typed_args[1].uniformity != Uniformity::Uniform
+            {
+                return Err(Diagnostic::new(
+                    typed_args[1].span,
+                    "warp_broadcast lane must be uniform",
+                ));
+            }
+            uniformity = match intrinsic {
+                Intrinsic::Broadcast
+                | Intrinsic::Ballot
+                | Intrinsic::Any
+                | Intrinsic::All
+                | Intrinsic::ReduceAdd
+                | Intrinsic::ReduceAddUnsigned
+                | Intrinsic::ReduceMinSigned
+                | Intrinsic::ReduceMaxSigned
+                | Intrinsic::ReduceMinUnsigned
+                | Intrinsic::ReduceMaxUnsigned
+                | Intrinsic::ReduceAnd
+                | Intrinsic::ReduceOr
+                | Intrinsic::ReduceXor => Uniformity::Uniform,
+                _ => uniformity,
+            };
             return Ok(TypedExpr {
                 kind: TypedExprKind::Intrinsic {
                     intrinsic,
@@ -1947,6 +2093,7 @@ fn scan_expr_divergence(
         ast::ExprKind::Member { base, .. } => {
             scan_expr_divergence(base, function_ids, direct, edges);
         }
+        ast::ExprKind::Name(name) if name == "WARP" => *direct = true,
         ast::ExprKind::Number(_)
         | ast::ExprKind::Char(_)
         | ast::ExprKind::String(_)
@@ -2057,6 +2204,17 @@ fn require_integer(expr: &TypedExpr, role: &str) -> Result<(), Diagnostic> {
             expr.span,
             format!("{role} must have integer type"),
         ))
+    }
+}
+
+fn reject_warp_declaration(name: &str, span: Span) -> Result<(), Diagnostic> {
+    if name == "WARP" {
+        Err(Diagnostic::new(
+            span,
+            "'WARP' is a reserved predefined Warp C identifier",
+        ))
+    } else {
+        Ok(())
     }
 }
 

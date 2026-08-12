@@ -688,3 +688,78 @@ five seconds sampled frame counters were 224–225 (about 45 FPS) and sampled
 private receive counters were 3–4, proving that the acceleration and blue
 colour response came from actual neighbouring mailbox traffic. The 577-word
 program needed no new opcode or runtime-specialized drawing path.
+
+## 23. `WARP` can be a storage-free language value
+
+**Discovered by:** Warp C v0.1.5
+
+**Classification:** compiler language surface; no ISA change
+
+The useful indexing idiom is sufficiently central to deserve `WARP` as a
+predefined divergent `int`. It aliases the compiler's existing reserved lane
+register, initialized once with `LANEID`, rather than behaving like a global or
+an implicit load. A generated-code regression confirms that a program using
+only `WARP - WARP` contains neither RAM loads nor stores. The compiler reserves
+the name and rejects lvalue, address, array-bound, and case-label uses.
+
+An important accompanying rule is that automatic arrays are lane-private in
+the existing ABI. Shared cooperative arrays must be globals or be accessed
+through pointers to shared VM memory. Changing automatic-array ownership would
+silently break established C semantics and is not required for cooperative
+work.
+
+## 24. Existing reductions are enough for a useful C collective family
+
+**Discovered by:** Warp C v0.1.5 collective acceptance program
+
+**Classification:** compiler and PTX-backend coverage; no ISA change
+
+Broadcast, shuffle, XOR shuffle, votes, and arithmetic/bitwise reductions now
+have C-valued interfaces. Dynamic uniform broadcast selects the existing
+shuffle path; signed min/max bias the sign bit around unsigned reduction.
+Because predicates cannot be copied into vector registers, ballot constructs
+one lane bit per true C value and OR-reduces it, while any/all normalize their
+arguments before OR/AND reduction. Exact interpreter/PTX equivalence covers
+these synthesized forms.
+
+Collective call sites must be under uniform control even when their values are
+divergent. This is a compiler safety condition, not evidence for an active-mask
+instruction. The present `shuffle_xor` mask is deliberately constant 0..31;
+generalizing it should wait for a real program that needs a dynamic mask.
+
+## 25. Cooperative memory is ordinary Warp C with exact tail predication
+
+**Discovered by:** `warp_memcpy`, `warp_memset`, and the v0.1.5 data benchmark
+
+**Classification:** compiler-injected source library; no ISA change
+
+Both routines are injected as normal source only when referenced. A uniform
+loop advances by 32, lane `WARP` owns one word, and a divergent comparison
+predicates the final partial batch. Exact dual-engine tests cover lengths 0,
+1, 31, 32, 33, 63, 64, 65, and 100 with sentinels on either side.
+
+On the RTX 3060, paired direct-compiled copy/fill/add programs were 2.43x to
+26.41x faster than their sequential shared-memory C forms; at 1,024 and 4,096
+words every operation was about 20x to 26x faster. Retired interpreter
+bytecodes showed the same scaling direction. The sequential source loop is
+executed redundantly by all 32 lanes, so this measures the benefit of expressing
+VM word work cooperatively, not performance against an optimized CPU library.
+No specialized memory instruction is presently justified.
+
+## 26. One program can combine the complete warp-native surface
+
+**Discovered by:** `warp_native_demo.wc`
+
+**Classification:** language/runtime capstone; no ISA change
+
+A 64-VM persistent program now combines `WARP` indexing, cooperative copy and
+fill, reduction, ballot, full 128x128 graphics, VM identity, and genuine ring
+mailbox traffic. In the initial live run all 64 machines remained `RUNNING / OK`;
+VM 0 published 163 frames in four seconds and had received two messages.
+
+Messaging remains intentionally limited to the persistent interpreter because
+the direct PTX execution path has no resident mailbox system. A bounded,
+messaging-free three-frame counterpart exercises every other feature and
+matches complete interpreter/PTX state, RAM, framebuffer, and frame sequence.
+This is an execution-mode boundary rather than a missing collective or ISA
+primitive.

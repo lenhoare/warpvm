@@ -698,6 +698,112 @@ int RunCompiledHaltEquivalence(const char* path) {
   return pass ? 0 : 1;
 }
 
+int RunWarpCDataBenchmark(const char* sequential_path,
+                          const char* warp_path) {
+  constexpr uint32_t kMemoryWords = 16384;
+  constexpr uint64_t kInstructionLimit = 100000000u;
+  struct Measurement {
+    uint64_t instructions = 0;
+    double milliseconds = 0.0;
+  };
+
+  wvm::WvmFile sequential_file, warp_file;
+  std::string err;
+  if (!wvm::LoadWvm(sequential_path, sequential_file, err) ||
+      !wvm::LoadWvm(warp_path, warp_file, err)) {
+    std::fprintf(stderr, "warpc_bench: load failed: %s\n", err.c_str());
+    return 2;
+  }
+  wvm::PtxCompiledProgram sequential_compiled, warp_compiled;
+  if (!sequential_compiled.Compile(sequential_file, err) ||
+      !warp_compiled.Compile(warp_file, err)) {
+    std::fprintf(stderr, "warpc_bench: PTX compile failed: %s\n", err.c_str());
+    return 1;
+  }
+
+  auto measure = [&](const wvm::WvmFile& file,
+                     const wvm::PtxCompiledProgram& compiled,
+                     uint32_t benchmark_case, uint32_t operation,
+                     Measurement& measurement) -> bool {
+    wvm::CpuVm cpu;
+    cpu.Init(0, file, kMemoryWords);
+    cpu.memory[0] = benchmark_case;
+    cpu.memory[1] = operation;
+    while (cpu.status == wvm::kRunning &&
+           cpu.instruction_counter < kInstructionLimit)
+      cpu.RunQuantum();
+    if (cpu.status != wvm::kHalted || cpu.vregs[0][0] != 42) {
+      err = "logical interpreter did not halt with r0=42";
+      return false;
+    }
+    measurement.instructions = cpu.instruction_counter;
+
+    std::array<double, 5> samples{};
+    for (double& sample : samples) {
+      std::vector<wvm::VmState> states(1);
+      states[0].status = wvm::kRunning;
+      states[0].rng_state = 0x1234567u;
+      std::vector<uint32_t> memory(kMemoryWords, 0);
+      memory[0] = benchmark_case;
+      memory[1] = operation;
+      std::vector<uint32_t> no_framebuffer;
+      std::vector<uint32_t> no_frame_seq;
+      if (!compiled.LaunchCheckpoints(states, memory, kMemoryWords,
+                                      no_framebuffer, no_frame_seq, 1,
+                                      sample, err))
+        return false;
+      std::string difference;
+      if (!SameArchitecturalState(StateFromCpu(cpu), states[0], difference) ||
+          memory != cpu.memory) {
+        err = "interpreter/PTX mismatch: " + difference;
+        return false;
+      }
+    }
+    std::sort(samples.begin(), samples.end());
+    measurement.milliseconds = samples[samples.size() / 2];
+    return true;
+  };
+
+  const std::array<const char*, 3> operation_names = {"copy", "fill", "add"};
+  const std::array<uint32_t, 4> word_counts = {32, 128, 1024, 4096};
+  bool ok = true;
+  std::printf("Warp C v0.1.5 data benchmark\n");
+  std::printf("  each sample processes 262144 logical words\n");
+  std::printf("  interpreted column is exact retired WarpVM bytecodes; "
+              "compiled time is median of 5 kernel-only launches\n\n");
+  std::printf("  op    words   interpreter bytecodes (seq/warp/speedup)"
+              "   compiled ms (seq/warp/speedup)\n");
+  for (uint32_t operation = 0; operation < operation_names.size(); ++operation) {
+    for (uint32_t benchmark_case = 0; benchmark_case < word_counts.size();
+         ++benchmark_case) {
+      Measurement sequential, warp;
+      const bool measured =
+          measure(sequential_file, sequential_compiled, benchmark_case,
+                  operation, sequential) &&
+          measure(warp_file, warp_compiled, benchmark_case, operation, warp);
+      ok &= measured;
+      if (!measured) {
+        std::printf("  %-5s %5u   FAIL: %s\n", operation_names[operation],
+                    word_counts[benchmark_case], err.c_str());
+        continue;
+      }
+      const double instruction_speedup =
+          static_cast<double>(sequential.instructions) / warp.instructions;
+      const double compiled_speedup =
+          sequential.milliseconds / warp.milliseconds;
+      std::printf("  %-5s %5u   %9llu / %-9llu / %6.2fx"
+                  "       %8.4f / %-8.4f / %6.2fx\n",
+                  operation_names[operation], word_counts[benchmark_case],
+                  static_cast<unsigned long long>(sequential.instructions),
+                  static_cast<unsigned long long>(warp.instructions),
+                  instruction_speedup, sequential.milliseconds,
+                  warp.milliseconds, compiled_speedup);
+    }
+  }
+  std::printf(ok ? "warpc_015_bench PASS\n" : "warpc_015_bench FAIL\n");
+  return ok ? 0 : 1;
+}
+
 int RunCompiledLife(const char* path) {
   constexpr uint32_t kVms = 2;
   constexpr uint32_t kMemoryWords = 16384;
@@ -2703,6 +2809,8 @@ void Usage(const char* argv0) {
   std::printf("  compiled_tests        v0.1.3 minimal PTX backend tests\n");
   std::printf("  compiled_run <file.wvm>\n");
   std::printf("                  exact CPU/compiled equivalence through HALT\n");
+  std::printf("  warpc_bench <sequential.wvm> <warp.wvm>\n");
+  std::printf("                  v0.1.5 sequential/warp-native data benchmark\n");
   std::printf("  compiled_life <file.wvm>\n");
   std::printf("                  compiled WarpLife checkpoints and mode transitions\n");
   std::printf("  compiled_life_bench <file.wvm>\n");
@@ -2752,6 +2860,14 @@ int main(int argc, char** argv) {
       return 2;
     }
     return RunCompiledHaltEquivalence(argv[2]);
+  }
+  if (std::strcmp(cmd, "warpc_bench") == 0) {
+    if (argc != 4) {
+      std::fprintf(stderr,
+                   "error: warpc_bench requires sequential and warp .wvm files\n");
+      return 2;
+    }
+    return RunWarpCDataBenchmark(argv[2], argv[3]);
   }
   if (std::strcmp(cmd, "compiled_life_bench") == 0) {
     if (argc != 3) {

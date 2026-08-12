@@ -27,3 +27,4 @@ test -n "$RECEIVED"
 test "$RECEIVED" -gt 0
 
 echo "warpc_firefly PASS (64 VMs, received=$RECEIVED)"
+echo "warpc_warp_messaging PASS"

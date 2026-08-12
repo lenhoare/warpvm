@@ -1,0 +1,46 @@
+#include <warp.h>
+
+/* Identical logical work to bench_sequential.wc, but adjacent lanes own
+ * adjacent words. Each case processes 262,144 words in total. */
+unsigned benchmark_case;
+unsigned benchmark_operation;
+unsigned source_a[4096];
+unsigned source_b[4096];
+unsigned target[4096];
+
+int main(void)
+{
+    unsigned words = 32;
+    unsigned repetitions = 8192;
+    if (benchmark_case == 1) {
+        words = 128;
+        repetitions = 2048;
+    }
+    if (benchmark_case == 2) {
+        words = 1024;
+        repetitions = 256;
+    }
+    if (benchmark_case == 3) {
+        words = 4096;
+        repetitions = 64;
+    }
+
+    if (benchmark_operation == 0) {
+        for (unsigned repeat = 0; repeat < repetitions; ++repeat)
+            warp_memcpy(target, source_a, words);
+    }
+    if (benchmark_operation == 1) {
+        for (unsigned repeat = 0; repeat < repetitions; ++repeat)
+            warp_memset(target, 0x12345678u, words);
+    }
+    if (benchmark_operation == 2) {
+        for (unsigned repeat = 0; repeat < repetitions; ++repeat) {
+            for (unsigned base = 0; base < words; base += 32) {
+                unsigned i = base + WARP;
+                if (i < words)
+                    target[i] = source_a[i] + source_b[i] + 1;
+            }
+        }
+    }
+    return 42;
+}

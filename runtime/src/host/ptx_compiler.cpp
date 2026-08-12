@@ -238,8 +238,25 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err) {
              << "    and.b32 %t8, %t8, %t9;\n"
              << "    or.b32 %m" << rd << ", %m" << rd << ", %t8;\n";
         break;
+      case kAny: case kAll:
+        if (rd >= kPredRegs || rs1 >= kPredRegs)
+          return reject("invalid vote predicate register");
+        body << "    setp." << (op == kAny ? "ne" : "eq")
+             << ".u32 %p3, %m" << rs1 << ", "
+             << (op == kAny ? 0u : kFullMask) << ";\n"
+             << "    selp.u32 %t8, 0xffffffff, 0, %p3;\n"
+             << "    not.b32 %t4, %t9;\n"
+             << "    and.b32 %m" << rd << ", %m" << rd << ", %t4;\n"
+             << "    and.b32 %t8, %t8, %t9;\n"
+             << "    or.b32 %m" << rd << ", %m" << rd << ", %t8;\n";
+        break;
       case kLaneId:
         body << predicated << "mov.u32 " << VReg(rd) << ", %t3;\n";
+        break;
+      case kBroadcast:
+        body << "    shfl.sync.idx.b32 %t7, " << VReg(rs1) << ", "
+             << (lo & 31u) << ", 0x1f, 0xffffffff;\n"
+             << predicated << "mov.b32 " << VReg(rd) << ", %t7;\n";
         break;
       case kShuffle:
         body << "    and.b32 %t8, " << VReg(rs2) << ", 31;\n"
@@ -255,15 +272,23 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err) {
       case kVmid:
         body << predicated << "mov.u32 " << VReg(rd) << ", %vid;\n";
         break;
-      case kReduceOr:
+      case kReduceAdd: case kReduceMin: case kReduceMax:
+      case kReduceAnd: case kReduceOr: case kReduceXor: {
+        const char* operation = "or.b32";
+        if (op == kReduceAdd) operation = "add.u32";
+        else if (op == kReduceMin) operation = "min.u32";
+        else if (op == kReduceMax) operation = "max.u32";
+        else if (op == kReduceAnd) operation = "and.b32";
+        else if (op == kReduceXor) operation = "xor.b32";
         body << "    mov.b32 %t8, " << VReg(rs1) << ";\n";
         for (uint32_t delta : {16u, 8u, 4u, 2u, 1u}) {
           body << "    shfl.sync.bfly.b32 %t7, %t8, " << delta
                << ", 0x1f, 0xffffffff;\n"
-               << "    or.b32 %t8, %t8, %t7;\n";
+               << "    " << operation << " %t8, %t8, %t7;\n";
         }
         body << predicated << "mov.b32 " << VReg(rd) << ", %t8;\n";
         break;
+      }
       case kLoad: {
         body << "    setp.lt.u32 %p3, " << VReg(rs1) << ", %t5;\n"
              << "    and.pred %p3, %p3, %p2;\n"

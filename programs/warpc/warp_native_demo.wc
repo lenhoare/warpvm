@@ -1,0 +1,74 @@
+#include <warp.h>
+
+unsigned activity[32];
+unsigned history[64];
+unsigned frame;
+unsigned flash;
+unsigned received_messages;
+unsigned inbox_payload;
+unsigned inbox_metadata;
+unsigned current_energy;
+unsigned bright_mask;
+
+int main(void)
+{
+    unsigned vm = warp_vm_id();
+    unsigned *fb = warp_framebuffer();
+    warp_memset(history, 0, 64);
+
+    while (1) {
+        while (warp_try_recv(&inbox_payload, &inbox_metadata)) {
+            flash = 24 + (inbox_payload & 15);
+            ++received_messages;
+        }
+
+        /* Preserve the previous 32-wide sample, then calculate this frame's
+         * lane-local activity. Both operations are visibly cooperative. */
+        warp_memcpy(history + 32, history, 32);
+        activity[WARP] = (frame + WARP * 11 + vm * 7) & 31;
+        history[WARP] = activity[WARP];
+
+        current_energy = warp_reduce_add_u(activity[WARP]);
+        bright_mask = warp_ballot(activity[WARP] > 23);
+
+        if ((frame + vm * 29) % 150 == 0) {
+            warp_send((vm + 63) % 64, 2, current_energy);
+            warp_send((vm + 1) % 64, 2, current_energy);
+        }
+
+        for (unsigned y = 0; y < WARP_VIDEO_HEIGHT; ++y) {
+            for (unsigned base = 0; base < WARP_VIDEO_WIDTH; base += 32) {
+                unsigned x = base + WARP;
+                unsigned memory = history[WARP];
+                memory += history[32 + WARP];
+                unsigned red = x;
+                red += vm * 5;
+                red += memory;
+                red &= 255;
+                unsigned green = current_energy;
+                green >>= 4;
+                green += y;
+                green &= 255;
+                unsigned blue = x;
+                blue ^= y;
+                blue ^= frame;
+                blue &= 63;
+                unsigned lane_bit = x & 31;
+                lane_bit = bright_mask >> lane_bit;
+                if (lane_bit & 1)
+                    blue += 96;
+                if (flash != 0) {
+                    red = 40;
+                    green = 160 + (memory & 63);
+                    blue = 255;
+                }
+                fb[y * WARP_VIDEO_WIDTH + x] = warp_argb(255, red, green, blue);
+            }
+        }
+
+        warp_flip();
+        ++frame;
+        if (flash != 0)
+            --flash;
+    }
+}

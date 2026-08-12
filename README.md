@@ -49,9 +49,11 @@ Warp C currently supports signed `int`, `unsigned`, word-sized unsigned
 `char`, local variables, integer expressions, structured conditionals and
 loops, `switch`, named functions, prototypes, up to four parameters,
 assignment, pointers, fixed arrays, structs, word-per-character strings,
-globals, `sizeof`, `return`, the `warp_lane_id()` / `warp_vm_id()` intrinsics,
-and the built-in `<warp.h>` framebuffer and mailbox API, including nested divergent
-`if` / `else`. It emits inspectable
+globals, `sizeof`, `return`, predefined lane expression `WARP`, warp-wide
+shuffle/vote/reduction operations, cooperative word copy/fill, and the
+`warp_lane_id()` / `warp_vm_id()` intrinsics. Its built-in `<warp.h>` also
+provides framebuffer and mailbox APIs, including nested divergent `if` /
+`else`. It emits inspectable
 WarpVM assembly and assembles it in-process to canonical `.wvm`:
 
 ```sh
@@ -123,6 +125,18 @@ build/tools-rust/release/warpc programs/warpc/warpc_firefly.wc \
 build/runtime/warpvm view build/warpc_firefly.wvm --vms 64
 ```
 
+The v0.1.5 native capstone combines `WARP`, collectives, cooperative memory,
+full-frame graphics, and real neighbour messaging in each of 64 resident VMs:
+
+```sh
+build/tools-rust/release/warpc programs/warpc/warp_native_demo.wc \
+  -o build/warp_native_demo.wvm
+build/runtime/warpvm view build/warp_native_demo.wvm --vms 64
+```
+
+The paired sequential/warp-native copy, fill, and add benchmark is documented
+in [`benchmarks/warpc_015.md`](benchmarks/warpc_015.md).
+
 ## Program 01: WarpLife
 
 `programs/warplife.wva` is a complete 128×128 toroidal Conway's Life program
@@ -185,6 +199,7 @@ control-poll, and memory breakdown is in
 | v0.1.4-D | word-addressed pointers, arrays, structs, strings, globals, and automatic memory frames | done |
 | v0.1.4-E | uniformity propagation, lane/VM intrinsics, and masked divergent `if` / `else` | done |
 | v0.1.4-F | built-in `warp.h`, ARGB/framebuffer helpers, and `FLIP` | done |
+| v0.1.5 | `WARP`, collectives, cooperative memory, warp-native graphics/capstone, benchmark | done |
 
 ## v0.1 milestone
 
