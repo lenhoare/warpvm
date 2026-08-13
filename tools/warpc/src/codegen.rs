@@ -13,7 +13,10 @@ const ALLOCATABLE_REGS: usize = 13; // r13/r14 are ABI scratch; r15 is assembler
                                     // retry the function with one or two fewer homes. This makes spilling follow
                                     // measured peak pressure instead of imposing one pessimistic reserve globally.
 const MAX_LOCAL_VECTOR_REGS: usize = 8;
-const MIN_LOCAL_VECTOR_REGS: usize = 6;
+// Deep expressions containing an inlined helper may need nearly the whole
+// architectural file for transient values. Retry with as few as two local
+// homes and spill the rest before reporting genuine temporary exhaustion.
+const MIN_LOCAL_VECTOR_REGS: usize = 2;
 const ALLOCATABLE_SCALAR_REGS: usize = 7; // s7 is the stack pointer.
 const LANE_REG: u8 = 13;
 const STACK_ADDR_REG: u8 = 14;
@@ -79,6 +82,24 @@ impl LifetimeCollector {
                 for arg in args {
                     self.expr(arg, point, touched);
                 }
+            }
+            TypedExprKind::Inline { statements, result } => {
+                for statement in statements {
+                    match statement {
+                        TypedStmt::Decl { local, init, .. } => {
+                            self.touch(*local, point);
+                            touched.insert(*local);
+                            self.initializer(init.as_ref(), point, touched);
+                        }
+                        TypedStmt::Expr(expr) => {
+                            if let Some(expr) = expr {
+                                self.expr(expr, point, touched);
+                            }
+                        }
+                        _ => unreachable!("inline candidate contains a control statement"),
+                    }
+                }
+                self.expr(result, point, touched);
             }
             TypedExprKind::LValue(value) | TypedExprKind::AddressOf(value) => {
                 self.lvalue(value, point, touched)
@@ -1065,6 +1086,23 @@ impl<'a> Generator<'a> {
             } => self.assignment(target, *op, right, *operation_type, *scale, expr),
             TypedExprKind::Call { function, args } => {
                 self.call(*function, args, expr.ty, expr.span)
+            }
+            TypedExprKind::Inline { statements, result } => {
+                for statement in statements {
+                    match statement {
+                        TypedStmt::Decl { local, init, span } => {
+                            self.declaration(*local, init.as_ref(), *span)?;
+                        }
+                        TypedStmt::Expr(expr) => {
+                            if let Some(expr) = expr {
+                                let value = self.expr(expr)?;
+                                self.release(value);
+                            }
+                        }
+                        _ => unreachable!("inline candidate contains a control statement"),
+                    }
+                }
+                self.expr(result)
             }
             TypedExprKind::IncDec {
                 target,
@@ -2261,7 +2299,7 @@ mod tests {
     #[test]
     fn calls_use_the_lane_private_stack_abi() {
         let text = assembly(
-            "int add(int, int); int main(void) { int keep = 20; return add(keep, 22); } int add(int a, int b) { return a + b; }",
+            "int add(int, int); int main(void) { int keep = 20; return add(keep, 22); } int add(int a, int b) { if (a == 20) return a + b; return 0; }",
         );
         assert!(text.contains("LANEID r13"));
         assert!(text.contains("S_MOV_I s7, 16384"));
@@ -2270,6 +2308,45 @@ mod tests {
         assert!(text.contains("CALL __warpc_fn_add"));
         assert!(text.contains("__warpc_fn_add:"));
         assert!(text.contains("RET"));
+    }
+
+    #[test]
+    fn tiny_helpers_inline_without_call_or_callee_ret() {
+        let text =
+            assembly("int twice(int x) { return x*2; } int main(void) { return twice(21); }");
+        assert!(!text.contains("CALL"), "{text}");
+        assert!(!text.contains("__warpc_fn_twice:"), "{text}");
+        assert!(!text.contains("RET"), "{text}");
+    }
+
+    #[test]
+    fn inline_bindings_cover_parameters_locals_loops_and_divergence() {
+        let text = assembly(
+            "int mix(int a,int b) { int sum=a+b; int adjusted=sum+1; return adjusted; } int lane_value(int base) { return base+WARP; } int main(void) { int total=0; for(int i=0;i<2;++i) total+=mix(i,19); if(WARP<16) total+=mix(WARP,1); int v=lane_value(10); return 42+v-v; }",
+        );
+        assert!(!text.contains("CALL"), "{text}");
+        assert!(text.contains("[inlined mix]"));
+        assert!(text.contains("[inlined lane_value]"));
+        assert!(text.contains("@p3"));
+    }
+
+    #[test]
+    fn larger_control_flow_helper_keeps_call_ret_abi() {
+        let text = assembly(
+            "int choose(int x) { if(x<0) return -x; if(x==0) return 1; return x+1; } int main(void) { return choose(41); }",
+        );
+        assert!(text.contains("CALL __warpc_fn_choose"));
+        assert!(text.contains("__warpc_fn_choose:"));
+        assert!(text.contains("RET"));
+    }
+
+    #[test]
+    fn large_straight_line_helper_is_not_silently_expanded() {
+        let text = assembly(
+            "int large(int x) { int a=x+1; int b=a+1; int c=b+1; int d=c+1; int e=d+1; int f=e+1; int g=f+1; return g; } int main(void) { return large(35); }",
+        );
+        assert!(text.contains("CALL __warpc_fn_large"));
+        assert!(text.contains("__warpc_fn_large:"));
     }
 
     #[test]

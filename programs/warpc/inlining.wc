@@ -1,0 +1,63 @@
+#include <warp.h>
+
+int twice(int value)
+{
+    return value * 2;
+}
+
+int mix(int a, int b)
+{
+    int sum = a + b;
+    int adjusted = sum + 1;
+    return adjusted;
+}
+
+int lane_value(int base)
+{
+    return base + WARP;
+}
+
+/* Multiple returns deliberately keep this helper on the ordinary CALL/RET
+ * ABI, providing a fallback regression alongside the inlined helpers. */
+int large_choice(int value)
+{
+    if (value < 0)
+        return -value;
+    if (value == 0)
+        return 1;
+    return value + 1;
+}
+
+int main(void)
+{
+    int failures = 0;
+
+    /* ++side must be evaluated exactly once when bound to twice's parameter. */
+    int side = 20;
+    int answer = twice(++side);
+    if (answer != 42 || side != 21)
+        failures = 1;
+
+    int total = 0;
+    for (int i = 0; i < 3; ++i)
+        total += mix(i, 10);
+    if (total != 36)
+        failures = 2;
+
+    int lanes = lane_value(7);
+    if (!warp_all(lanes == WARP + 7))
+        failures = 3;
+
+    int under_mask = 0;
+    if (WARP < 16)
+        under_mask = mix(WARP, 0);
+    else
+        under_mask = mix(WARP, 0);
+    if (!warp_all(under_mask == WARP + 1))
+        failures = 4;
+
+    if (large_choice(41) != 42)
+        failures = 5;
+
+    return failures ? 0 : 42;
+}

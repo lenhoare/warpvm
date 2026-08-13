@@ -122,6 +122,11 @@ add_test(NAME warpc_argsort_conditional
           ${CMAKE_SOURCE_DIR}/testprojects/argsort/argsort.wc
           ${CMAKE_BINARY_DIR}/warpc_argsort_conditional
           warpc_argsort_conditional)
+add_test(NAME warpc_inlining
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_acceptance.sh
+          ${WVM_WARPC} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/programs/warpc/inlining.wc
+          ${CMAKE_BINARY_DIR}/warpc_inlining warpc_inlining)
 add_test(NAME warpc_graphics
   COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_graphics.sh
           ${WVM_WARPC} $<TARGET_FILE:warpvm>

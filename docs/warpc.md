@@ -65,6 +65,18 @@ larger expressions. Definition parameters require names; prototype parameter
 names are optional. Recursion is rejected, and static call chains may not
 exceed WarpVM's eight-entry architectural call stack.
 
+The compiler conservatively inlines small, straight-line scalar helpers. An
+eligible helper has at most six statements and 48 expression/statement AST
+nodes, ends in one value-return statement, and contains no control flow,
+nested calls, arrays, structures, pointers, or address-taking. Actual
+arguments are first bound once to fresh caller-local slots; helper locals are
+also fresh at every call site, so side effects, parameter assignment, and name
+shadowing retain normal call semantics. Inlined result expressions keep their
+ordinary uniform/divergent analysis and may therefore execute inside existing
+divergent masks. Helpers outside this deliberately small policy continue to
+use the unchanged WarpVM CALL/RET ABI. Recursive helpers are never candidates
+and remain rejected by normal call-graph validation.
+
 Slice B requires controlling expressions to be uniform. This is checked in
 the typed semantic layer rather than inferred from the current lowering.
 Slice E relaxes that restriction specifically for structured `if` / `else`.

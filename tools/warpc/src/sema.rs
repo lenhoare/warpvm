@@ -402,6 +402,10 @@ pub enum TypedExprKind {
         postfix: bool,
         scale: usize,
     },
+    Inline {
+        statements: Vec<TypedStmt>,
+        result: Box<TypedExpr>,
+    },
     Call {
         function: FunctionId,
         args: Vec<TypedExpr>,
@@ -421,6 +425,13 @@ struct FunctionSymbol {
     span: Span,
     divergent_result: bool,
 }
+
+#[derive(Clone)]
+struct InlineCandidate {
+    params: Vec<ast::Parameter>,
+    statements: Vec<ast::Stmt>,
+    result: ast::Expr,
+}
 struct SwitchContext {
     labels: Vec<SwitchLabel>,
     values: HashMap<u32, Span>,
@@ -438,6 +449,7 @@ struct Analyzer {
     return_type: Type,
     functions: Vec<FunctionSymbol>,
     function_ids: HashMap<String, FunctionId>,
+    inline_candidates: HashMap<FunctionId, InlineCandidate>,
     current_function: Option<FunctionId>,
     call_edges: Vec<Vec<FunctionId>>,
     loop_depth: usize,
@@ -459,6 +471,7 @@ impl Analyzer {
             return_type: Type::VOID,
             functions: Vec::new(),
             function_ids: HashMap::new(),
+            inline_candidates: HashMap::new(),
             current_function: None,
             call_edges: Vec::new(),
             loop_depth: 0,
@@ -478,6 +491,7 @@ impl Analyzer {
             self.register_function(function)?;
         }
         self.summarize_function_divergence(&program.functions);
+        self.inline_candidates = collect_inline_candidates(&program.functions, &self.function_ids);
         self.call_edges.resize(self.functions.len(), Vec::new());
         let Some(&main) = self.function_ids.get("main") else {
             return Err(Diagnostic::new(
@@ -558,6 +572,16 @@ impl Analyzer {
         }
         self.current_function = None;
         self.validate_call_graph()?;
+        let normally_called: std::collections::HashSet<FunctionId> = self
+            .call_edges
+            .iter()
+            .flat_map(|callees| callees.iter().copied())
+            .collect();
+        typed_functions.retain(|function| {
+            function.id == main
+                || !self.inline_candidates.contains_key(&function.id)
+                || normally_called.contains(&function.id)
+        });
         let function_names = self.functions.iter().map(|f| f.name.clone()).collect();
         Ok(TypedProgram {
             functions: typed_functions,
@@ -1520,12 +1544,6 @@ impl Analyzer {
                 span,
             });
         }
-        if self.divergent_depth != 0 {
-            return Err(Diagnostic::new(
-                span,
-                "function calls inside divergent control flow are not supported in Slice E",
-            ));
-        }
         let Some(&function) = self.function_ids.get(&callee) else {
             return Err(Diagnostic::new(
                 span,
@@ -1544,6 +1562,15 @@ impl Analyzer {
                     symbol.params.len(),
                     args.len()
                 ),
+            ));
+        }
+        if let Some(candidate) = self.inline_candidates.get(&function).cloned() {
+            return self.inline_call(candidate, args, &symbol, span);
+        }
+        if self.divergent_depth != 0 {
+            return Err(Diagnostic::new(
+                span,
+                "function calls inside divergent control flow are not supported in Slice E",
             ));
         }
         let mut typed_args = Vec::new();
@@ -1571,6 +1598,77 @@ impl Analyzer {
             uniformity,
             span,
         })
+    }
+
+    fn inline_call(
+        &mut self,
+        candidate: InlineCandidate,
+        args: Vec<ast::Expr>,
+        symbol: &FunctionSymbol,
+        span: Span,
+    ) -> Result<TypedExpr, Diagnostic> {
+        let mut typed_args = Vec::with_capacity(args.len());
+        for (arg, param) in args.into_iter().zip(&symbol.params) {
+            let arg = self.expr(arg)?;
+            self.require_assignable(*param, &arg, "function argument")?;
+            typed_args.push(arg);
+        }
+
+        self.scopes.push(HashMap::new());
+        let result = (|| {
+            let mut statements = Vec::new();
+            for ((parameter, ty), init) in candidate
+                .params
+                .into_iter()
+                .zip(&symbol.params)
+                .zip(typed_args)
+            {
+                let name = parameter.ty.declarator.name.unwrap();
+                let local = self.locals.len();
+                let uniformity = if self.divergent_depth != 0 {
+                    Uniformity::Divergent
+                } else {
+                    init.uniformity
+                };
+                self.locals.push(LocalInfo {
+                    name: format!("{name} [inlined {}]", symbol.name),
+                    ty: *ty,
+                    span: parameter.span,
+                    uniformity,
+                    // Inlined bindings live in fixed caller-frame slots. This
+                    // prevents a helper expanded inside a deep expression
+                    // from consuming the caller's scarce vector registers.
+                    address_taken: true,
+                    frame_offset: None,
+                });
+                self.scopes.last_mut().unwrap().insert(name, local);
+                statements.push(TypedStmt::Decl {
+                    local,
+                    init: Some(TypedInitializer::Expr(init)),
+                    span: parameter.span,
+                });
+            }
+            for statement in candidate.statements {
+                let statement = self.statement(statement)?;
+                if let TypedStmt::Decl { local, .. } = &statement {
+                    self.locals[*local].address_taken = true;
+                }
+                statements.push(statement);
+            }
+            let result = self.expr(candidate.result)?;
+            self.require_assignable(symbol.return_type, &result, "return value")?;
+            Ok(TypedExpr {
+                ty: symbol.return_type,
+                uniformity: result.uniformity,
+                kind: TypedExprKind::Inline {
+                    statements,
+                    result: Box::new(result),
+                },
+                span,
+            })
+        })();
+        self.scopes.pop();
+        result
     }
 
     fn min_max(
@@ -2268,6 +2366,140 @@ fn scan_expr_divergence(
     }
 }
 
+const MAX_INLINE_STATEMENTS: usize = 6;
+const MAX_INLINE_AST_NODES: usize = 48;
+
+fn collect_inline_candidates(
+    functions: &[ast::Function],
+    function_ids: &HashMap<String, FunctionId>,
+) -> HashMap<FunctionId, InlineCandidate> {
+    let mut candidates = HashMap::new();
+    for function in functions {
+        let Some(body) = &function.body else { continue };
+        if !plain_scalar_decl(&function.return_type)
+            || function.params.iter().any(|parameter| {
+                parameter.ty.declarator.name.is_none() || !plain_scalar_decl(&parameter.ty)
+            })
+            || body.statements.is_empty()
+            || body.statements.len() > MAX_INLINE_STATEMENTS
+        {
+            continue;
+        }
+        let Some((last, statements)) = body.statements.split_last() else {
+            continue;
+        };
+        let ast::Stmt::Return(Some(result), _) = last else {
+            continue;
+        };
+        if statements.iter().any(|statement| match statement {
+            ast::Stmt::Decl { ty, init, .. } => {
+                !plain_scalar_decl(ty)
+                    || init
+                        .as_ref()
+                        .is_some_and(inline_expr_has_unsupported_operation)
+            }
+            ast::Stmt::Expr(Some(expr), _) => inline_expr_has_unsupported_operation(expr),
+            _ => true,
+        }) || inline_expr_has_unsupported_operation(result)
+        {
+            continue;
+        }
+        let nodes = statements.iter().map(inline_statement_nodes).sum::<usize>()
+            + inline_expr_nodes(result);
+        if nodes > MAX_INLINE_AST_NODES {
+            continue;
+        }
+        candidates.insert(
+            function_ids[&function.name],
+            InlineCandidate {
+                params: function.params.clone(),
+                statements: statements.to_vec(),
+                result: result.clone(),
+            },
+        );
+    }
+    candidates
+}
+
+fn plain_scalar_decl(decl: &ast::DeclType) -> bool {
+    decl.declarator.pointers == 0
+        && decl.declarator.array_len.is_none()
+        && matches!(
+            decl.base,
+            ast::TypeName::Int | ast::TypeName::Unsigned | ast::TypeName::Char
+        )
+}
+
+fn inline_statement_nodes(statement: &ast::Stmt) -> usize {
+    match statement {
+        ast::Stmt::Decl { init, .. } => 1 + init.as_ref().map_or(0, inline_expr_nodes),
+        ast::Stmt::Expr(expr, _) => 1 + expr.as_ref().map_or(0, inline_expr_nodes),
+        _ => MAX_INLINE_AST_NODES + 1,
+    }
+}
+
+fn inline_expr_nodes(expr: &ast::Expr) -> usize {
+    match &expr.kind {
+        ast::ExprKind::Call { args, .. } => 1 + args.iter().map(inline_expr_nodes).sum::<usize>(),
+        ast::ExprKind::Unary(_, operand) | ast::ExprKind::SizeofExpr(operand) => {
+            1 + inline_expr_nodes(operand)
+        }
+        ast::ExprKind::Binary(_, left, right)
+        | ast::ExprKind::Assign(_, left, right)
+        | ast::ExprKind::Index(left, right) => {
+            1 + inline_expr_nodes(left) + inline_expr_nodes(right)
+        }
+        ast::ExprKind::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            1 + inline_expr_nodes(condition)
+                + inline_expr_nodes(then_expr)
+                + inline_expr_nodes(else_expr)
+        }
+        ast::ExprKind::Member { base, .. } => 1 + inline_expr_nodes(base),
+        ast::ExprKind::Number(_)
+        | ast::ExprKind::Char(_)
+        | ast::ExprKind::String(_)
+        | ast::ExprKind::Name(_)
+        | ast::ExprKind::SizeofType(_) => 1,
+    }
+}
+
+fn inline_expr_has_unsupported_operation(expr: &ast::Expr) -> bool {
+    match &expr.kind {
+        // Excluding all calls keeps candidate selection acyclic and avoids
+        // multiplying another helper's ABI or collective constraints.
+        ast::ExprKind::Call { .. }
+        | ast::ExprKind::Index(_, _)
+        | ast::ExprKind::Member { .. }
+        | ast::ExprKind::String(_) => true,
+        ast::ExprKind::Unary(op, operand) => {
+            matches!(op, ast::UnaryOp::AddressOf | ast::UnaryOp::Deref)
+                || inline_expr_has_unsupported_operation(operand)
+        }
+        ast::ExprKind::Binary(_, left, right) | ast::ExprKind::Assign(_, left, right) => {
+            inline_expr_has_unsupported_operation(left)
+                || inline_expr_has_unsupported_operation(right)
+        }
+        ast::ExprKind::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            inline_expr_has_unsupported_operation(condition)
+                || inline_expr_has_unsupported_operation(then_expr)
+                || inline_expr_has_unsupported_operation(else_expr)
+        }
+        ast::ExprKind::SizeofExpr(operand) => inline_expr_has_unsupported_operation(operand),
+        ast::ExprKind::Number(_)
+        | ast::ExprKind::Char(_)
+        | ast::ExprKind::Name(_)
+        | ast::ExprKind::SizeofType(_) => false,
+    }
+}
+
 fn value_type(ty: Type) -> Type {
     ty.decay()
 }
@@ -2761,7 +2993,7 @@ mod tests {
         .unwrap_err();
         assert!(err.message.contains("while condition must be uniform"));
         let err = source(
-            "int f(void) { return 1; } int main(void) { int lane=warp_lane_id(); int x=0; if (lane<16) x=f(); return 42; }",
+            "int f(void) { if (warp_vm_id()) return 2; return 1; } int main(void) { int lane=warp_lane_id(); int x=0; if (lane<16) x=f(); return 42; }",
         )
         .unwrap_err();
         assert!(err.message.contains("function calls inside divergent"));
@@ -2779,5 +3011,35 @@ mod tests {
             panic!()
         };
         assert_eq!(condition.uniformity, Uniformity::Divergent);
+    }
+
+    #[test]
+    fn inline_helper_preserves_argument_evaluation_and_result_uniformity() {
+        let p = source(
+            "int twice(int x){return x*2;} int lane_value(int base){int out=base+WARP;return out;} int main(void){int side=0;int answer=twice(++side);int lanes=lane_value(10);return answer+lanes-lanes+40;}",
+        )
+        .unwrap();
+        let side = p.locals.iter().find(|local| local.name == "side").unwrap();
+        assert_eq!(side.uniformity, Uniformity::Uniform);
+        let answer = p
+            .locals
+            .iter()
+            .find(|local| local.name == "answer")
+            .unwrap();
+        let lanes = p.locals.iter().find(|local| local.name == "lanes").unwrap();
+        assert_eq!(answer.uniformity, Uniformity::Uniform);
+        assert_eq!(lanes.uniformity, Uniformity::Divergent);
+        assert!(p
+            .functions
+            .iter()
+            .all(|function| function.name != "twice" && function.name != "lane_value"));
+    }
+
+    #[test]
+    fn tiny_helper_is_allowed_inside_divergent_control() {
+        source(
+            "int add(int a,int b){int sum=a+b;return sum;} int main(void){int x=0;if(WARP<16)x=add(WARP,1);else x=add(WARP,1);return 42+x-x;}",
+        )
+        .unwrap();
     }
 }
