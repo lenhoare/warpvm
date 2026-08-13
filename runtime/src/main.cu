@@ -27,6 +27,7 @@
 #include "host/persistent.h"
 #include "host/ptx_compiler.h"
 #include "host/supervisor.h"
+#include "host/supervisor_cli.h"
 #include "host/vm_image.h"
 #include "host/wvm_file.h"
 
@@ -4184,6 +4185,8 @@ void Usage(const char* argv0) {
   std::printf("  slice1..slice5,slice7  self-test suites\n");
   std::printf("  hetero_tests           shared-program heterogeneous VM tests\n");
   std::printf("  supervisor_tests       dynamic VM lifecycle/recycling tests\n");
+  std::printf("  supervise [--script FILE] [--interactive]\n");
+  std::printf("                  long-lived heterogeneous CPU supervisor console\n");
   std::printf("  gfxa | gfxb            v0.1.1 graphics slices A/B self-tests\n");
   std::printf("  gfxsmoke <file.wvm>    headless framebuffer-copy smoke test\n");
   std::printf("  gfx_cap <file.wvm> [--vms N]\n");
@@ -4356,6 +4359,22 @@ int main(int argc, char** argv) {
     return RunHeterogeneousProgramTests();
   if (std::strcmp(cmd, "supervisor_tests") == 0)
     return RunSupervisorLifecycleTests();
+  if (std::strcmp(cmd, "supervise") == 0) {
+    const char* script_path = nullptr;
+    bool interactive = false;
+    for (int i = 2; i < argc; ++i) {
+      if (std::strcmp(argv[i], "--script") == 0 && i + 1 < argc)
+        script_path = argv[++i];
+      else if (std::strcmp(argv[i], "--interactive") == 0)
+        interactive = true;
+      else {
+        std::fprintf(stderr, "error: unknown supervise option '%s'\n",
+                     argv[i]);
+        return 2;
+      }
+    }
+    return wvm::RunSupervisorCli(script_path, interactive);
+  }
   if (std::strcmp(cmd, "gfxa") == 0) return RunSliceGfxA();
   if (std::strcmp(cmd, "gfxb") == 0) return RunSliceGfxB();
   if (std::strcmp(cmd, "gfxsmoke") == 0) {

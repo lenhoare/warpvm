@@ -550,13 +550,21 @@ class PersistentRuntime {
     return true;
   }
 
-  bool ResumeSlot(VmSlot slot, std::string& err) {
+  bool ResumeSlot(VmSlot slot, std::string& err, int timeout_ms = 2000) {
     if (!RequireOccupied(slot, err)) return false;
     if (Status(slot) != kPaused) {
       err = "VM resume requires STOPPED state";
       return false;
     }
     SendCmd(slot, kCmdRun);
+    for (int waited = 0; waited < timeout_ms; ++waited) {
+      if (Status(slot) != kPaused) return true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (Status(slot) == kPaused) {
+      err = "timed out waiting for VM to acknowledge resume";
+      return false;
+    }
     return true;
   }
 
@@ -719,6 +727,13 @@ class PersistentRuntime {
                d_framebuffers_ + static_cast<size_t>(first_vm) * kVideoWords,
                words * sizeof(uint32_t), cudaMemcpyDeviceToHost) ==
            cudaSuccess;
+  }
+  // Diagnostic mailbox snapshot. A RUNNING VM may change the ring while the
+  // copy is in flight; stopped VMs provide a stable inspection point.
+  bool ReadMailbox(VmSlot slot, Mailbox& out) const {
+    if (slot >= num_vms_ || d_mailboxes_ == nullptr) return false;
+    return cudaMemcpy(&out, &d_mailboxes_[slot], sizeof(Mailbox),
+                      cudaMemcpyDeviceToHost) == cudaSuccess;
   }
 
   // ---- status reads (mapped memory, no sync needed) -----------------------

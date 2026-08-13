@@ -122,6 +122,46 @@ GPU lifecycle regression with:
 build/runtime/warpvm supervisor_tests
 ```
 
+## Long-lived CPU supervisor
+
+`warpvm supervise` exposes the same supervisor operations through a small
+line-oriented console. Programs are loaded first, then a fixed resident
+capacity is launched and logical VMs are created within it:
+
+```text
+program load plasma build/plasma.wvm
+program load mandelbrot build/mandelbrot.wvm
+launch 8
+vm create plasma
+vm create mandelbrot
+vm start 0
+vm start 1
+list
+view
+```
+
+Run it interactively or from a repeatable startup file:
+
+```sh
+build/runtime/warpvm supervise
+build/runtime/warpvm supervise --script population.wvs
+build/runtime/warpvm supervise --script population.wvs --interactive
+```
+
+Commands use stable logical VM IDs for lifecycle and inspection. `list` keeps
+logical ID, resident slot, program, engine, lifecycle and device status
+separate. `view [vm-id ...]` likewise binds tiles to logical IDs and returns to
+the still-running supervisor when the window closes. The ready-made four
+program demonstration is:
+
+```sh
+programs/supervisor_demo.sh
+```
+
+The initial population epoch deliberately requires program images to be
+loaded before `launch`; adding new device program bodies to an already-running
+population is part of the compiled population-epoch slice.
+
 ## Attach and single-step (slice 6)
 
 `attach` boots resident VMs and drops into an interactive console to inspect
@@ -249,6 +289,7 @@ control-poll, and memory breakdown is in
 | v0.1.6 | publication-safe mailboxes and continuously resident compiled messaging/control/viewer | done |
 | v0.1.7-A/B | stable logical VM IDs, shared program registry, heterogeneous interpreted population | done |
 | v0.1.7-C/D | fixed-capacity supervisor lifecycle, safe slot recycling and cold program rebind | done |
+| v0.1.7-E | long-lived supervisor CLI, startup files and logical-ID viewer | done |
 
 ## v0.1 milestone
 

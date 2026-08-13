@@ -49,6 +49,10 @@ class Supervisor {
   const ProgramRegistry& programs() const { return programs_; }
   PersistentRuntime& runtime() { return runtime_; }
   const PersistentRuntime& runtime() const { return runtime_; }
+  bool launched() const { return launched_; }
+  uint32_t capacity() const {
+    return static_cast<uint32_t>(instances_.size());
+  }
 
   bool ProgramLoad(const std::string& path, const std::string& name,
                    LoadedProgramId& result, std::string& err) {
@@ -77,6 +81,10 @@ class Supervisor {
   bool Launch(uint32_t capacity, std::string& err) {
     if (launched_) {
       err = "supervisor population is already resident";
+      return false;
+    }
+    if (programs_.size() == 0) {
+      err = "load at least one program before resident launch";
       return false;
     }
     directory_.Reset(capacity);
@@ -168,7 +176,11 @@ class Supervisor {
       return false;
     }
     if (!runtime_.ResumeSlot(vm->slot.value, err)) return false;
-    vm->lifecycle = VmLifecycle::kRunning;
+    const uint32_t status = runtime_.Status(vm->slot.value);
+    vm->lifecycle = status == kHalted
+                        ? VmLifecycle::kHalted
+                        : status == kFaulted ? VmLifecycle::kFaulted
+                                             : VmLifecycle::kRunning;
     return true;
   }
 
@@ -185,6 +197,24 @@ class Supervisor {
     if (!runtime_.ResetSlot(programs_, vm->slot.value, timeout_ms, err))
       return false;
     vm->lifecycle = VmLifecycle::kReady;
+    return true;
+  }
+
+  bool VmSetEngine(LogicalVmId id, ExecutionEngine engine,
+                   std::string& err) {
+    VmInstanceInfo* vm = FindMutable(id, err);
+    if (vm == nullptr) return false;
+    Refresh(*vm);
+    if (vm->lifecycle == VmLifecycle::kRunning) {
+      err = "engine selection requires a non-RUNNING VM";
+      return false;
+    }
+    if (engine == ExecutionEngine::kCompiled) {
+      err = "heterogeneous compiled execution is not available until the "
+            "compiled population-kernel slice";
+      return false;
+    }
+    vm->engine = engine;
     return true;
   }
 

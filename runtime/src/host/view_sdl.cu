@@ -15,6 +15,7 @@
 #include "gpu/warpvm.cuh"
 #include "host/persistent.h"
 #include "host/ptx_compiler.h"
+#include "host/supervisor.h"
 #include "host/vm_image.h"
 #include "host/wvm_file.h"
 
@@ -59,11 +60,17 @@ SDL_Rect FitToWindow(SDL_Renderer* renderer, const ViewerLayout& layout) {
 
 int PresentRuntime(PersistentRuntime& rt, const std::string& source,
                    uint32_t first_vm, const ViewerLayout& layout,
-                   const char* mode) {
-  if (SDL_Init(SDL_INIT_VIDEO) != 0) {
-    std::fprintf(stderr, "error: SDL_Init: %s\n", SDL_GetError());
+                   const char* mode,
+                   const std::vector<VmId>* logical_ids = nullptr,
+                   bool owns_runtime = true) {
+  auto shutdown_owned_runtime = [&]() {
+    if (!owns_runtime) return;
     rt.ShutdownAll();
     rt.Sync();
+  };
+  if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+    std::fprintf(stderr, "error: SDL_Init: %s\n", SDL_GetError());
+    shutdown_owned_runtime();
     return 1;
   }
 
@@ -92,7 +99,9 @@ int PresentRuntime(PersistentRuntime& rt, const std::string& source,
     std::snprintf(title, sizeof(title), "WarpVM - %u VMs (%ux%u)",
                   layout.displayed_vms, layout.columns, layout.rows);
   } else {
-    std::snprintf(title, sizeof(title), "WarpVM - VM %u", first_vm);
+    const VmId shown_id = logical_ids == nullptr ? first_vm
+                                                  : logical_ids->front();
+    std::snprintf(title, sizeof(title), "WarpVM - VM %u", shown_id);
   }
 
   SDL_Window* win = SDL_CreateWindow(
@@ -101,8 +110,7 @@ int PresentRuntime(PersistentRuntime& rt, const std::string& source,
   if (!win) {
     std::fprintf(stderr, "error: SDL_CreateWindow: %s\n", SDL_GetError());
     SDL_Quit();
-    rt.ShutdownAll();
-    rt.Sync();
+    shutdown_owned_runtime();
     return 1;
   }
   SDL_Renderer* ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED);
@@ -111,8 +119,7 @@ int PresentRuntime(PersistentRuntime& rt, const std::string& source,
     std::fprintf(stderr, "error: SDL_CreateRenderer: %s\n", SDL_GetError());
     SDL_DestroyWindow(win);
     SDL_Quit();
-    rt.ShutdownAll();
-    rt.Sync();
+    shutdown_owned_runtime();
     return 1;
   }
   SDL_Texture* tex = SDL_CreateTexture(
@@ -124,8 +131,7 @@ int PresentRuntime(PersistentRuntime& rt, const std::string& source,
     SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(win);
     SDL_Quit();
-    rt.ShutdownAll();
-    rt.Sync();
+    shutdown_owned_runtime();
     return 1;
   }
   SDL_SetTextureScaleMode(tex, SDL_ScaleModeNearest);
@@ -143,8 +149,7 @@ int PresentRuntime(PersistentRuntime& rt, const std::string& source,
     SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(win);
     SDL_Quit();
-    rt.ShutdownAll();
-    rt.Sync();
+    shutdown_owned_runtime();
     return 1;
   }
 
@@ -154,13 +159,17 @@ int PresentRuntime(PersistentRuntime& rt, const std::string& source,
                 mode, layout.displayed_vms, source.c_str(), layout.columns,
                 layout.rows);
   } else {
+    const VmId shown_id = logical_ids == nullptr ? first_vm
+                                                  : logical_ids->front();
     std::printf("view%s: VM %u from %s (close window or Esc to exit)\n",
-                mode, first_vm, source.c_str());
+                mode, shown_id, source.c_str());
   }
 
   std::vector<uint32_t> framebuffers;
   std::vector<uint32_t> last_seq(layout.displayed_vms, 0);
   std::vector<uint32_t> current_seq(layout.displayed_vms, 0);
+  std::vector<VmSlot> last_slots(layout.displayed_vms, kInvalidVmSlot);
+  std::vector<VmSlot> current_slots(layout.displayed_vms, kInvalidVmSlot);
   bool running = true;
   while (running) {
     SDL_Event e;
@@ -172,37 +181,69 @@ int PresentRuntime(PersistentRuntime& rt, const std::string& source,
 
     bool refresh = false;
     for (uint32_t tile = 0; tile < layout.displayed_vms; ++tile) {
-      current_seq[tile] = rt.FrameSeq(first_vm + tile);
-      refresh |= current_seq[tile] != last_seq[tile];
+      current_slots[tile] =
+          logical_ids == nullptr
+              ? first_vm + tile
+              : rt.SlotForVmId((*logical_ids)[tile]);
+      current_seq[tile] = current_slots[tile] == kInvalidVmSlot
+                              ? 0
+                              : rt.FrameSeq(current_slots[tile]);
+      refresh |= current_seq[tile] != last_seq[tile] ||
+                 current_slots[tile] != last_slots[tile];
     }
 
-    if (refresh &&
-        rt.ReadFramebuffers(first_vm, layout.displayed_vms, framebuffers)) {
+    const bool copied =
+        !refresh ? false
+                 : logical_ids == nullptr
+                       ? rt.ReadFramebuffers(first_vm, layout.displayed_vms,
+                                             framebuffers)
+                       : rt.ReadFramebuffers(0, rt.num_vms(), framebuffers);
+    if (refresh && copied) {
       if (grid) {
         // Device storage is VM-major; the SDL texture is a row-major atlas.
         // Compose changed tiles on the CPU, then upload the atlas once.
         for (uint32_t tile = 0; tile < layout.displayed_vms; ++tile) {
-          if (current_seq[tile] == last_seq[tile]) continue;
+          if (current_seq[tile] == last_seq[tile] &&
+              current_slots[tile] == last_slots[tile])
+            continue;
           const uint32_t tile_x = (tile % layout.columns) * kVideoWidth;
           const uint32_t tile_y = (tile / layout.columns) * kVideoHeight;
-          const uint32_t* source =
-              framebuffers.data() + static_cast<size_t>(tile) * kVideoWords;
+          const bool present = current_slots[tile] != kInvalidVmSlot;
+          const size_t source_slot = logical_ids == nullptr
+                                         ? tile
+                                         : current_slots[tile];
+          const uint32_t* tile_source =
+              present ? framebuffers.data() + source_slot * kVideoWords
+                      : nullptr;
           for (uint32_t y = 0; y < kVideoHeight; ++y) {
             uint32_t* destination =
                 atlas.data() + static_cast<size_t>(tile_y + y) *
                                    layout.texture_width +
                 tile_x;
-            std::copy_n(source + static_cast<size_t>(y) * kVideoWidth,
-                        kVideoWidth, destination);
+            if (tile_source != nullptr)
+              std::copy_n(tile_source + static_cast<size_t>(y) * kVideoWidth,
+                          kVideoWidth, destination);
+            else
+              std::fill_n(destination, kVideoWidth, kVideoResetColor);
           }
         }
         if (SDL_UpdateTexture(tex, nullptr, atlas.data(),
                               layout.texture_width * sizeof(uint32_t)) == 0) {
           last_seq = current_seq;
+          last_slots = current_slots;
         }
-      } else if (SDL_UpdateTexture(tex, nullptr, framebuffers.data(),
-                                   kVideoWidth * sizeof(uint32_t)) == 0) {
-        last_seq = current_seq;
+      } else {
+        const uint32_t* single_source =
+            current_slots[0] == kInvalidVmSlot
+                ? atlas.data()
+                : framebuffers.data() +
+                      (logical_ids == nullptr ? 0 : current_slots[0]) *
+                          kVideoWords;
+        if (SDL_UpdateTexture(tex, nullptr, single_source,
+                              kVideoWidth * sizeof(uint32_t)) == 0) {
+          last_seq = current_seq;
+          last_slots = current_slots;
+        }
       }
     }
 
@@ -213,8 +254,11 @@ int PresentRuntime(PersistentRuntime& rt, const std::string& source,
     SDL_Delay(16);  // ~60 fps cap; keeps the display GPU responsive
   }
 
-  rt.ShutdownAll();
-  const cudaError_t sync_result = rt.Sync();
+  cudaError_t sync_result = cudaSuccess;
+  if (owns_runtime) {
+    rt.ShutdownAll();
+    sync_result = rt.Sync();
+  }
   SDL_DestroyTexture(tex);
   SDL_DestroyRenderer(ren);
   SDL_DestroyWindow(win);
@@ -338,6 +382,34 @@ int ViewHeterogeneousGrid(const std::vector<std::string>& paths) {
   return PresentRuntime(rt, "heterogeneous registry", 0,
                         MakeGridLayout(static_cast<uint32_t>(paths.size())),
                         " (heterogeneous interpreted)");
+}
+
+int ViewSupervisorPopulation(Supervisor& supervisor,
+                             const std::vector<VmId>& logical_ids) {
+  if (!supervisor.launched() || logical_ids.empty() ||
+      logical_ids.size() > kMaxVms) {
+    std::fprintf(stderr, "error: supervisor view requires active VMs\n");
+    return 2;
+  }
+  for (VmId id : logical_ids) {
+    if (supervisor.Find(LogicalVmId{id}) == nullptr) {
+      std::fprintf(stderr, "error: logical VM %u is not active\n", id);
+      return 2;
+    }
+  }
+  std::printf("supervisor view logical mapping:\n");
+  for (VmId id : logical_ids) {
+    const VmInstanceInfo* vm = supervisor.Find(LogicalVmId{id});
+    const ProgramInfo* program = supervisor.programs().Find(vm->program_id);
+    std::printf("  tile VM %u -> slot %u -> %s -> %s\n", id,
+                vm->slot.value,
+                program == nullptr ? "?" : program->name.c_str(),
+                LifecycleName(vm->lifecycle));
+  }
+  return PresentRuntime(
+      supervisor.runtime(), "CPU supervisor", 0,
+      MakeGridLayout(static_cast<uint32_t>(logical_ids.size())),
+      " (stable logical IDs)", &logical_ids, false);
 }
 
 }  // namespace wvm

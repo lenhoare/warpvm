@@ -153,6 +153,27 @@ device code allocations remain until shutdown. Program unload is still allowed
 after its last VM reference disappears; adding new device program images while
 the kernel is resident is deferred to the controlled population-epoch work.
 
+### Long-lived supervisor frontend
+
+`warpvm supervise` is a line-oriented frontend over the same `Supervisor` C++
+API used by tests. Interactive input and startup files share one parser and one
+operation implementation; a failed startup-file command reports its line and
+aborts instead of leaving a partially configured unattended population.
+
+The frontend separates its phases explicitly: load immutable program objects,
+`launch <capacity>`, then create and operate logical VMs. Commands cover
+create/delete/start/stop/resume/reset, cold program replacement, engine
+metadata, deterministic state waits, and existing register/RAM/disassembly/
+framebuffer/log inspection. All VM operands are logical IDs and are resolved to
+slots at the point of use.
+
+The supervisor viewer snapshots the requested logical IDs as tile identities,
+but resolves each ID through the live route directory on every refresh. A
+logical machine therefore remains attached to its tile if its resident slot
+changes; deletion blanks that logical tile rather than showing an unrelated VM
+which later occupies the slot. Closing the viewer returns to the command loop
+without stopping the resident population.
+
 ## Messaging
 
 Fixed 16-byte messages. The header packs `src_vm` (low 16 bits) and
