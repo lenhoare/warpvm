@@ -1,0 +1,33 @@
+# Heterogeneous compiled resident population.
+#
+# First build the four images (programs/supervisor_demo.sh does this), or run
+# the four warpc commands documented in README.md. Then, from the repository
+# root:
+#
+#   ./build/runtime/warpvm supervise --script programs/population.wvs --interactive
+#
+# Change `compiled` to `interpreted` to run the same population through the
+# bytecode interpreter. All VM commands continue to use stable logical IDs.
+
+program load plasma build/supervisor_demo/plasma.wvm
+program load mandelbrot build/supervisor_demo/mandelbrot.wvm
+program load wave build/supervisor_demo/wave.wvm
+program load sandpile build/supervisor_demo/sandpile.wvm
+
+launch 8 compiled
+
+vm create plasma
+vm create mandelbrot
+vm create wave
+vm create sandpile
+
+vm start 0
+vm start 1
+vm start 2
+vm start 3
+
+wait 0 RUNNING 5000
+wait 1 RUNNING 5000
+wait 2 RUNNING 5000
+wait 3 RUNNING 5000
+list

@@ -159,6 +159,18 @@ class PersistentRuntime {
     h_program_ids_.assign(num_vms_, kInvalidVmId);
     h_program_names_.resize(num_vms_);
 
+    if (cudaMalloc(reinterpret_cast<void**>(&d_slot_program_ids_),
+                   num_vms_ * sizeof(ProgramId)) != cudaSuccess) {
+      err = "cudaMalloc slot program IDs failed";
+      return false;
+    }
+    if (cudaMemcpy(d_slot_program_ids_, h_program_ids_.data(),
+                   num_vms_ * sizeof(ProgramId),
+                   cudaMemcpyHostToDevice) != cudaSuccess) {
+      err = "slot program ID initialization failed";
+      return false;
+    }
+
     if (cudaHostAlloc(&h_ctrl_, sizeof(Control), cudaHostAllocMapped) !=
         cudaSuccess) {
       err = "cudaHostAlloc failed";
@@ -308,8 +320,9 @@ class PersistentRuntime {
       err = "resident slot is already occupied";
       return false;
     }
-    if (binding.engine != ExecutionEngine::kInterpreted) {
-      err = "resident lifecycle currently supports interpreted VMs only";
+    if (binding.engine != ExecutionEngine::kInterpreted &&
+        binding.engine != ExecutionEngine::kCompiled) {
+      err = "unknown resident execution engine";
       return false;
     }
     const ProgramInfo* program = registry.Find(binding.program_id);
@@ -403,6 +416,20 @@ class PersistentRuntime {
                    cudaMemcpyHostToDevice) != cudaSuccess) {
       h_vm_routes_[vm_id] = kInvalidVmSlot;
       err = "VM route publication failed";
+      return false;
+    }
+    // Publish the body selector last. A compiled resident warp may observe it
+    // immediately and enter the selected body, so every descriptor/state,
+    // mailbox and route dependency must already be valid.
+    const ProgramId program_id = binding.program_id.value;
+    if (cudaMemcpy(&d_slot_program_ids_[slot], &program_id,
+                   sizeof(program_id), cudaMemcpyHostToDevice) !=
+        cudaSuccess) {
+      h_vm_routes_[vm_id] = kInvalidVmSlot;
+      const VmSlot invalid_route = kInvalidVmSlot;
+      cudaMemcpy(&d_vm_routes_[vm_id], &invalid_route, sizeof(invalid_route),
+                 cudaMemcpyHostToDevice);
+      err = "slot program ID publication failed";
       return false;
     }
     h_ctrl_->cmd[slot] = kCmdNone;
@@ -513,7 +540,9 @@ class PersistentRuntime {
   void* DeviceControl() const { return d_ctrl_; }
   void* DeviceMailboxes() const { return d_mailboxes_; }
   void* DeviceVmRoutes() const { return d_vm_routes_; }
+  void* DeviceSlotProgramIds() const { return d_slot_program_ids_; }
   cudaStream_t Stream() const { return stream_; }
+  void MarkExternallyLaunched() { launched_ = true; }
 
   // ---- host commands -----------------------------------------------------
   void SendCmd(uint32_t vm, VmCmd cmd) { h_ctrl_->cmd[vm] = cmd; }
@@ -602,6 +631,32 @@ class PersistentRuntime {
       }
     }
     h_vm_routes_[old_vm_id] = kInvalidVmSlot;
+
+    // The compiled population wrapper withdraws this selector before its
+    // acknowledgement so it cannot re-enter the retired body. Repeat the
+    // store here for the interpreter path and as a host-side invariant.
+    const ProgramId invalid_program = kInvalidVmId;
+    if (cudaMemcpy(&d_slot_program_ids_[slot], &invalid_program,
+                   sizeof(invalid_program), cudaMemcpyHostToDevice) !=
+        cudaSuccess) {
+      err = "slot program ID withdrawal failed";
+      return false;
+    }
+
+    // Deactivation drains and invalidates a live mailbox but deliberately
+    // does not rewrite the ring while senders may still be pinned to it.
+    // Once acknowledgement arrives the host owns the slot and can install a
+    // pristine ring for the next logical VM.
+    Mailbox retired_mailbox{};
+    retired_mailbox.owner_vm_id = kInvalidVmId;
+    for (uint32_t entry = 0; entry < kMailboxSlots; ++entry)
+      retired_mailbox.slots[entry].sequence = entry;
+    if (cudaMemcpy(&d_mailboxes_[slot], &retired_mailbox,
+                   sizeof(retired_mailbox), cudaMemcpyHostToDevice) !=
+        cudaSuccess) {
+      err = "VM mailbox retirement failed";
+      return false;
+    }
 
     const VmDesc empty_desc{
         nullptr, 0, nullptr, 0, d_mem_[slot], 0,
@@ -797,6 +852,8 @@ class PersistentRuntime {
     if (d_states_) cudaFree(d_states_), d_states_ = nullptr;
     if (d_mailboxes_) cudaFree(d_mailboxes_), d_mailboxes_ = nullptr;
     if (d_vm_routes_) cudaFree(d_vm_routes_), d_vm_routes_ = nullptr;
+    if (d_slot_program_ids_)
+      cudaFree(d_slot_program_ids_), d_slot_program_ids_ = nullptr;
     if (d_framebuffers_) cudaFree(d_framebuffers_), d_framebuffers_ = nullptr;
     for (const DeviceProgram& program : d_programs_) {
       if (program.code) cudaFree(program.code);
@@ -849,6 +906,7 @@ class PersistentRuntime {
   VmState* d_states_ = nullptr;
   Mailbox* d_mailboxes_ = nullptr;
   VmSlot* d_vm_routes_ = nullptr;
+  ProgramId* d_slot_program_ids_ = nullptr;
   uint32_t* d_framebuffers_ = nullptr;  // flat pool: num_vms_ * kVideoWords
   std::vector<DeviceProgram> d_programs_;
   std::vector<uint32_t*> d_mem_;

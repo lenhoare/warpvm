@@ -9,6 +9,7 @@ warpc=${build_dir}/tools-rust/release/warpc
 warpvm=${build_dir}/runtime/warpvm
 output_dir=${build_dir}/supervisor_demo
 startup=${output_dir}/population.wvs
+engine=${WARPVM_ENGINE:-compiled}
 
 if [[ ! -x "${warpc}" || ! -x "${warpvm}" ]]; then
   echo "error: build WarpVM first with: cmake --build ${build_dir}" >&2
@@ -31,7 +32,7 @@ printf '%s\n' \
   "program load mandelbrot ${output_dir}/mandelbrot.wvm" \
   "program load wave ${output_dir}/wave.wvm" \
   "program load sandpile ${output_dir}/sandpile.wvm" \
-  "launch 8" \
+  "launch 8 ${engine}" \
   "vm create plasma" \
   "vm create mandelbrot" \
   "vm create wave" \
@@ -46,6 +47,7 @@ printf '%s\n' \
   "wait 3 RUNNING 5000" \
   "list" > "${startup}"
 
-echo "The population will remain resident at the interactive prompt."
+echo "The ${engine} population will remain resident at the interactive prompt."
 echo "Try: view, list, vm stop 1, vm reset 1, vm start 1"
+echo "A hand-editable example is also checked in at programs/population.wvs."
 exec "${warpvm}" supervise --script "${startup}" --interactive

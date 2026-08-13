@@ -28,6 +28,15 @@ bool TranslateWvmToPtx(const WvmFile& file, std::string& ptx,
 bool TranslateWvmToResidentPtx(const WvmFile& file, std::string& ptx,
                                std::string& err);
 
+struct CompiledPopulationProgram {
+  ProgramId program_id;
+  WvmFile image;
+};
+
+bool TranslateWvmPopulationToResidentPtx(
+    const std::vector<CompiledPopulationProgram>& programs, std::string& ptx,
+    std::string& err);
+
 // Direct whole-program code running as continuously resident VM warps. The
 // caller owns the canonical runtime pools; this object owns only the JITed
 // program artifact and launches it asynchronously into the supplied stream.
@@ -53,6 +62,39 @@ class PtxResidentProgram {
   CUfunction function_ = nullptr;
   std::string ptx_;
   double jit_milliseconds_ = 0.0;
+};
+
+// One resident kernel containing several distinct compiled WVM bodies. A
+// warp selects its body once at cold entry from slot_program_ids; dispatch is
+// uniform across all 32 lanes and is not repeated per VM instruction.
+class PtxHeterogeneousResidentProgram {
+ public:
+  PtxHeterogeneousResidentProgram() = default;
+  ~PtxHeterogeneousResidentProgram();
+  PtxHeterogeneousResidentProgram(
+      const PtxHeterogeneousResidentProgram&) = delete;
+  PtxHeterogeneousResidentProgram& operator=(
+      const PtxHeterogeneousResidentProgram&) = delete;
+
+  bool Compile(const std::vector<CompiledPopulationProgram>& programs,
+               std::string& err);
+  bool Launch(CUdeviceptr states, uint32_t num_vms, CUdeviceptr descs,
+              CUdeviceptr control, CUdeviceptr mailboxes,
+              CUdeviceptr slot_program_ids, CUstream stream,
+              std::string& err) const;
+  const std::string& ptx() const { return ptx_; }
+  double jit_milliseconds() const { return jit_milliseconds_; }
+  size_t program_count() const { return program_count_; }
+
+ private:
+  CUdevice device_ = 0;
+  CUcontext context_ = nullptr;
+  bool retained_primary_context_ = false;
+  CUmodule module_ = nullptr;
+  CUfunction function_ = nullptr;
+  std::string ptx_;
+  double jit_milliseconds_ = 0.0;
+  size_t program_count_ = 0;
 };
 
 class PtxCompiledProgram {

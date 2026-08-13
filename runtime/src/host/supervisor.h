@@ -3,11 +3,13 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "host/persistent.h"
 #include "host/program_registry.h"
+#include "host/ptx_compiler.h"
 #include "host/vm_identity.h"
 
 namespace wvm {
@@ -53,6 +55,17 @@ class Supervisor {
   uint32_t capacity() const {
     return static_cast<uint32_t>(instances_.size());
   }
+  ExecutionEngine population_engine() const { return population_engine_; }
+  size_t compiled_program_count() const {
+    return compiled_population_ ? compiled_population_->program_count() : 0;
+  }
+  size_t compiled_ptx_bytes() const {
+    return compiled_population_ ? compiled_population_->ptx().size() : 0;
+  }
+  double compiled_jit_milliseconds() const {
+    return compiled_population_ ? compiled_population_->jit_milliseconds()
+                                : 0.0;
+  }
 
   bool ProgramLoad(const std::string& path, const std::string& name,
                    LoadedProgramId& result, std::string& err) {
@@ -75,10 +88,16 @@ class Supervisor {
   }
 
   bool ProgramUnload(LoadedProgramId id, std::string& err) {
+    if (launched_ && population_engine_ == ExecutionEngine::kCompiled) {
+      err = "cannot unload a program referenced by the active compiled "
+            "population artifact; quiesce the population first";
+      return false;
+    }
     return programs_.Unload(id, err);
   }
 
-  bool Launch(uint32_t capacity, std::string& err) {
+  bool Launch(uint32_t capacity, std::string& err,
+              ExecutionEngine engine = ExecutionEngine::kInterpreted) {
     if (launched_) {
       err = "supervisor population is already resident";
       return false;
@@ -91,11 +110,40 @@ class Supervisor {
     instances_.assign(capacity, VmInstanceInfo{});
     for (VmSlot slot = 0; slot < capacity; ++slot)
       instances_[slot].slot = ResidentSlotId{slot};
-    if (!runtime_.InitCapacity(programs_, capacity, err) ||
-        !runtime_.Launch(err)) {
+    if (!runtime_.InitCapacity(programs_, capacity, err)) {
       runtime_.Free();
       return false;
     }
+    bool resident_started = false;
+    if (engine == ExecutionEngine::kInterpreted) {
+      resident_started = runtime_.Launch(err);
+    } else {
+      std::vector<CompiledPopulationProgram> programs;
+      programs.reserve(programs_.size());
+      for (const ProgramInfo& program : programs_.programs())
+        programs.push_back({program.id.value, program.image});
+      compiled_population_ =
+          std::make_unique<PtxHeterogeneousResidentProgram>();
+      resident_started =
+          runtime_.EnsureStream(err) &&
+          compiled_population_->Compile(programs, err) &&
+          compiled_population_->Launch(
+              reinterpret_cast<CUdeviceptr>(runtime_.DeviceStates()),
+              capacity,
+              reinterpret_cast<CUdeviceptr>(runtime_.DeviceDescs()),
+              reinterpret_cast<CUdeviceptr>(runtime_.DeviceControl()),
+              reinterpret_cast<CUdeviceptr>(runtime_.DeviceMailboxes()),
+              reinterpret_cast<CUdeviceptr>(
+                  runtime_.DeviceSlotProgramIds()),
+              reinterpret_cast<CUstream>(runtime_.Stream()), err);
+      if (resident_started) runtime_.MarkExternallyLaunched();
+    }
+    if (!resident_started) {
+      compiled_population_.reset();
+      runtime_.Free();
+      return false;
+    }
+    population_engine_ = engine;
     launched_ = true;
     return true;
   }
@@ -125,7 +173,7 @@ class Supervisor {
     LogicalVmId vm_id;
     if (!directory_.Create(ResidentSlotId{free_slot}, vm_id, err))
       return false;
-    VmBinding binding{vm_id, program_id, ExecutionEngine::kInterpreted,
+    VmBinding binding{vm_id, program_id, population_engine_,
                       mem_size_words, mem_init};
     if (!programs_.Retain(program_id, err)) return false;
     if (!runtime_.BindSlot(programs_, free_slot, binding, err)) {
@@ -136,7 +184,7 @@ class Supervisor {
     }
     instances_[free_slot] = VmInstanceInfo{
         vm_id, ResidentSlotId{free_slot}, program_id,
-        ExecutionEngine::kInterpreted, VmLifecycle::kReady};
+        population_engine_, VmLifecycle::kReady};
     result = vm_id;
     return true;
   }
@@ -209,9 +257,12 @@ class Supervisor {
       err = "engine selection requires a non-RUNNING VM";
       return false;
     }
-    if (engine == ExecutionEngine::kCompiled) {
-      err = "heterogeneous compiled execution is not available until the "
-            "compiled population-kernel slice";
+    if (engine != population_engine_) {
+      err = "this resident epoch uses the " +
+            std::string(population_engine_ == ExecutionEngine::kCompiled
+                            ? "compiled"
+                            : "interpreted") +
+            " engine; simultaneous mixed engines are a later slice";
       return false;
     }
     vm->engine = engine;
@@ -246,8 +297,7 @@ class Supervisor {
       programs_.Release(new_program_id, ignored);
       return false;
     }
-    const VmBinding replacement{id, new_program_id,
-                                ExecutionEngine::kInterpreted,
+    const VmBinding replacement{id, new_program_id, population_engine_,
                                 mem_size_words, {}};
     if (!runtime_.BindSlot(programs_, slot, replacement, err)) {
       std::string ignored;
@@ -256,7 +306,7 @@ class Supervisor {
     }
     if (!programs_.Release(old_program_id, err)) return false;
     vm->program_id = new_program_id;
-    vm->engine = ExecutionEngine::kInterpreted;
+    vm->engine = population_engine_;
     vm->lifecycle = VmLifecycle::kReady;
     return true;
   }
@@ -292,6 +342,7 @@ class Supervisor {
     if (!launched_) return;
     runtime_.ShutdownAll();
     runtime_.Sync();
+    compiled_population_.reset();
     runtime_.Free();
     for (VmInstanceInfo& vm : instances_) {
       if (vm.lifecycle == VmLifecycle::kEmpty) continue;
@@ -301,6 +352,7 @@ class Supervisor {
     instances_.clear();
     directory_.Reset(0);
     launched_ = false;
+    population_engine_ = ExecutionEngine::kInterpreted;
   }
 
  private:
@@ -328,7 +380,9 @@ class Supervisor {
   ProgramRegistry programs_;
   VmDirectory directory_;
   PersistentRuntime runtime_;
+  std::unique_ptr<PtxHeterogeneousResidentProgram> compiled_population_;
   std::vector<VmInstanceInfo> instances_;
+  ExecutionEngine population_engine_ = ExecutionEngine::kInterpreted;
   bool launched_ = false;
 };
 

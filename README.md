@@ -88,10 +88,10 @@ control plane (host↔GPU commands + status + log) is documented in
 
 ## Heterogeneous resident programs
 
-Different resident VMs can execute different interpreted WVM images. Program
-code and literals are immutable registry objects uploaded once and shared by
-every VM bound to that program; VM state, RAM, framebuffer and mailbox remain
-private.
+Different resident VMs can execute different WVM images through either an
+interpreted population or one combined compiled population kernel. Program
+code and literals are immutable registry objects shared by every VM bound to
+that program; VM state, RAM, framebuffer and mailbox remain private.
 
 The four-program demonstration compiles plasma, Mandelbrot, wave and sandpile
 and displays them together:
@@ -131,7 +131,7 @@ capacity is launched and logical VMs are created within it:
 ```text
 program load plasma build/plasma.wvm
 program load mandelbrot build/mandelbrot.wvm
-launch 8
+launch 8 compiled
 vm create plasma
 vm create mandelbrot
 vm start 0
@@ -144,8 +144,8 @@ Run it interactively or from a repeatable startup file:
 
 ```sh
 build/runtime/warpvm supervise
-build/runtime/warpvm supervise --script population.wvs
-build/runtime/warpvm supervise --script population.wvs --interactive
+build/runtime/warpvm supervise --script programs/population.wvs
+build/runtime/warpvm supervise --script programs/population.wvs --interactive
 ```
 
 Commands use stable logical VM IDs for lifecycle and inspection. `list` keeps
@@ -158,9 +158,21 @@ program demonstration is:
 programs/supervisor_demo.sh
 ```
 
-The initial population epoch deliberately requires program images to be
-loaded before `launch`; adding new device program bodies to an already-running
-population is part of the compiled population-epoch slice.
+`programs/population.wvs` is checked in as the hand-editable version. The demo
+script first builds its four `.wvm` files and defaults to a compiled epoch; use
+`WARPVM_ENGINE=interpreted programs/supervisor_demo.sh` for the same population
+through the interpreter.
+
+In a compiled epoch each physical warp reads its slot's program ID once at
+cold entry and takes a warp-uniform branch into that program's direct PTX body.
+There is no per-bytecode interpreter dispatch. Several VMs using the same
+program share one emitted body. `launch` reports compiled-body count, generated
+PTX size and JIT time.
+
+The current epoch deliberately requires program images to be loaded before
+`launch`. A population is all interpreted or all compiled for now; simultaneous
+mixed engines and installing newly compiled bodies without a controlled epoch
+change remain later slices.
 
 ## Attach and single-step (slice 6)
 
@@ -290,6 +302,7 @@ control-poll, and memory breakdown is in
 | v0.1.7-A/B | stable logical VM IDs, shared program registry, heterogeneous interpreted population | done |
 | v0.1.7-C/D | fixed-capacity supervisor lifecycle, safe slot recycling and cold program rebind | done |
 | v0.1.7-E | long-lived supervisor CLI, startup files and logical-ID viewer | done |
+| v0.1.7-F | heterogeneous combined compiled kernel and warp-uniform program selection | done |
 
 ## v0.1 milestone
 

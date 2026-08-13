@@ -1,10 +1,12 @@
 #include "host/ptx_compiler.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <iomanip>
+#include <regex>
 #include <sstream>
 #include <string>
 
@@ -879,6 +881,8 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err,
         << "], 0;\n"
         << "    @%p8 mov.u32 %t16, 1;\n"
         << "    @%p8 bra L_resident_reset;\n"
+        << "    setp.eq.u32 %p8, %t11, " << kCmdDeactivate << ";\n"
+        << "    @%p8 bra L_resident_deactivate;\n"
         << "    nanosleep.u32 1000;\n"
         << "    bra.uni L_resident_idle_wait;\n"
         << "L_resident_start:\n"
@@ -927,6 +931,8 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err,
         << "    @%p8 bra L_resident_reset;\n"
         << "    setp.eq.u32 %p8, %t11, " << kCmdExit << ";\n"
         << "    @%p8 bra L_resident_shutdown;\n"
+        << "    setp.eq.u32 %p8, %t11, " << kCmdDeactivate << ";\n"
+        << "    @%p8 bra L_resident_deactivate;\n"
         << "    nanosleep.u32 1000;\n"
         << "    bra.uni L_resident_paused_wait;\n"
         << "L_resident_reset:\n";
@@ -962,6 +968,10 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err,
         << "], " << kRunning << ";\n"
         << "    @%p8 bra L_dispatch;\n"
         << "    bra.uni L_resident_idle_wait;\n"
+        << "L_resident_deactivate:\n"
+        << "    mov.u32 %t6, " << kIdle << ";\n"
+        << "    mov.u32 %t4, 0;\n"
+        << "    bra.uni L_save_fault;\n"
         << "L_resident_shutdown:\n"
         << "    mov.u32 %t6, " << kIdle << ";\n"
         << "    mov.u32 %t4, 0;\n"
@@ -1010,6 +1020,8 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err,
         << "    @%p8 bra L_resident_reset;\n"
         << "    setp.eq.u32 %p8, %t11, " << kCmdExit << ";\n"
         << "    @%p8 bra L_resident_shutdown;\n"
+        << "    setp.eq.u32 %p8, %t11, " << kCmdDeactivate << ";\n"
+        << "    @%p8 bra L_resident_deactivate;\n"
         << "    nanosleep.u32 1000;\n"
         << "    bra.uni L_resident_stopped_wait;\n";
   }
@@ -1029,6 +1041,196 @@ bool TranslateWvmToPtx(const WvmFile& file, std::string& ptx,
 bool TranslateWvmToResidentPtx(const WvmFile& file, std::string& ptx,
                                std::string& err) {
   return EmitPtx(file, ptx, err, true);
+}
+
+namespace {
+
+void ReplaceAll(std::string& text, const std::string& from,
+                const std::string& to) {
+  size_t at = 0;
+  while ((at = text.find(from, at)) != std::string::npos) {
+    text.replace(at, from.size(), to);
+    at += to.size();
+  }
+}
+
+}  // namespace
+
+bool TranslateWvmPopulationToResidentPtx(
+    const std::vector<CompiledPopulationProgram>& programs, std::string& ptx,
+    std::string& err) {
+  if (programs.empty()) {
+    err = "compiled population requires at least one program";
+    return false;
+  }
+  std::vector<ProgramId> ids;
+  std::vector<std::string> bodies;
+  for (const CompiledPopulationProgram& program : programs) {
+    if (std::find(ids.begin(), ids.end(), program.program_id) != ids.end()) {
+      err = "compiled population program IDs must be unique";
+      return false;
+    }
+    ids.push_back(program.program_id);
+    std::string standalone;
+    if (!EmitPtx(program.image, standalone, err, true)) {
+      err = "program " + std::to_string(program.program_id) + ": " + err;
+      return false;
+    }
+    const std::string first_instruction =
+        "    ld.param.u64 %rd0, [states_param];\n";
+    const size_t begin = standalone.find(first_instruction);
+    const size_t close = standalone.rfind("}\n");
+    if (begin == std::string::npos || close == std::string::npos ||
+        close <= begin) {
+      err = "internal error extracting resident PTX program body";
+      return false;
+    }
+    std::string body = standalone.substr(begin, close - begin);
+    const std::string prefix =
+        "P" + std::to_string(program.program_id) + "_L_";
+    body = std::regex_replace(body, std::regex("\\bL_([A-Za-z0-9_]+)"),
+                              prefix + "$1");
+    // A resident body has both ordinary and predicated returns (for example
+    // the IDLE/deactivate path uses `@%p8 ret`). Every one must return to the
+    // population wrapper rather than terminate that physical CUDA warp.
+    ReplaceAll(body, "ret;", "bra.uni L_population_return;");
+    bodies.push_back(std::move(body));
+  }
+
+  std::ostringstream out;
+  out << ".version 7.0\n"
+      << ".target sm_70\n"
+      << ".address_size 64\n\n"
+      << ".visible .entry warpvm_compiled_population(\n"
+      << "    .param .u64 states_param,\n"
+      << "    .param .u32 num_vms_param,\n"
+      << "    .param .u64 descs_param,\n"
+      << "    .param .u64 control_param,\n"
+      << "    .param .u64 mailboxes_param,\n"
+      << "    .param .u64 slot_program_ids_param\n"
+      << ")\n"
+      << ".maxntid 256, 1, 1\n"
+      << "{\n"
+      << "    .reg .pred %p<12>;\n"
+      << "    .reg .b32 %t<20>;\n"
+      << "    .reg .b32 %v<16>;\n"
+      << "    .reg .b32 %m<4>;\n"
+      << "    .reg .b32 %s<8>;\n"
+      << "    .reg .b32 %cs<8>;\n"
+      << "    .reg .b32 %cd;\n"
+      << "    .reg .b32 %vid;\n"
+      << "    .reg .b64 %rd<24>;\n"
+      << "    .reg .b64 %ic;\n\n"
+      << "    ld.param.u32 %t0, [num_vms_param];\n"
+      << "    ld.param.u64 %rd17, [control_param];\n"
+      << "    ld.param.u64 %rd20, [slot_program_ids_param];\n"
+      << "L_population_select:\n"
+      << "    mov.u32 %t1, %tid.x;\n"
+      << "    mov.u32 %t4, %ctaid.x;\n"
+      << "    mov.u32 %t2, %ntid.x;\n"
+      << "    mad.lo.u32 %t1, %t4, %t2, %t1;\n"
+      << "    shr.u32 %t2, %t1, 5;\n"
+      << "    setp.ge.u32 %p0, %t2, %t0;\n"
+      << "    @%p0 ret;\n"
+      << "    and.b32 %t3, %t1, 31;\n"
+      << "    setp.eq.u32 %p7, %t3, 0;\n"
+      << "    mov.u32 %t10, 0;\n"
+      << "    @%p7 ld.global.u32 %t10, [%rd17+"
+      << offsetof(Control, shutdown) << "];\n"
+      << "    shfl.sync.idx.b32 %t10, %t10, 0, 0x1f, 0xffffffff;\n"
+      << "    setp.ne.u32 %p8, %t10, 0;\n"
+      << "    @%p8 ret;\n"
+      << "    mul.wide.u32 %rd21, %t2, 4;\n"
+      << "    add.u64 %rd22, %rd20, %rd21;\n"
+      << "    ld.global.u32 %t15, [%rd22];\n";
+  for (ProgramId id : ids) {
+    out << "    setp.eq.u32 %p8, %t15, " << id << ";\n"
+        << "    @%p8 bra P" << id << "_entry;\n";
+  }
+  out << "    nanosleep.u32 1000;\n"
+      << "    bra.uni L_population_select;\n\n";
+
+  for (size_t index = 0; index < programs.size(); ++index) {
+    out << "P" << programs[index].program_id << "_entry:\n"
+        << bodies[index] << "\n";
+  }
+
+  out << "L_population_return:\n"
+      << "    ld.param.u64 %rd0, [states_param];\n"
+      << "    ld.param.u64 %rd6, [descs_param];\n"
+      << "    ld.param.u64 %rd17, [control_param];\n"
+      << "    ld.param.u64 %rd14, [mailboxes_param];\n"
+      << "    mov.u32 %t1, %tid.x;\n"
+      << "    mov.u32 %t4, %ctaid.x;\n"
+      << "    mov.u32 %t2, %ntid.x;\n"
+      << "    mad.lo.u32 %t1, %t4, %t2, %t1;\n"
+      << "    shr.u32 %t2, %t1, 5;\n"
+      << "    and.b32 %t3, %t1, 31;\n"
+      << "    setp.eq.u32 %p7, %t3, 0;\n"
+      << "    mov.u32 %t10, 0;\n"
+      << "    mov.u32 %t11, 0;\n"
+      << "    @%p7 ld.global.u32 %t10, [%rd17+"
+      << offsetof(Control, shutdown) << "];\n"
+      << "    @%p7 mul.wide.u32 %rd21, %t2, 4;\n"
+      << "    @%p7 add.u64 %rd22, %rd17, %rd21;\n"
+      << "    @%p7 ld.global.u32 %t11, [%rd22+"
+      << offsetof(Control, cmd) << "];\n"
+      << "    shfl.sync.idx.b32 %t10, %t10, 0, 0x1f, 0xffffffff;\n"
+      << "    shfl.sync.idx.b32 %t11, %t11, 0, 0x1f, 0xffffffff;\n"
+      << "    setp.ne.u32 %p8, %t10, 0;\n"
+      << "    @%p8 ret;\n"
+      << "    setp.eq.u32 %p8, %t11, " << kCmdExit << ";\n"
+      << "    @%p8 ret;\n"
+      << "    setp.ne.u32 %p8, %t11, " << kCmdDeactivate << ";\n"
+      << "    @%p8 bra L_population_select;\n"
+      << "    mul.wide.u32 %rd1, %t2, " << sizeof(VmState) << ";\n"
+      << "    add.u64 %rd2, %rd0, %rd1;\n"
+      << "    ld.global.u32 %vid, [%rd2+" << offsetof(VmState, vm_id)
+      << "];\n"
+      << "    mul.wide.u32 %rd19, %t2, " << sizeof(VmDesc) << ";\n"
+      << "    add.u64 %rd19, %rd6, %rd19;\n"
+      << "    ld.global.u64 %rd12, [%rd19+"
+      << offsetof(VmDesc, vm_routes) << "];\n"
+      << "    mul.wide.u32 %rd15, %t2, " << sizeof(Mailbox) << ";\n"
+      << "    add.u64 %rd15, %rd14, %rd15;\n"
+      // Withdraw the body selector before acknowledging deactivation. This
+      // prevents the resident warp from looping around and re-entering a body
+      // whose descriptor the host is about to replace.
+      << "    @%p7 add.u64 %rd13, %rd20, %rd21;\n"
+      << "    @%p7 atom.global.exch.b32 %t12, [%rd13], "
+      << kInvalidVmId << ";\n"
+      << "    @%p7 mul.wide.u32 %rd13, %vid, 4;\n"
+      << "    @%p7 add.u64 %rd13, %rd12, %rd13;\n"
+      << "    @%p7 atom.global.exch.b32 %t12, [%rd13], "
+      << kInvalidVmSlot << ";\n"
+      << "    @%p7 atom.global.exch.b32 %t12, [%rd15+"
+      << offsetof(Mailbox, owner_vm_id) << "], " << kInvalidVmId << ";\n"
+      << "L_population_drain_sends:\n"
+      << "    mov.u32 %t12, 0;\n"
+      << "    @%p7 atom.global.add.u32 %t12, [%rd15+"
+      << offsetof(Mailbox, in_flight_sends) << "], 0;\n"
+      << "    shfl.sync.idx.b32 %t12, %t12, 0, 0x1f, 0xffffffff;\n"
+      << "    setp.ne.u32 %p8, %t12, 0;\n"
+      << "    @%p8 nanosleep.u32 1000;\n"
+      << "    @%p8 bra L_population_drain_sends;\n"
+      << "    @%p7 st.global.u32 [%rd22+" << offsetof(Control, cmd)
+      << "], 0;\n"
+      << "    @%p7 st.global.u32 [%rd22+" << offsetof(Control, fault)
+      << "], 0;\n"
+      << "    @%p7 st.global.u32 [%rd22+" << offsetof(Control, pc)
+      << "], 0;\n"
+      << "    @%p7 st.global.u32 [%rd22+" << offsetof(Control, status)
+      << "], " << kIdle << ";\n"
+      << "    @%p7 ld.global.u32 %t12, [%rd22+" << offsetof(Control, seq)
+      << "];\n"
+      << "    @%p7 add.u32 %t12, %t12, 1;\n"
+      << "    membar.sys;\n"
+      << "    @%p7 st.global.u32 [%rd22+" << offsetof(Control, seq)
+      << "], %t12;\n"
+      << "    bra.uni L_population_select;\n"
+      << "}\n";
+  ptx = out.str();
+  return true;
 }
 
 PtxResidentProgram::~PtxResidentProgram() {
@@ -1117,6 +1319,105 @@ bool PtxResidentProgram::Launch(CUdeviceptr states, uint32_t num_vms,
                           parameters, nullptr);
   if (result != CUDA_SUCCESS) {
     err = "resident compiled kernel launch failed: " + DriverError(result);
+    return false;
+  }
+  return true;
+}
+
+PtxHeterogeneousResidentProgram::~PtxHeterogeneousResidentProgram() {
+  if (context_ != nullptr) cuCtxSetCurrent(context_);
+  if (module_ != nullptr) cuModuleUnload(module_);
+  if (retained_primary_context_) cuDevicePrimaryCtxRelease(device_);
+}
+
+bool PtxHeterogeneousResidentProgram::Compile(
+    const std::vector<CompiledPopulationProgram>& programs,
+    std::string& err) {
+  if (module_ != nullptr) {
+    cuModuleUnload(module_);
+    module_ = nullptr;
+    function_ = nullptr;
+  }
+  program_count_ = 0;
+  if (!TranslateWvmPopulationToResidentPtx(programs, ptx_, err)) return false;
+  CUresult result = cuInit(0);
+  if (result != CUDA_SUCCESS) {
+    err = "CUDA driver initialization failed: " + DriverError(result);
+    return false;
+  }
+  if (!retained_primary_context_) {
+    result = cuDeviceGet(&device_, 0);
+    if (result != CUDA_SUCCESS) {
+      err = "CUDA device lookup failed: " + DriverError(result);
+      return false;
+    }
+    result = cuDevicePrimaryCtxRetain(&context_, device_);
+    if (result != CUDA_SUCCESS) {
+      err = "CUDA primary-context creation failed: " + DriverError(result);
+      context_ = nullptr;
+      return false;
+    }
+    retained_primary_context_ = true;
+  }
+  result = cuCtxSetCurrent(context_);
+  if (result != CUDA_SUCCESS) {
+    err = "CUDA context activation failed: " + DriverError(result);
+    return false;
+  }
+  const auto start = std::chrono::steady_clock::now();
+  char error_log[8192] = {};
+  CUjit_option options[] = {CU_JIT_ERROR_LOG_BUFFER,
+                            CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES};
+  void* values[] = {
+      error_log,
+      reinterpret_cast<void*>(static_cast<uintptr_t>(sizeof(error_log)))};
+  result = cuModuleLoadDataEx(&module_, ptx_.c_str(), 2, options, values);
+  const auto stop = std::chrono::steady_clock::now();
+  jit_milliseconds_ =
+      std::chrono::duration<double, std::milli>(stop - start).count();
+  if (result != CUDA_SUCCESS) {
+    err = "heterogeneous resident PTX JIT failed: " + DriverError(result);
+    if (error_log[0] != '\0') err += "\n" + std::string(error_log);
+    module_ = nullptr;
+    return false;
+  }
+  result = cuModuleGetFunction(&function_, module_,
+                               "warpvm_compiled_population");
+  if (result != CUDA_SUCCESS) {
+    err = "heterogeneous resident kernel lookup failed: " +
+          DriverError(result);
+    cuModuleUnload(module_);
+    module_ = nullptr;
+    function_ = nullptr;
+    return false;
+  }
+  program_count_ = programs.size();
+  return true;
+}
+
+bool PtxHeterogeneousResidentProgram::Launch(
+    CUdeviceptr states, uint32_t num_vms, CUdeviceptr descs,
+    CUdeviceptr control, CUdeviceptr mailboxes, CUdeviceptr slot_program_ids,
+    CUstream stream, std::string& err) const {
+  if (function_ == nullptr || num_vms == 0 || slot_program_ids == 0) {
+    err = "heterogeneous compiled launch requires programs, VMs, and slot "
+          "program IDs";
+    return false;
+  }
+  CUresult result = cuCtxSetCurrent(context_);
+  if (result != CUDA_SUCCESS) {
+    err = "CUDA context activation failed: " + DriverError(result);
+    return false;
+  }
+  void* parameters[] = {&states, &num_vms, &descs, &control, &mailboxes,
+                        &slot_program_ids};
+  constexpr uint32_t block = 256;
+  const uint32_t grid = (num_vms * kLanes + block - 1) / block;
+  result = cuLaunchKernel(function_, grid, 1, 1, block, 1, 1, 0, stream,
+                          parameters, nullptr);
+  if (result != CUDA_SUCCESS) {
+    err = "heterogeneous resident kernel launch failed: " +
+          DriverError(result);
     return false;
   }
   return true;

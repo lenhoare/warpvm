@@ -1084,11 +1084,12 @@ int RunCompiledResident(const char* path, uint32_t num_vms,
                     (num_vms == 1 || received > 0) && state_ok && resumed &&
                     sync == cudaSuccess;
   std::printf("compiled resident: VMs=%u running=%s frames=%u received=%u "
-              "pause=%s resume=%s shutdown=%s JIT=%.3fms\n",
+              "pause=%s resume=%s shutdown=%s PTX=%zuB JIT=%.3fms\n",
               num_vms, running ? "PASS" : "FAIL", frame_before_pause,
               received, state_ok ? "PASS" : "FAIL",
               resumed ? "PASS" : "FAIL",
               sync == cudaSuccess ? "PASS" : "FAIL",
+              program.ptx().size(),
               program.jit_milliseconds());
   std::printf(pass ? "compiled resident: PASS\n" :
                      "compiled resident: FAIL\n");
@@ -3251,6 +3252,264 @@ int RunSupervisorLifecycleTests() {
   return ok ? 0 : 1;
 }
 
+int RunCompiledPopulationTests() {
+  using wvm::enc_i;
+  using wvm::enc_r;
+  bool ok = true;
+  auto report = [&](const char* name, bool pass) {
+    std::printf("  %-34s %s\n", name, pass ? "PASS" : "FAIL");
+    ok &= pass;
+  };
+  auto image = [](std::initializer_list<uint32_t> code,
+                  std::initializer_list<uint32_t> literals = {}) {
+    wvm::WvmFile result;
+    result.code.assign(code);
+    result.literals.assign(literals);
+    return result;
+  };
+  auto colour_program = [&](uint32_t sentinel, uint32_t colour,
+                            uint32_t nops) {
+    wvm::WvmFile result;
+    result.literals = {sentinel, wvm::kVideoBaseWord, colour};
+    result.code = {
+        enc_i(wvm::kLdw, 0, 0, 0, 0),
+        enc_i(wvm::kMovI, 0, 1, 0, 0),
+        enc_r(wvm::kStore, 0, 1, 0, 0),
+        enc_i(wvm::kLdw, 0, 2, 0, 1),
+        enc_i(wvm::kLdw, 0, 3, 0, 2),
+        enc_r(wvm::kStore, 0, 2, 3, 0),
+        enc_r(wvm::kFlip, 0, 0, 0, 0),
+    };
+    for (uint32_t i = 0; i < nops; ++i)
+      result.code.push_back(enc_r(wvm::kNop, 0, 0, 0, 0));
+    result.code.push_back(enc_r(wvm::kHalt, 0, 0, 0, 0));
+    return result;
+  };
+
+  const wvm::WvmFile sender = image({
+      enc_i(wvm::kMovI, 0, 0, 0, 1),
+      enc_i(wvm::kMovI, 0, 1, 0, 7),
+      enc_i(wvm::kMovI, 0, 2, 0, 1234),
+      enc_r(wvm::kSend, 0, 0, 1, 2),
+      enc_r(wvm::kHalt, 0, 0, 0, 0),
+  });
+  const wvm::WvmFile receiver = image({
+      enc_r(wvm::kTryRecv, 0, 2, 4, 5),
+      enc_r(wvm::kNotMask, 0, 3, 2, 0),
+      enc_i(wvm::kJmpIfAny, 4, 0, 0, 0),
+      enc_i(wvm::kMovI, 0, 6, 0, 0),
+      enc_r(wvm::kStore, 0, 6, 4, 0),
+      enc_i(wvm::kMovI, 0, 6, 0, 1),
+      enc_r(wvm::kStore, 0, 6, 5, 0),
+      enc_r(wvm::kHalt, 0, 0, 0, 0),
+  });
+  const wvm::WvmFile red = colour_program(101, 0xFFFF2020u, 0);
+  const wvm::WvmFile green = colour_program(202, 0xFF20FF20u, 2);
+
+  // Translation is inspectable: one entry label per immutable program body
+  // and one warp-uniform selection load before any body is entered.
+  const std::vector<wvm::CompiledPopulationProgram> translated = {
+      {0, sender}, {1, receiver}, {2, red}, {3, green}};
+  std::string ptx, err;
+  const bool translated_ok =
+      wvm::TranslateWvmPopulationToResidentPtx(translated, ptx, err);
+  auto occurrences = [](const std::string& haystack,
+                        const std::string& needle) {
+    size_t count = 0, at = 0;
+    while ((at = haystack.find(needle, at)) != std::string::npos) {
+      ++count;
+      at += needle.size();
+    }
+    return count;
+  };
+  bool bodies_once = translated_ok;
+  for (uint32_t id = 0; id < translated.size(); ++id)
+    bodies_once &= occurrences(ptx, "P" + std::to_string(id) +
+                                        "_entry:") == 1;
+  report("combined_ptx_bodies_emitted_once", bodies_once);
+  const size_t select = ptx.find("L_population_select:");
+  const size_t first_body = ptx.find("P0_entry:");
+  report("single_warp_uniform_program_select",
+         translated_ok && select != std::string::npos &&
+             first_body != std::string::npos && select < first_body &&
+             ptx.find("ld.global.u32 %t15, [%rd22]", select) < first_body &&
+             ptx.find("shfl.sync.idx.b32", select) < first_body);
+
+  struct Snapshot {
+    std::vector<std::vector<uint32_t>> memory;
+    std::vector<uint32_t> pixels;
+    std::vector<uint32_t> status;
+    std::vector<uint32_t> fault;
+    std::vector<uint32_t> frame_seq;
+  };
+  auto run_population = [&](wvm::ExecutionEngine engine, Snapshot& snapshot,
+                            size_t& ptx_bytes, double& jit_ms) {
+    wvm::Supervisor supervisor;
+    wvm::LoadedProgramId sender_id, receiver_id, red_id, green_id;
+    bool pass = supervisor.ProgramAdd("sender", sender, sender_id, err) &&
+                supervisor.ProgramAdd("receiver", receiver, receiver_id,
+                                      err) &&
+                supervisor.ProgramAdd("red", red, red_id, err) &&
+                supervisor.ProgramAdd("green", green, green_id, err) &&
+                supervisor.Launch(5, err, engine);
+    if (!pass) {
+      std::printf("    population setup: %s\n", err.c_str());
+      return false;
+    }
+    ptx_bytes = supervisor.compiled_ptx_bytes();
+    jit_ms = supervisor.compiled_jit_milliseconds();
+    wvm::LogicalVmId sender_vm, receiver_vm, red_vm, green_vm, red_peer;
+    pass = supervisor.VmCreate(sender_id, sender_vm, err, 8) &&
+           supervisor.VmCreate(receiver_id, receiver_vm, err, 8) &&
+           supervisor.VmCreate(red_id, red_vm, err, 8) &&
+           supervisor.VmCreate(green_id, green_vm, err, 8) &&
+           supervisor.VmCreate(red_id, red_peer, err, 8);
+    // Let the receiver poll before the independently compiled sender enters.
+    pass = pass && supervisor.VmStart(receiver_vm, err) &&
+           supervisor.VmStart(sender_vm, err) &&
+           supervisor.VmStart(red_vm, err) &&
+           supervisor.VmStart(green_vm, err) &&
+           supervisor.VmStart(red_peer, err);
+    const wvm::LogicalVmId ids[] = {sender_vm, receiver_vm, red_vm, green_vm,
+                                    red_peer};
+    snapshot.memory.resize(5);
+    snapshot.pixels.resize(5);
+    snapshot.status.resize(5);
+    snapshot.fault.resize(5);
+    snapshot.frame_seq.resize(5);
+    for (wvm::VmSlot slot = 0; pass && slot < 5; ++slot) {
+      pass &= supervisor.runtime().WaitStatus(slot, wvm::kHalted, 3000);
+      std::vector<uint32_t> framebuffer;
+      pass &= supervisor.runtime().ReadMem(slot, 0, 2,
+                                           snapshot.memory[slot]) &&
+              supervisor.runtime().ReadFramebuffer(slot, framebuffer);
+      if (!framebuffer.empty()) snapshot.pixels[slot] = framebuffer[0];
+      snapshot.status[slot] = supervisor.runtime().Status(slot);
+      snapshot.fault[slot] = supervisor.runtime().Fault(slot);
+      snapshot.frame_seq[slot] = supervisor.runtime().FrameSeq(slot);
+      pass &= supervisor.Find(ids[slot]) != nullptr;
+    }
+    pass &= snapshot.memory[1][0] == 1234 &&
+            snapshot.memory[1][1] == (7u << 16) &&
+            snapshot.memory[2][0] == 101 &&
+            snapshot.memory[3][0] == 202 &&
+            snapshot.memory[4][0] == 101 &&
+            snapshot.pixels[2] == 0xFFFF2020u &&
+            snapshot.pixels[3] == 0xFF20FF20u &&
+            snapshot.pixels[4] == 0xFFFF2020u;
+    supervisor.Shutdown();
+    return pass;
+  };
+
+  Snapshot interpreted, compiled;
+  size_t ignored_ptx = 0, compiled_ptx = 0;
+  double ignored_jit = 0.0, compiled_jit = 0.0;
+  const bool interpreted_ok =
+      run_population(wvm::ExecutionEngine::kInterpreted, interpreted,
+                     ignored_ptx, ignored_jit);
+  const bool compiled_ok =
+      run_population(wvm::ExecutionEngine::kCompiled, compiled,
+                     compiled_ptx, compiled_jit);
+  report("four_programs_execute_concurrently", compiled_ok);
+  report("cross_body_logical_messaging",
+         compiled_ok && compiled.memory[1][0] == 1234 &&
+             compiled.memory[1][1] == (7u << 16));
+  report("shared_body_private_ram_framebuffer",
+         compiled_ok && compiled.memory[2] == compiled.memory[4] &&
+             compiled.pixels[2] == compiled.pixels[4] &&
+             compiled.pixels[2] != compiled.pixels[3]);
+  report("interpreter_compiled_population_equal",
+         interpreted_ok && compiled_ok &&
+             interpreted.memory == compiled.memory &&
+             interpreted.pixels == compiled.pixels &&
+             interpreted.status == compiled.status &&
+             interpreted.fault == compiled.fault &&
+             interpreted.frame_seq == compiled.frame_seq);
+  std::printf("    compiled population: programs=4 ptx_bytes=%zu jit_ms=%.3f\n",
+              compiled_ptx, compiled_jit);
+
+  // Exercise controls and cold selector replacement on a second compiled
+  // epoch. The VM identity survives program replacement; slot reuse does not.
+  const wvm::WvmFile counter = image({
+      enc_i(wvm::kMovI, 0, 0, 0, 0),
+      enc_r(wvm::kLoad, 0, 1, 0, 0),
+      enc_i(wvm::kAddI, 0, 1, 1, 1),
+      enc_r(wvm::kStore, 0, 0, 1, 0),
+      enc_r(wvm::kYield, 0, 0, 0, 0),
+      enc_i(wvm::kJmp, 0, 0, 0, 1),
+  });
+  const wvm::WvmFile faulter = image({
+      enc_r(wvm::kRet, 0, 0, 0, 0),
+  });
+  wvm::Supervisor lifecycle;
+  wvm::LoadedProgramId counter_id, red_id, green_id, fault_id;
+  bool lifecycle_ok =
+      lifecycle.ProgramAdd("counter", counter, counter_id, err) &&
+      lifecycle.ProgramAdd("red", red, red_id, err) &&
+      lifecycle.ProgramAdd("green", green, green_id, err) &&
+      lifecycle.ProgramAdd("fault", faulter, fault_id, err) &&
+      lifecycle.Launch(2, err, wvm::ExecutionEngine::kCompiled);
+  if (!lifecycle_ok) std::printf("    lifecycle setup: %s\n", err.c_str());
+  wvm::LogicalVmId counter_vm, colour_vm;
+  lifecycle_ok = lifecycle_ok &&
+                 lifecycle.VmCreate(counter_id, counter_vm, err, 8) &&
+                 lifecycle.VmCreate(red_id, colour_vm, err, 8) &&
+                 lifecycle.VmStart(counter_vm, err) &&
+                 lifecycle.runtime().WaitStatus(0, wvm::kRunning, 2000);
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  lifecycle_ok = lifecycle_ok && lifecycle.VmStop(counter_vm, err);
+  std::vector<uint32_t> count_before, count_after;
+  lifecycle_ok = lifecycle_ok &&
+                 lifecycle.runtime().ReadMem(0, 0, 1, count_before) &&
+                 lifecycle.VmResume(counter_vm, err);
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  lifecycle_ok = lifecycle_ok && lifecycle.VmStop(counter_vm, err) &&
+                 lifecycle.runtime().ReadMem(0, 0, 1, count_after);
+  report("compiled_stop_resume_per_vm",
+         lifecycle_ok && count_after[0] > count_before[0]);
+
+  const wvm::VmId preserved_id = colour_vm.value;
+  lifecycle_ok = lifecycle_ok && lifecycle.VmStart(colour_vm, err) &&
+                 lifecycle.runtime().WaitStatus(1, wvm::kHalted, 2000) &&
+                 lifecycle.VmSetProgram(colour_vm, green_id, err) &&
+                 lifecycle.Find(colour_vm)->vm_id.value == preserved_id &&
+                 lifecycle.VmStart(colour_vm, err) &&
+                 lifecycle.runtime().WaitStatus(1, wvm::kHalted, 2000);
+  std::vector<uint32_t> rebound_fb;
+  lifecycle_ok = lifecycle_ok &&
+                 lifecycle.runtime().ReadFramebuffer(1, rebound_fb);
+  if (!lifecycle_ok || rebound_fb.empty() ||
+      rebound_fb[0] != 0xFF20FF20u)
+    std::printf("    rebind detail: ok=%u status=%s fault=%s pixel=0x%08x "
+                "error=%s\n",
+                lifecycle_ok,
+                wvm::StatusName(lifecycle.runtime().Status(1)),
+                wvm::FaultName(lifecycle.runtime().Fault(1)),
+                rebound_fb.empty() ? 0u : rebound_fb[0], err.c_str());
+  report("compiled_cold_rebind_same_identity",
+         lifecycle_ok && rebound_fb[0] == 0xFF20FF20u);
+
+  lifecycle_ok = lifecycle_ok && lifecycle.VmDelete(colour_vm, err);
+  wvm::LogicalVmId fault_vm;
+  lifecycle_ok = lifecycle_ok &&
+                 lifecycle.VmCreate(fault_id, fault_vm, err, 8) &&
+                 lifecycle.Find(fault_vm)->slot.value == 1 &&
+                 fault_vm.value != colour_vm.value &&
+                 lifecycle.VmStart(fault_vm, err) &&
+                 lifecycle.runtime().WaitStatus(1, wvm::kFaulted, 2000);
+  if (!lifecycle_ok)
+    std::printf("    recycle detail: status=%s fault=%s error=%s\n",
+                wvm::StatusName(lifecycle.runtime().Status(1)),
+                wvm::FaultName(lifecycle.runtime().Fault(1)), err.c_str());
+  report("compiled_slot_recycle_and_fault",
+         lifecycle_ok && lifecycle.runtime().Fault(1) == wvm::kFaultStack);
+  lifecycle.Shutdown();
+
+  std::printf(ok ? "compiled population: PASS\n"
+                 : "compiled population: FAIL\n");
+  return ok ? 0 : 1;
+}
+
 int RunSlice7() {
   using wvm::enc_i;
   using wvm::enc_r;
@@ -4185,6 +4444,8 @@ void Usage(const char* argv0) {
   std::printf("  slice1..slice5,slice7  self-test suites\n");
   std::printf("  hetero_tests           shared-program heterogeneous VM tests\n");
   std::printf("  supervisor_tests       dynamic VM lifecycle/recycling tests\n");
+  std::printf("  compiled_population_tests\n");
+  std::printf("                  heterogeneous resident compiled-kernel tests\n");
   std::printf("  supervise [--script FILE] [--interactive]\n");
   std::printf("                  long-lived heterogeneous CPU supervisor console\n");
   std::printf("  gfxa | gfxb            v0.1.1 graphics slices A/B self-tests\n");
@@ -4359,6 +4620,8 @@ int main(int argc, char** argv) {
     return RunHeterogeneousProgramTests();
   if (std::strcmp(cmd, "supervisor_tests") == 0)
     return RunSupervisorLifecycleTests();
+  if (std::strcmp(cmd, "compiled_population_tests") == 0)
+    return RunCompiledPopulationTests();
   if (std::strcmp(cmd, "supervise") == 0) {
     const char* script_path = nullptr;
     bool interactive = false;

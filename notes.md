@@ -925,3 +925,46 @@ Assembly exposes `RAM_SIZE_WORDS`, while Warp C exposes
 `WARP_RAM_SIZE_WORDS`. An acceptance program allocates a 20,000-word global
 array and verifies interpreted/native access at addresses above the old RAM
 boundary.
+
+## 31. Heterogeneous direct-compiled resident populations
+
+**Discovered by:** supervisor Slice F
+
+**Classification:** compiled runtime/backend implementation; no ISA change
+
+Several canonical WVM images can now be translated into one persistent PTX
+kernel. Each immutable program body is emitted once, and each VM warp performs
+one warp-uniform program-ID selection at cold entry. It then executes direct
+compiled code; this is not per-instruction opcode dispatch. RAM, framebuffer,
+mailbox, state, logical routing and control use the existing common ABI.
+
+The body-composition prototype exposed an important control-flow detail:
+resident generated bodies contain both unconditional `ret` and predicated
+`@p ret`. Redirecting only the unconditional form allowed a deactivated warp to
+exit the CUDA kernel before the population wrapper could retire its selector
+and acknowledge deletion. All body returns are now redirected to the wrapper.
+The wrapper first invalidates the slot program selector, then withdraws the
+logical route and mailbox owner, drains in-flight sends, acknowledges the host,
+and waits for a new binding. Cold program rebind and recycled slots therefore
+remain safe without stopping neighbouring VMs.
+
+On the RTX 3060, the real four-program prototype (plasma, Mandelbrot, wave and
+sandpile) generated 1,073,664 bytes of PTX. A cold uncached JIT took 15.09 s;
+subsequent cached runs took a few milliseconds. In representative one-second
+runs, per-VM frames were:
+
+| program | homogeneous compiled | four-program compiled population |
+| --- | ---: | ---: |
+| plasma | 55 | 44 |
+| Mandelbrot | 13 | 10 |
+| wave | 534 | 357 |
+| sandpile | 134 | 93 |
+
+The heterogeneous run places four unrelated instruction streams on the GPU at
+once, so the 20–33% per-program reduction includes normal concurrent resource
+competition and possible instruction-cache locality cost; it is not selection
+overhead measured in isolation. The dispatch itself occurs only at cold entry.
+A deterministic four-body regression generated 85,383 bytes of PTX and proved
+cross-body logical messaging, shared-body/private-state isolation, exact
+interpreter/compiled result equivalence, per-VM stop/resume and fault handling,
+cold rebind with preserved logical identity, and safe slot recycling.

@@ -47,6 +47,8 @@ add_test(NAME slice5_control_plane COMMAND warpvm slice5)
 add_test(NAME slice7_messaging COMMAND warpvm slice7)
 add_test(NAME heterogeneous_program_registry COMMAND warpvm hetero_tests)
 add_test(NAME supervisor_vm_lifecycle COMMAND warpvm supervisor_tests)
+add_test(NAME heterogeneous_compiled_population
+  COMMAND warpvm compiled_population_tests)
 add_test(NAME supervisor_startup_script
   COMMAND bash ${CMAKE_SOURCE_DIR}/tests/supervisor_startup.sh
           ${WVM_AS} $<TARGET_FILE:warpvm> ${CMAKE_SOURCE_DIR}

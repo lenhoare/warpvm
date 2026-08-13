@@ -54,7 +54,7 @@ void PrintSupervisorHelp() {
   std::printf("  program load <name> <file.wvm>\n");
   std::printf("  program list | program unload <name-or-id>\n");
   std::printf("population:\n");
-  std::printf("  launch <capacity>\n");
+  std::printf("  launch <capacity> [interpreted|compiled]\n");
   std::printf("  vm create <program> [ram-words]\n");
   std::printf("  vm start|stop|resume|reset|delete <vm-id>\n");
   std::printf("  vm program <vm-id> <program>   cold program replacement\n");
@@ -173,12 +173,26 @@ class SupervisorCommandSession {
 
   bool LaunchCommand(const std::vector<std::string>& tok) {
     uint32_t capacity = 0;
-    if (tok.size() != 2 || !ParseU32(tok[1], capacity))
-      return Fail("usage: launch <capacity>");
+    if ((tok.size() != 2 && tok.size() != 3) ||
+        !ParseU32(tok[1], capacity))
+      return Fail("usage: launch <capacity> [interpreted|compiled]");
+    ExecutionEngine engine = ExecutionEngine::kInterpreted;
+    if (tok.size() == 3) {
+      if (tok[2] == "compiled")
+        engine = ExecutionEngine::kCompiled;
+      else if (tok[2] != "interpreted")
+        return Fail("engine must be interpreted or compiled");
+    }
     std::string err;
-    if (!supervisor_.Launch(capacity, err)) return Fail(err);
-    std::printf("population launched: capacity=%u programs=%zu\n", capacity,
-                supervisor_.programs().size());
+    if (!supervisor_.Launch(capacity, err, engine)) return Fail(err);
+    std::printf("population launched: capacity=%u programs=%zu engine=%s",
+                capacity, supervisor_.programs().size(), EngineName(engine));
+    if (engine == ExecutionEngine::kCompiled)
+      std::printf(" compiled_bodies=%zu ptx_bytes=%zu jit_ms=%.3f",
+                  supervisor_.compiled_program_count(),
+                  supervisor_.compiled_ptx_bytes(),
+                  supervisor_.compiled_jit_milliseconds());
+    std::printf("\n");
     return true;
   }
 

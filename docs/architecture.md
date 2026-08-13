@@ -117,8 +117,22 @@ PC may fetch unrelated instructions from different programs.
 
 Legacy homogeneous commands use the same path: identical code/literal images
 are interned into one program allocation and slots receive logical IDs `0..N-1`
-for compatibility. Static heterogeneous bindings are interpreted in this
-slice; compiled program selection remains a later population-kernel feature.
+for compatibility.
+
+For a compiled population, the PTX generator emits every distinct loaded WVM
+program once into a single resident kernel. At cold entry each warp reads the
+program ID assigned to its resident slot and takes one warp-uniform branch into
+the selected direct body. The branch is not VM-instruction dispatch: after
+selection the body executes the same direct generated PTX used by homogeneous
+compiled execution. Empty slots wait at the selector, and shared bodies still
+operate on slot-private descriptor, state, RAM, framebuffer and mailbox data.
+
+The slot program-ID publication is the final host bind step. During deletion,
+the compiled wrapper withdraws that selector before it invalidates routing,
+drains in-flight senders and acknowledges the host. The physical warp then
+returns to the selector and can enter a newly bound program body without ending
+the resident population. This preserves cold rebind, slot recycling and stable
+logical identity in compiled mode.
 
 The host list view exposes logical VM ID, resident slot and program name as
 separate columns. `hetero_view` loads a list of WVM paths into one registry and
@@ -161,11 +175,16 @@ operation implementation; a failed startup-file command reports its line and
 aborts instead of leaving a partially configured unattended population.
 
 The frontend separates its phases explicitly: load immutable program objects,
-`launch <capacity>`, then create and operate logical VMs. Commands cover
+`launch <capacity> [interpreted|compiled]`, then create and operate logical VMs. Commands cover
 create/delete/start/stop/resume/reset, cold program replacement, engine
 metadata, deterministic state waits, and existing register/RAM/disassembly/
 framebuffer/log inspection. All VM operands are logical IDs and are resolved to
 slots at the point of use.
+
+Execution engine is selected for the resident population epoch in Slice F.
+This provides heterogeneous programs under either interpreter or compiled
+execution, but not both engines simultaneously in one epoch; per-VM mixed
+engines remain the later Slice H launch-structure decision.
 
 The supervisor viewer snapshots the requested logical IDs as tile identities,
 but resolves each ID through the live route directory on every refresh. A
