@@ -10,6 +10,17 @@ int main(void)
         result = 0;
     if (warp_broadcast(lane * 3, selected_lane) != 21)
         result = 0;
+    int shuffled31 = warp_shuffle(lane * 3, 31);
+    int broadcast31 = warp_broadcast(lane * 3, 31);
+    int shuffled0 = warp_shuffle(lane * 3, 0);
+    int broadcast0 = warp_broadcast(lane * 3, 0);
+    if (shuffled31 != 93 || shuffled31 != broadcast31)
+        result = 0;
+    if (shuffled0 != 0 || shuffled0 != broadcast0)
+        result = 0;
+    if (warp_shuffle(lane * 3, selected_lane) !=
+        warp_broadcast(lane * 3, selected_lane))
+        result = 0;
     if (warp_shuffle(lane * 3, 31 - lane) != (31 - lane) * 3)
         result = 0;
     if (warp_shuffle_xor(lane, 1) != (lane ^ 1))

@@ -236,4 +236,27 @@ mod tests {
             .unwrap();
         assert!(error.message.contains("constant from 0 to 31"));
     }
+
+    #[test]
+    fn shuffle_uniformity_is_visible_in_dump_and_branch_lowering() {
+        let result = compile(
+            "int main(void) { int value=WARP*7; int fixed=warp_shuffle(value,31); int self=warp_shuffle(value,WARP); if (fixed==217 && warp_vm_id()>=0) return 42; return self-self; }",
+        )
+        .unwrap();
+        let fixed = result
+            .uniformity_dump
+            .lines()
+            .find(|line| line.contains(" fixed:"))
+            .unwrap();
+        let self_value = result
+            .uniformity_dump
+            .lines()
+            .find(|line| line.contains(" self:"))
+            .unwrap();
+        assert!(fixed.ends_with("Uniform"), "{fixed}");
+        assert!(self_value.ends_with("Divergent"), "{self_value}");
+        assert!(result.assembly.contains("SHUFFLE"));
+        assert!(result.assembly.contains("JMP_IF_ANY"));
+        assert!(!result.assembly.contains("BALLOT p3"));
+    }
 }

@@ -313,6 +313,33 @@ pub enum Intrinsic {
     MaxUnsigned,
 }
 
+impl Intrinsic {
+    fn result_uniformity(self, args: &[TypedExpr], operand_uniformity: Uniformity) -> Uniformity {
+        match self {
+            // These operations produce one warp-wide result by definition.
+            Intrinsic::Broadcast
+            | Intrinsic::Ballot
+            | Intrinsic::Any
+            | Intrinsic::All
+            | Intrinsic::ReduceAdd
+            | Intrinsic::ReduceAddUnsigned
+            | Intrinsic::ReduceMinSigned
+            | Intrinsic::ReduceMaxSigned
+            | Intrinsic::ReduceMinUnsigned
+            | Intrinsic::ReduceMaxUnsigned
+            | Intrinsic::ReduceAnd
+            | Intrinsic::ReduceOr
+            | Intrinsic::ReduceXor => Uniformity::Uniform,
+
+            // SHUFFLE is rd[i] = value[index[i] & 31]. If index is uniform,
+            // every lane reads the same one source element, regardless of
+            // whether the source vector itself is divergent.
+            Intrinsic::Shuffle if args[1].uniformity == Uniformity::Uniform => Uniformity::Uniform,
+            _ => operand_uniformity,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum LValue {
     Local(LocalId),
@@ -1482,22 +1509,7 @@ impl Analyzer {
                     "warp_broadcast lane must be uniform",
                 ));
             }
-            uniformity = match intrinsic {
-                Intrinsic::Broadcast
-                | Intrinsic::Ballot
-                | Intrinsic::Any
-                | Intrinsic::All
-                | Intrinsic::ReduceAdd
-                | Intrinsic::ReduceAddUnsigned
-                | Intrinsic::ReduceMinSigned
-                | Intrinsic::ReduceMaxSigned
-                | Intrinsic::ReduceMinUnsigned
-                | Intrinsic::ReduceMaxUnsigned
-                | Intrinsic::ReduceAnd
-                | Intrinsic::ReduceOr
-                | Intrinsic::ReduceXor => Uniformity::Uniform,
-                _ => uniformity,
-            };
+            uniformity = intrinsic.result_uniformity(&typed_args, uniformity);
             return Ok(TypedExpr {
                 kind: TypedExprKind::Intrinsic {
                     intrinsic,
@@ -2666,6 +2678,32 @@ mod tests {
         assert_eq!(p.locals[1].uniformity, Uniformity::Divergent);
         assert_eq!(p.locals[2].uniformity, Uniformity::Divergent);
         assert_eq!(p.locals[3].uniformity, Uniformity::Divergent);
+    }
+
+    #[test]
+    fn shuffle_uniformity_follows_its_source_lane_semantics() {
+        let p = source(
+            "int main(void) { int value=WARP*3; int s31=warp_shuffle(value,31); int s0=warp_shuffle(value,0); int self=warp_shuffle(value,WARP); int laneVar=WARP^1; int varying=warp_shuffle(value,laneVar); int uniformLane=warp_vm_id()&31; int dynamic=warp_shuffle(value,uniformLane); int xorValue=warp_shuffle_xor(value,1); int broadcast=warp_broadcast(value,31); return 42; }",
+        )
+        .unwrap();
+        assert_eq!(p.locals[0].uniformity, Uniformity::Divergent);
+        assert_eq!(p.locals[1].uniformity, Uniformity::Uniform);
+        assert_eq!(p.locals[2].uniformity, Uniformity::Uniform);
+        assert_eq!(p.locals[3].uniformity, Uniformity::Divergent);
+        assert_eq!(p.locals[4].uniformity, Uniformity::Divergent);
+        assert_eq!(p.locals[5].uniformity, Uniformity::Divergent);
+        assert_eq!(p.locals[6].uniformity, Uniformity::Uniform);
+        assert_eq!(p.locals[7].uniformity, Uniformity::Uniform);
+        assert_eq!(p.locals[8].uniformity, Uniformity::Divergent);
+        assert_eq!(p.locals[9].uniformity, Uniformity::Uniform);
+    }
+
+    #[test]
+    fn uniform_shuffle_result_allows_uniform_control_propagation() {
+        source(
+            "int main(void) { int value=WARP; int x=warp_shuffle(value,31); if (x==31 && warp_vm_id()>=0) return 42; return 0; }",
+        )
+        .unwrap();
     }
 
     #[test]

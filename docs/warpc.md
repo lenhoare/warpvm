@@ -142,6 +142,11 @@ with lane shifts, predicate selection, and bitwise reductions because WarpVM
 predicate registers do not move directly into vector registers. These
 restrictions and lowerings are compiler contracts, not new ISA operations.
 
+`warp_shuffle(value, lane)` is inferred uniform when `lane` is uniform: every
+lane then reads the same `value[lane & 31]`, even if `value` is divergent.
+A divergent source-lane expression keeps the result divergent, and
+`warp_shuffle_xor` remains lane-relative.
+
 `warp_memcpy(dst, src, words)` and `warp_memset(dst, value, words)` are ordinary
 Warp C routines injected on demand by the compiler. They process uniform
 32-word batches at `base + WARP` and predicate the final partial batch with an
