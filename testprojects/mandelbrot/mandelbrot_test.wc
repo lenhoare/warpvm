@@ -1,0 +1,64 @@
+#include <warp.h>
+
+/* Verification of the warp-native Mandelbrot escape-count logic.
+ *
+ * The machine is integer only, so complex arithmetic uses Q4.12 fixed point
+ * (value * 4096; 4 integer bits, 12 fractional). A product of two Q4.12
+ * numbers is (a*b) >> 12; values stay under ~8 in magnitude before escape, so
+ * a*b stays within signed 32 bits.
+ *
+ * Escape times differ per pixel, but divergent loop conditions are not allowed,
+ * so the loop runs a FIXED number of iterations for every lane and a sticky
+ * `escaped` mask freezes the escape count of lanes that have already left the
+ * disc of radius 2 (|z|^2 > 4). This is the standard SIMT Mandelbrot shape.
+ *
+ * The 32 lanes sample c along the real axis from -2.5 to +0.89 (ci = 0, so the
+ * orbit stays real and zi is identically 0). The real slice of the Mandelbrot
+ * set is exactly [-2, 0.25], which gives a robust classification test: lanes
+ * whose cr sits clearly inside that interval must never escape (count == max),
+ * and lanes clearly outside it must escape. A margin around each boundary is
+ * left unchecked because near-boundary points escape too slowly to classify in
+ * a fixed iteration budget. */
+
+unsigned g_cr[32];      /* sampled cr (Q4.12)          */
+unsigned g_count[32];   /* escape count per lane       */
+unsigned g_nin;         /* lanes checked as clearly-in  */
+unsigned g_nout;        /* lanes checked as clearly-out */
+
+int main(void)
+{
+    int cr = -10240 + WARP * 448;     /* Q4.12: -2.5 + lane*(3.5/32) */
+    int zr = 0;
+    int count = 0;
+    int escaped = 0;
+    int a;
+    int iter;
+
+    for (iter = 0; iter < 255; ++iter) {
+        a = (zr * zr) >> 12;          /* zr^2 in Q4.12 (zi == 0)     */
+        escaped = escaped | (a > 16384);   /* sticky: |z|^2 > 4.0     */
+        count = count + (1 - escaped);
+        zr = a + cr;                  /* zr <- zr^2 + cr             */
+    }
+
+    g_cr[WARP] = cr;
+    g_count[WARP] = count;
+
+    /* Classification with margins that avoid the slow-escape boundary. The
+     * loop registers are dead here, so they are reused as flags rather than
+     * spending fresh registers from the ~13-register budget:
+     *   escaped -> clear_in, a -> clear_out, zr -> in_set, iter -> violation. */
+    escaped = (cr > -7782) & (cr < 410);        /* clear_in:  -1.9 .. 0.1   */
+    a = (cr < -8397) | (cr > 1638);             /* clear_out: < -2.05, > 0.4 */
+    zr = count >= 255;                          /* in_set                    */
+    iter = (escaped & (1 - zr)) | (a & zr);     /* violation                 */
+
+    g_nin = warp_reduce_add_u(escaped);
+    g_nout = warp_reduce_add_u(a);
+
+    /* Pass only if no checked lane is misclassified and both classes are
+     * actually exercised. */
+    if (warp_all(iter == 0) && (g_nin > 0u) && (g_nout > 0u))
+        return 42;
+    return 0;
+}

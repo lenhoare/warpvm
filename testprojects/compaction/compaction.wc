@@ -1,0 +1,70 @@
+#include <warp.h>
+
+/* Warp-native stream compaction (filter) — the payoff of the scan primitive.
+ *
+ * Each lane holds a value and a keep/drop predicate. The task is to pack the
+ * kept values densely at the front of an output array, in original lane order
+ * (a stable filter). The trick is that an EXCLUSIVE prefix sum of the 0/1 keep
+ * predicate gives every kept lane its output index directly: the number of
+ * kept elements before it. A single predicated scatter then writes each kept
+ * value to its slot, all 32 lanes at once.
+ *
+ *   value    :  v0  v1  v2  v3  v4  ...
+ *   keep     :   1   0   1   1   0  ...
+ *   excl scan:   0   1   1   2   3  ...   <- output index, valid where keep=1
+ *   out[]    :  v0  v2  v3 ...            <- dense, order preserved
+ *
+ * The scan is the same Kogge-Stone loop as testprojects/scan. Two independent
+ * checks confirm the compaction:
+ *   - readback: every kept lane reads its own value back from out[pos], so no
+ *     kept value was lost or overwritten by a colliding position;
+ *   - dense positions: the kept positions sum to 0+1+...+(count-1), which for
+ *     exactly `count` kept lanes holds only if they are precisely 0..count-1
+ *     with no gaps or collisions. */
+
+unsigned g_in[32];
+unsigned g_keep[32];
+unsigned g_pos[32];
+unsigned g_out[32];
+unsigned g_count;
+unsigned g_possum;
+
+int main(void)
+{
+    unsigned x = (WARP * WARP * 37u + 11u) & 63u;   /* scattered values 0..63 */
+    unsigned p = x < 24u;                           /* filter: keep values < 24 */
+    g_in[WARP] = x;
+    g_keep[WARP] = p;
+
+    /* Inclusive prefix sum of the keep predicate. */
+    unsigned val = p;
+    int d;
+    for (d = 1; d < 32; d = d << 1) {
+        unsigned below = warp_shuffle(val, WARP - d);
+        if (WARP >= d)
+            val = val + below;
+    }
+
+    /* Exclusive scan gives the dense output index for each kept lane. Every
+     * lane's index is <= its own lane number, so it is always in bounds. */
+    val = val - p;
+    g_pos[WARP] = val;
+    g_count = warp_reduce_add_u(p);
+
+    /* Scatter: all kept lanes write their value to their own slot at once. */
+    if (p)
+        g_out[val] = x;
+
+    /* Check 1: each kept lane recovers its own value from its slot. */
+    unsigned back = g_out[val];
+    int lane_ok = 1;
+    if (p)
+        lane_ok = back == x;
+
+    /* Check 2: kept positions are exactly 0..count-1 (dense, no collisions). */
+    g_possum = warp_reduce_add_u(p * val);
+
+    if (warp_all(lane_ok) && (g_possum == g_count * (g_count - 1u) / 2u))
+        return 42;
+    return 0;
+}

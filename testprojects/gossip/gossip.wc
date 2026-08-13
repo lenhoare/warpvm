@@ -1,0 +1,69 @@
+#include <warp.h>
+
+/* Gossip consensus across 64 resident VMs — a messaging + persistence demo.
+ *
+ * Each VM is one node holding a scalar estimate. Every round it exchanges its
+ * estimate with one neighbour and moves to the average, so the whole population
+ * converges to the global mean. Messaging is a VM-wide (uniform) operation, so
+ * the consensus arithmetic is scalar per VM and the 32 lanes are used to paint
+ * the tile that visualises this VM's current value. Parallelism here is across
+ * the 64 gossiping machines, exactly the island-model shape the project targets.
+ *
+ * Topology: hypercube dimension exchange. With 64 = 2^6 nodes, the partner in
+ * round r is `vm XOR (1 << (r mod 6))`. Cycling through the six dimensions
+ * averages every node to the exact global mean in O(log N) rounds, vastly
+ * faster than a ring's O(N^2) diffusion — so convergence is visible in seconds.
+ * (This wiring assumes exactly 64 resident VMs, like the firefly demo.)
+ *
+ * Each round drains the whole inbox and averages self with everything received,
+ * then sends the updated value to this round's partner. One send per round plus
+ * a full drain keeps the 16-slot mailbox from overflowing.
+ *
+ * Initial values are a gradient (vm * 4096), so the 8x8 grid starts as a colour
+ * ramp and collapses to a single uniform colour as the nodes agree. The mean of
+ * 0..63 scaled by 4096 is 31.5*4096 = 129024, the value every tile converges to. */
+
+unsigned g_value;          /* this VM's current estimate (fixed *4096) */
+unsigned g_frame;          /* round counter                            */
+unsigned g_pay;            /* try_recv payload scratch                 */
+unsigned g_meta;           /* try_recv metadata scratch                */
+unsigned g_sum;            /* sum of values received this round        */
+unsigned g_cnt;            /* count of messages received this round     */
+
+int main(void)
+{
+    unsigned vm = warp_vm_id();
+    unsigned partner;
+    unsigned n;
+    unsigned batch;
+
+    g_value = vm * 4096u;      /* gradient initial condition */
+    g_frame = 0;
+
+    while (1) {
+        /* Drain the inbox and average this node with everything it heard. */
+        g_sum = 0;
+        g_cnt = 0;
+        while (warp_try_recv(&g_pay, &g_meta)) {
+            g_sum = g_sum + g_pay;
+            g_cnt = g_cnt + 1u;
+        }
+        g_value = (g_value + g_sum) / (1u + g_cnt);
+
+        /* Send the updated estimate to this round's hypercube partner. */
+        partner = vm ^ (1u << (g_frame % 6u));
+        warp_send(partner, 1u, g_value);
+
+        /* Visualise: flat heat colour for the tile. Low value = blue, high =
+         * red; convergence turns the whole grid one colour. */
+        n = g_value >> 10;                 /* 0..252 */
+        for (batch = 0; batch < 512u; batch = batch + 1u) {
+            warp_set_pixel((batch * 32u + WARP) & 127u,
+                           (batch * 32u + WARP) >> 7,
+                           warp_argb(255u, n, (n >> 1) + 40u, 255u - n));
+        }
+
+        warp_flip();
+        g_frame = g_frame + 1u;
+    }
+}

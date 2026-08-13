@@ -1,0 +1,98 @@
+#include <warp.h>
+
+/* Bloom — a spinning kaleidoscopic mandala, one living flower per VM.
+ *
+ * A small celebration piece that puts the session's lessons to work:
+ *   - a 256-entry sine table lives in RAM and is filled WARP-COOPERATIVELY at
+ *     startup (32 lanes, 8 batches), so the render loop has no user-function
+ *     calls: fast, and free of the plasma's register pressure;
+ *   - each pixel's centred coordinate is rotated by a per-frame angle, so the
+ *     whole field turns;
+ *   - the field is the interference of moving stripes, a hyperbolic (x*y)
+ *     pinwheel, and breathing concentric rings;
+ *   - colour flows through the hue circle by reading the same sine table three
+ *     phases apart.
+ * Each VM gets its own rotation speed and palette offset, so a 64-VM grid is a
+ * garden of distinct, slowly turning blooms.
+ *
+ * View it (interpreter path):
+ *   warpvm view bloom.wvm --vm 0        # one enlarged bloom
+ *   warpvm view bloom.wvm --vms 64      # the whole garden */
+
+int g_tab[256];        /* sine wheel, values -127..127        */
+unsigned g_frame;      /* frame counter                       */
+unsigned g_t;          /* wave time                           */
+int g_cos;             /* rotation matrix, this frame (/128)  */
+int g_sin;
+unsigned g_pal;        /* palette rotation, this frame        */
+unsigned g_rotspeed;   /* per-VM rotation speed               */
+unsigned g_palbase;    /* per-VM hue offset                   */
+
+int main(void)
+{
+    unsigned batch;
+    int dx;
+    int dy;
+    int rx;
+    int ry;
+    int r2;
+    int v;
+
+    /* Fill the sine table cooperatively: lane i writes entries i, i+32, ...
+     * The parabolic half-wave q = h*(128-h) scaled to +/-127, sign from the
+     * top phase bit. */
+    for (batch = 0; batch < 256u; batch = batch + 32u) {
+        dx = batch + WARP;                       /* table index 0..255 */
+        dy = dx & 127;                           /* position in half   */
+        r2 = dy * (128 - dy);                    /* 0..4096            */
+        rx = (r2 * 127) >> 12;                   /* magnitude 0..127   */
+        ry = 1 - ((dx >> 7) & 1) * 2;            /* +1 / -1 by half    */
+        g_tab[dx] = rx * ry;
+    }
+
+    g_rotspeed = 1u + warp_vm_id() % 3u;         /* distinct spin per VM */
+    g_palbase = warp_vm_id() * 15u;              /* distinct hue per VM  */
+    g_frame = 0;
+
+    while (1) {
+        /* Per-frame uniform setup: rotation matrix, wave time, palette. cos is
+         * sine a quarter-turn (64/256) ahead of sin. */
+        g_t = g_frame * 2u;
+        g_pal = g_palbase + g_frame;
+        rx = g_frame * g_rotspeed;               /* rotation angle */
+        g_sin = g_tab[rx & 255];
+        g_cos = g_tab[(rx + 64) & 255];
+
+        for (batch = 0; batch < 512u; batch = batch + 1u) {
+            dx = ((batch * 32u + WARP) & 127u) - 64;    /* centred x */
+            dy = ((batch * 32u + WARP) >> 7) - 64;      /* centred y */
+
+            /* Rotate the coordinate frame (fixed point, matrix /128). */
+            rx = (dx * g_cos - dy * g_sin) >> 7;
+            ry = (dx * g_sin + dy * g_cos) >> 7;
+            r2 = dx * dx + dy * dy;                      /* radius^2 */
+
+            /* Interference: two moving stripe fields in the rotated frame, a
+             * hyperbolic pinwheel, and expanding rings. */
+            v = g_tab[(rx * 2 + g_t) & 255u];
+            v = v + g_tab[(ry * 2 - g_t) & 255u];
+            v = v + g_tab[((rx * ry) >> 5) & 255];
+            v = v + g_tab[((r2 >> 3) - g_t) & 255u];
+
+            /* Flow through the hue circle; components read the wheel 120
+             * degrees (85/256) apart. Each lands in [1,255], no wrap. The dead
+             * coordinate registers are reused as the r/g/b channels to keep
+             * every expression shallow. */
+            v = v + g_pal;
+            dx = 128 + g_tab[v & 255u];             /* r */
+            dy = 128 + g_tab[(v + 85u) & 255u];     /* g */
+            rx = 128 + g_tab[(v + 170u) & 255u];    /* b */
+            r2 = warp_argb(255u, dx, dy, rx);
+            warp_set_pixel((batch * 32u + WARP) & 127u,
+                           (batch * 32u + WARP) >> 7, r2);
+        }
+
+        warp_flip();
+        g_frame = g_frame + 1u;
+    }
+}

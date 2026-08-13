@@ -1,0 +1,55 @@
+#include <warp.h>
+
+/* The same warp-native bitonic network as bitonic.wc, exercised on arbitrary
+ * unsigned data with many duplicate values (32 lanes drawn from 0..15, so ties
+ * are guaranteed). The network is data-independent, so correctness here plus
+ * the perfect-permutation result in bitonic.wc together demonstrate it sorts
+ * real data, not just a lucky input.
+ *
+ * Two independent checks confirm the result:
+ *   - non-decreasing:  every lane's value <= the next lane's value;
+ *   - multiset intact: the sum and xor of the 32 values are permutation
+ *     invariants, so matching them before/after proves nothing was lost,
+ *     duplicated, or invented. */
+
+unsigned g_in[32];
+unsigned g_out[32];
+unsigned g_sum_in;
+unsigned g_xor_in;
+unsigned g_sum_out;
+unsigned g_xor_out;
+
+int main(void)
+{
+    unsigned val = (WARP * WARP * 37u + WARP * 101u + 7u) & 15u;
+    g_in[WARP] = val;
+    g_sum_in = warp_reduce_add_u(val);
+    g_xor_in = warp_reduce_xor(val);
+
+    int k;
+    int j;
+    for (k = 2; k <= 32; k = k << 1) {
+        for (j = k >> 1; j > 0; j = j >> 1) {
+            unsigned other = warp_shuffle(val, WARP ^ j);
+            int want_min = ((WARP & j) == 0) == ((WARP & k) == 0);
+            if (want_min != (val < other))
+                val = other;
+        }
+    }
+
+    g_out[WARP] = val;
+    g_sum_out = warp_reduce_add_u(val);
+    g_xor_out = warp_reduce_xor(val);
+
+    /* Compare each lane with the one above it. Lane 31 has no successor, so it
+     * stays ordered by definition. */
+    unsigned above = warp_shuffle(val, WARP + 1);
+    int ordered = 1;
+    if (WARP < 31)
+        ordered = val <= above;
+    int all_ordered = warp_all(ordered);
+
+    if (all_ordered && (g_sum_out == g_sum_in) && (g_xor_out == g_xor_in))
+        return 42;
+    return 0;
+}

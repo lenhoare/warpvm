@@ -1,0 +1,107 @@
+#include <warp.h>
+
+/* WarpVM plasma / interference field.
+ *
+ * A classic demoscene plasma, rebuilt for a 32-lane integer machine. There is
+ * no floating point and no sin(), so colour comes from an integer sine wheel.
+ * Every warp batch paints 32 horizontally-adjacent pixels at once (lane i owns
+ * pixel `batch*32 + i`), so one uniform 512-iteration loop covers the whole
+ * 128x128 framebuffer. The field is the sum of three travelling plane waves
+ * and two moving radial ripple sources; the summed interference selects a
+ * colour from a cycling RGB palette. Each VM is given its own palette rotation
+ * and animation speed so a 64-VM grid shimmers out of phase.
+ *
+ * Uniform per-frame state (time, sources, palette) lives in VM-shared globals
+ * so the register file stays free for the divergent per-pixel arithmetic. */
+
+unsigned g_t;          /* frame counter                      */
+unsigned g_palette;    /* palette rotation this frame        */
+unsigned g_speed;      /* per-VM animation speed             */
+unsigned g_pal_base;   /* per-VM palette rotation base       */
+int g_src1x;           /* moving interference source 1       */
+int g_src1y;
+int g_src2x;           /* moving interference source 2       */
+int g_src2y;
+
+/* Integer sine, period 256, amplitude [-127, 127]. A branchless parabolic
+ * half-wave: q = h*(128-h) is a parabola that is 0 at the ends and 4096 at the
+ * centre; scaling by 127/4096 gives a clean [0,127] magnitude, and the top
+ * phase bit flips the sign for the second half of the circle. It uses no lane
+ * identity, so it is a pure function of its argument. */
+int isin(unsigned a)
+{
+    a = a & 255u;
+    unsigned h = a & 127u;
+    unsigned q = h * (128u - h);           /* 0 .. 4096                */
+    int mag = (q * 127u) >> 12;            /* 0 .. 127                 */
+    int sign = 1 - ((a >> 7) & 1u) * 2;    /* +1 first half, -1 second */
+    return mag * sign;
+}
+
+int main(void)
+{
+    /* Warp C appears to give each named local its own register for the whole
+     * function, so main keeps only the hot inner temporaries as locals and
+     * parks per-VM personality in globals. */
+    g_pal_base = warp_vm_id() * 21u;       /* per-VM palette rotation */
+    g_speed = 1u + (warp_vm_id() & 3u);    /* per-VM animation speed  */
+    g_t = 0;
+
+    while (1) {
+        /* Two interference sources trace slow ellipses around the centre.
+         * They depend only on the frame counter, so they are uniform and are
+         * computed once per frame rather than per pixel. */
+        g_src1x = 64 + isin(g_t) / 2;
+        g_src1y = 64 + isin(g_t + 64u) / 2;
+        g_src2x = 64 + isin(g_t * 2u + 40u) / 2;
+        g_src2y = 64 + isin(g_t + 170u) / 2;
+        g_palette = g_pal_base + (g_t >> 1);
+
+        for (unsigned batch = 0; batch < 512u; ++batch) {
+            unsigned px = (batch * 32u + WARP) & 127u;
+            unsigned py = (batch * 32u + WARP) >> 7;
+            int wave;
+            int dx;
+            int dy;
+            unsigned d;
+
+            /* Three directional plane waves at different angles and speeds.
+             * Expressions are kept shallow: the compiler allocates one vector
+             * temp per pending operand, so deep trees exhaust the file. */
+            d = px * 2u + g_t;
+            wave = isin(d);
+            d = py * 2u - g_t;
+            wave += isin(d);
+            d = px + py + g_t * 2u;
+            wave += isin(d);
+
+            /* Two radial ripples from the moving sources. Squared distance
+             * (no sqrt) shrunk by >>4 gives comfortably spaced rings. The
+             * dx/dy pair is reused for both sources to spare registers. */
+            dx = px - g_src1x;
+            dy = py - g_src1y;
+            d = dx * dx + dy * dy;
+            d = (d >> 4) + g_t;
+            wave += isin(d);
+
+            dx = px - g_src2x;
+            dy = py - g_src2y;
+            d = dx * dx + dy * dy;
+            d = (d >> 4) - g_t;
+            wave += isin(d);
+
+            /* Map the interference sum onto a cycling palette. The three
+             * components read the sine wheel 120 degrees (85/256) apart, so
+             * the field glides through the full hue circle. isin is in
+             * [-127,127], so every component lands in [1,255] with no wrap. */
+            d = wave + g_palette;
+            warp_set_pixel(px, py, warp_argb(255u,
+                                             128 + isin(d),
+                                             128 + isin(d + 85u),
+                                             128 + isin(d + 170u)));
+        }
+
+        warp_flip();
+        g_t = g_t + g_speed;
+    }
+}

@@ -1,0 +1,61 @@
+#include <warp.h>
+
+/* Warp-native prefix sum (scan) of 32 values — one value per lane.
+ *
+ * A Kogge-Stone / Hillis-Steele scan: in step d each lane adds the value d
+ * lanes below it, doubling d each time (1,2,4,8,16). After five steps lane i
+ * holds the inclusive prefix sum x[0]+...+x[i]. Like the bitonic network the
+ * step structure is data-independent, so the control flow never diverges; the
+ * only per-lane branch is the guard that stops the low lanes reaching past
+ * lane 0, and the only cross-lane traffic is one shuffle-up per step.
+ *
+ * warp_shuffle takes a runtime per-lane source lane, so `warp_shuffle(val,
+ * WARP - d)` reads d lanes down with an ordinary loop variable d. Low lanes
+ * where WARP-d < 0 read a wrapped lane, but their guarded add discards it.
+ *
+ * The input carries deliberate duplicates (values 1..4 repeating) to show the
+ * scan is a genuine running sum, not something that only works on a
+ * permutation. Two independent checks confirm the result:
+ *   - difference recovery: incl[i] - incl[i-1] == x[i] for every lane (and
+ *     incl[0] == x[0]) proves it is exactly the prefix sum of the input;
+ *   - total agreement: the last inclusive value equals an independent
+ *     warp reduction of the input. */
+
+unsigned g_in[32];
+unsigned g_incl[32];
+unsigned g_excl[32];
+unsigned g_total;
+
+int main(void)
+{
+    unsigned x = (WARP & 3u) + 1u;        /* 1,2,3,4,1,2,3,4,... */
+    unsigned val = x;                     /* becomes the inclusive scan */
+    g_in[WARP] = x;
+
+    int d;
+    for (d = 1; d < 32; d = d << 1) {
+        unsigned below = warp_shuffle(val, WARP - d);
+        if (WARP >= d)
+            val = val + below;
+    }
+
+    g_incl[WARP] = val;                   /* inclusive: x[0]..x[i]        */
+    g_excl[WARP] = val - x;               /* exclusive: x[0]..x[i-1]      */
+
+    /* Differencing the inclusive scan must return the original input. Lane 0
+     * has no predecessor, so it should simply equal x[0]. */
+    unsigned prev = warp_shuffle(val, WARP - 1);
+    unsigned recovered = val;
+    if (WARP > 0)
+        recovered = val - prev;
+    int all_recovered = warp_all(recovered == x);
+
+    /* The final inclusive value is the whole-warp total; compare it with an
+     * independent reduction of the input. */
+    g_total = warp_reduce_add_u(x);
+    unsigned last = warp_broadcast(val, 31);
+
+    if (all_recovered && (last == g_total))
+        return 42;
+    return 0;
+}

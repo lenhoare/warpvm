@@ -1,0 +1,79 @@
+#include <warp.h>
+
+/* Warp-native Mandelbrot renderer — 128x128, one pixel per lane per batch.
+ *
+ * Integer machine, so the complex arithmetic is Q4.12 fixed point (see
+ * mandelbrot_test.wc for the escape-count logic and its verification). Each of
+ * the 512 warp batches paints 32 pixels; the escape loop runs a FIXED 100
+ * iterations for every lane with a sticky `escaped` mask, because per-lane
+ * divergent loop bounds are not allowed. Escaped lanes keep iterating harmlessly
+ * (integer overflow just wraps; the sticky mask already froze their count).
+ *
+ * The palette maps escape count to colour and cycles slowly with a frame
+ * counter so the bands shimmer; in-set pixels (count == max) stay black. No
+ * user functions are called, so only inlined intrinsics touch the software
+ * stack — the program runs on the resident compiled engine as well as the
+ * interpreter.
+ *
+ * Register budget note: the full-complex working set (cr, ci, zr, zi, count,
+ * escaped, and two scratch regs) already fills the ~13-register file, so the
+ * two uniform loop counters live in globals rather than registers.
+ *
+ * View window: real [-2.5, +1.0], imag [-1.75, +1.75] (3.5 units square). */
+
+unsigned g_frame;
+unsigned g_batch;
+unsigned g_iter;
+
+int main(void)
+{
+    int cr;
+    int ci;
+    int zr;
+    int zi;
+    int count;
+    int escaped;
+    int a;              /* scratch: pixel coords, then zr^2 / new zr */
+    int b;              /* scratch: pixel coords, then zi^2 / new zi */
+
+    g_frame = 0;
+
+    while (1) {
+        for (g_batch = 0; g_batch < 512u; g_batch = g_batch + 1u) {
+            a = (g_batch * 32u + WARP) & 127u;    /* px */
+            b = (g_batch * 32u + WARP) >> 7;      /* py */
+            cr = -10240 + a * 112;                /* -2.5 + px*(3.5/128), Q4.12 */
+            ci = -7168 + b * 112;                 /* -1.75 + py*(3.5/128)       */
+
+            zr = 0;
+            zi = 0;
+            count = 0;
+            escaped = 0;
+
+            for (g_iter = 0; g_iter < 100u; g_iter = g_iter + 1u) {
+                a = (zr * zr) >> 12;              /* zr^2 */
+                b = (zi * zi) >> 12;              /* zi^2 */
+                escaped = escaped | ((a + b) > 16384);   /* sticky |z|^2 > 4 */
+                count = count + (1 - escaped);
+                a = a - b + cr;                   /* new zr = zr^2 - zi^2 + cr */
+                b = ((zr * zi) >> 11) + ci;       /* new zi = 2*zr*zi + ci     */
+                zr = a;
+                zi = b;
+            }
+
+            /* Colour: black inside the set, else a frame-cycled palette. The
+             * dead loop registers are reused as the r/g/b channels. */
+            escaped = count < 100;                            /* active flag */
+            a = ((count * 8 + g_frame) & 255u) * escaped;     /* r */
+            b = ((count * 5 + 40) & 255u) * escaped;          /* g */
+            ci = ((count * 13 + 90) & 255u) * escaped;        /* b (reuse ci) */
+            count = warp_argb(255u, a, b, ci);                /* packed colour */
+
+            warp_set_pixel((g_batch * 32u + WARP) & 127u,
+                           (g_batch * 32u + WARP) >> 7, count);
+        }
+
+        warp_flip();
+        g_frame = g_frame + 2u;
+    }
+}

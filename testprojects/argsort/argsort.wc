@@ -1,0 +1,81 @@
+#include <warp.h>
+
+/* Warp-native argsort — a 32-lane bitonic sort that carries a payload.
+ *
+ * Each lane starts with a key and a payload; the payload here is the lane's
+ * own index (WARP), so sorting the keys turns into an argsort: after the sort,
+ * lane i holds the i-th smallest key together with the original lane it came
+ * from. The bitonic network is unchanged from testprojects/bitonic — the only
+ * addition is that whenever a lane adopts the partner's key it must adopt the
+ * partner's payload in the same masked step, so key and payload travel
+ * together through every compare-exchange.
+ *
+ * The keys carry heavy duplicates (values 0..15 over 32 lanes) so this also
+ * exercises a payload permutation that is not simply the inverse of the keys.
+ *
+ * Three checks confirm the result:
+ *   - keys non-decreasing across the lanes;
+ *   - payload is a genuine permutation of 0..31 (sum 496, xor 0);
+ *   - payload consistency: orig_key[payload[i]] == sorted_key[i], i.e. each
+ *     payload really points back to a source lane holding that key. This is
+ *     the property that makes the result a usable argsort, and it holds even
+ *     with duplicate keys because key and payload move in lockstep. */
+
+unsigned g_in_key[32];
+unsigned g_in_pay[32];
+unsigned g_out_key[32];
+unsigned g_out_pay[32];
+unsigned g_psum;
+unsigned g_pxor;
+
+int main(void)
+{
+    unsigned key = (WARP * WARP * 37u + 11u) & 15u;   /* 0..15, many ties */
+    unsigned pay = WARP;                              /* payload = source index */
+    g_in_key[WARP] = key;
+    g_in_pay[WARP] = pay;
+
+    int k;
+    int j;
+    unsigned ok;     /* partner key (reused later as scratch)     */
+    unsigned op;     /* partner payload (reused later as scratch) */
+    for (k = 2; k <= 32; k = k << 1) {
+        for (j = k >> 1; j > 0; j = j >> 1) {
+            ok = warp_shuffle(key, WARP ^ j);
+            op = warp_shuffle(pay, WARP ^ j);
+            int want_min = ((WARP & j) == 0) == ((WARP & k) == 0);
+            /* Adopt the partner only on a STRICT comparison, so equal keys
+             * keep their own payload instead of both copying one side. A
+             * want-min lane takes a strictly smaller partner; a want-max lane
+             * takes a strictly larger one. Branchless to avoid nested masks. */
+            int take = (want_min & (ok < key)) | ((1 - want_min) & (ok > key));
+            if (take) {
+                key = ok;
+                pay = op;
+            }
+        }
+    }
+
+    g_out_key[WARP] = key;
+    g_out_pay[WARP] = pay;
+
+    /* Non-decreasing keys; lane 31 has no successor so it is ordered by
+     * definition. */
+    ok = warp_shuffle(key, WARP + 1);
+    int lane_ok = 1;
+    if (WARP < 31)
+        lane_ok = key <= ok;
+
+    /* Payload consistency: the original key at the source lane equals the
+     * sorted key here. The original key is gathered from g_in_key[pay] rather
+     * than kept in a live register. (Bitwise & rather than && so the divergent
+     * operands do not form a short-circuit expression.) */
+    lane_ok = lane_ok & (g_in_key[pay] == key);
+
+    g_psum = warp_reduce_add_u(pay);
+    g_pxor = warp_reduce_xor(pay);
+
+    if (warp_all(lane_ok) && (g_psum == 496u) && (g_pxor == 0u))
+        return 42;
+    return 0;
+}

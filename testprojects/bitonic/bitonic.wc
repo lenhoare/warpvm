@@ -1,0 +1,49 @@
+#include <warp.h>
+
+/* Warp-native bitonic sort of 32 values — one value per lane.
+ *
+ * A bitonic sorting network on 2^5 elements is five stages (k = 2,4,8,16,32);
+ * stage k has log2(k) compare-exchange steps at distances j = k/2, k/4, ... 1.
+ * The whole network is data-independent, so it maps perfectly onto a warp:
+ * every lane runs the identical sequence of steps with no divergence in the
+ * control flow, and the only cross-lane traffic is one SHUFFLE per step.
+ *
+ * For a step at distance j, lane i exchanges with lane i^j. The subsequence is
+ * sorted ascending when (i & k)==0, and lane i is the lower element of its
+ * comparator when (i & j)==0. The lower element of an ascending pair keeps the
+ * minimum; every other combination flips. So a lane keeps its own value when
+ * `want_min == (mine < theirs)` and otherwise adopts the partner's value.
+ *
+ * warp_shuffle takes a runtime, per-lane source lane, so the loops stay rolled
+ * (warp_shuffle_xor would require a compile-time constant mask and full
+ * unrolling). The globals record the before/after arrays for host inspection. */
+
+unsigned g_input[32];
+unsigned g_output[32];
+
+int main(void)
+{
+    /* A permutation of 0..31: 5 is coprime to 32, so (i*5 mod 32) hits every
+     * value exactly once, in scrambled order. A correct ascending sort must
+     * therefore leave lane i holding exactly i. */
+    int val = (WARP * 5) & 31;
+    g_input[WARP] = val;
+
+    int k;
+    int j;
+    for (k = 2; k <= 32; k = k << 1) {
+        for (j = k >> 1; j > 0; j = j >> 1) {
+            int other = warp_shuffle(val, WARP ^ j);
+            int want_min = ((WARP & j) == 0) == ((WARP & k) == 0);
+            if (want_min != (val < other))
+                val = other;
+        }
+    }
+
+    g_output[WARP] = val;
+
+    /* Every lane holding its own index proves a perfect ascending sort. */
+    if (warp_all(val == WARP))
+        return 42;
+    return 0;
+}
