@@ -1561,8 +1561,13 @@ impl<'a> Generator<'a> {
             .enumerate()
             .filter_map(|(reg, used)| used.then_some(reg as u8))
             .collect();
-        let return_slot = (return_type != Type::VOID).then_some(saved.len() + saved_scalars.len());
-        let frame_slots = saved.len() + saved_scalars.len() + usize::from(return_slot.is_some());
+        // Stage every argument in ABI-owned stack slots. The old lowering
+        // reloaded arguments from their incidental caller-save slots, which
+        // was invalid for values such as WARP in reserved r13 and needlessly
+        // coupled expression lowering to the caller-save register set.
+        let argument_base = saved.len() + saved_scalars.len();
+        let return_slot = (return_type != Type::VOID).then_some(argument_base + values.len());
+        let frame_slots = argument_base + values.len() + usize::from(return_slot.is_some());
         let frame_words = frame_slots * 32;
         if frame_words != 0 {
             self.instr(&format!(
@@ -1578,14 +1583,12 @@ impl<'a> Generator<'a> {
             self.instr(&format!("S_BCAST r15, s{reg}"));
             self.instr(&format!("STORE r{STACK_ADDR_REG}, r15"));
         }
-        for (arg_reg, value) in values.iter().enumerate() {
-            let Some(slot) = saved.iter().position(|&reg| reg == value.reg) else {
-                return Err(Diagnostic::new(
-                    span,
-                    "internal error: argument register was not saved",
-                ));
-            };
-            self.stack_address(slot);
+        for (index, value) in values.iter().enumerate() {
+            self.stack_address(argument_base + index);
+            self.instr(&format!("STORE r{STACK_ADDR_REG}, r{}", value.reg));
+        }
+        for arg_reg in 0..values.len() {
+            self.stack_address(argument_base + arg_reg);
             self.instr(&format!("LOAD r{arg_reg}, r{STACK_ADDR_REG}"));
         }
         let target = self.function_labels[function].clone();
@@ -2308,6 +2311,18 @@ mod tests {
         assert!(text.contains("CALL __warpc_fn_add"));
         assert!(text.contains("__warpc_fn_add:"));
         assert!(text.contains("RET"));
+    }
+
+    #[test]
+    fn call_arguments_are_staged_independently_of_source_registers() {
+        let text = assembly(
+            "int f(int a,int b) { if(a<0) return b; return a+b; } int main(void) { int side=0; int local=WARP+4; int a=f(WARP,1); int b=f(WARP+1,++side); int c=f(WARP*3+7,WARP); int d=f(local,warp_lane_id()); return 42+a-a+b-b+c-c+d-d+side-side; }",
+        );
+        assert!(text.contains("CALL __warpc_fn_f"));
+        // WARP and warp_lane_id both reside in reserved r13. They are now
+        // valid STORE sources for dedicated argument staging slots.
+        assert!(text.contains("STORE r14, r13"), "{text}");
+        assert!(!text.contains("argument register was not saved"));
     }
 
     #[test]

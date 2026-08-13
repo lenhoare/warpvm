@@ -58,12 +58,8 @@ int main(void)
 
     g_fail = 0;
 
-    /* Passing WARP directly into a non-inlined call currently trips a compiler
-     * internal error (r13 is live but not in the caller-save set). Bind it. */
-    sample = WARP;
-
     /* Identity: one of each bin. */
-    hits = count_chunk(sample, 1);
+    hits = count_chunk(WARP, 1);
     g_hist[WARP] = hits;
     if (!warp_all(hits == 1))
         g_fail = 1;
@@ -77,7 +73,7 @@ int main(void)
 
     /* Four samples in each of bins 0..7. Cross-check bin 7 two ways:
      * the lane-owned shuffle count, and a direct reduction of the predicate. */
-    sample = sample >> 2;
+    sample = WARP >> 2;
     hits = count_chunk(sample, 1);
     g_hist[WARP] = hits;
     expected = expect_quads();

@@ -127,6 +127,16 @@ add_test(NAME warpc_inlining
           ${WVM_WARPC} $<TARGET_FILE:warpvm>
           ${CMAKE_SOURCE_DIR}/programs/warpc/inlining.wc
           ${CMAKE_BINARY_DIR}/warpc_inlining warpc_inlining)
+add_test(NAME warpc_call_arguments
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_acceptance.sh
+          ${WVM_WARPC} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/programs/warpc/call_arguments.wc
+          ${CMAKE_BINARY_DIR}/warpc_call_arguments warpc_call_arguments)
+add_test(NAME warpc_histogram
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_acceptance.sh
+          ${WVM_WARPC} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/testprojects/histogram/histogram.wc
+          ${CMAKE_BINARY_DIR}/warpc_histogram warpc_histogram)
 add_test(NAME warpc_graphics
   COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_graphics.sh
           ${WVM_WARPC} $<TARGET_FILE:warpvm>

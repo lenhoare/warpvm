@@ -1,0 +1,62 @@
+#include <warp.h>
+
+/* The control flow deliberately keeps these helpers on the real CALL/RET ABI. */
+int take_one(int a)
+{
+    if (a == -999)
+        return 0;
+    return a;
+}
+
+int take_two(int a, int b)
+{
+    if (a == -999)
+        return 0;
+    return a + b;
+}
+
+int take_four(int a, int b, int c, int d)
+{
+    if (d == -999)
+        return 0;
+    return a + b + c + d;
+}
+
+int main(void)
+{
+    int failures = 0;
+    int value;
+
+    value = take_one(WARP);
+    if (!warp_all(value == WARP))
+        failures = 1;
+
+    value = take_two(WARP, 1);
+    if (!warp_all(value == WARP + 1))
+        failures = 2;
+
+    value = take_one(WARP + 1);
+    if (!warp_all(value == WARP + 1))
+        failures = 3;
+
+    value = take_one(WARP * 3 + 7);
+    if (!warp_all(value == WARP * 3 + 7))
+        failures = 4;
+
+    int side = 0;
+    value = take_two(WARP, ++side);
+    if (!warp_all(value == WARP + 1) || side != 1)
+        failures = 5;
+
+    value = take_four(WARP, WARP, WARP + 2, WARP);
+    if (!warp_all(value == WARP * 4 + 2))
+        failures = 6;
+
+    unsigned vm = warp_vm_id();
+    int local = WARP + 9;
+    value = take_four(local, warp_lane_id(), vm, 3);
+    if (!warp_all(value == WARP * 2 + 12 + vm))
+        failures = 7;
+
+    return failures ? 0 : 42;
+}
