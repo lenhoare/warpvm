@@ -93,8 +93,9 @@ without terminating the kernel.
 
 ## Memory
 
-- VM RAM: private global-memory region per VM, word-addressed. All LOAD/
-  STORE bounds-check against `[0, mem_size_words)`; violations fault the VM.
+- VM RAM: private global-memory region per VM, word-addressed. The standard
+  default is 65,536 words (256 KiB) per VM. All LOAD/STORE bounds-check
+  against `[0, mem_size_words)`; violations fault the VM.
 - VM state blocks: structure-of-arrays layout preferred where it improves
   coalescing (spill/reload, status scans).
 

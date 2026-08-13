@@ -166,7 +166,7 @@ Recommended v0.1 starting point:
 - 8 scalar registers
 - 32-bit integer values
 - 32-bit fixed-width bytecode instructions
-- 16 KB or 64 KB VM-local memory
+- 65,536 words (256 KiB) of VM-local memory by default
 - one small inbound mailbox
 - one outbound message slot or ring buffer
 
@@ -1151,4 +1151,3 @@ If a design decision makes WarpVM more familiar but wastes the 32-lane nature of
 The project exists to answer:
 
 > What should a programmable computer look like if 32-way parallel execution is its primitive operation rather than an accelerator feature?
-

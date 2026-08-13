@@ -195,7 +195,8 @@ Warp C's first calling convention is deliberately small:
 - `p0`–`p3` are temporary condition masks;
 - architectural `CALL` / `RET` preserve return continuations.
 
-Entry initializes `s7` to word address 16,384. The software stack grows down.
+Entry initializes `s7` to `WARP_RAM_SIZE_WORDS`, currently word address
+65,536. The software stack grows down.
 Every saved vector value occupies 32 consecutive words: slot lane `i` belongs
 to lane `i`. A call frame currently stores every allocator-active caller
 vector and scalar register in ascending register order, followed by dedicated

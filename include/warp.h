@@ -5,6 +5,7 @@
  * Addresses and sizes are in 32-bit VM words. Pixels are ARGB8888 words.
  * WARP is a predefined divergent int containing the current lane ID (0..31);
  * it is part of the language and intentionally has no declaration here. */
+#define WARP_RAM_SIZE_WORDS 65536
 #define WARP_VIDEO_WIDTH 128
 #define WARP_VIDEO_HEIGHT 128
 #define WARP_VIDEO_WORDS 16384

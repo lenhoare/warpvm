@@ -910,3 +910,18 @@ Permanent emitted comments now show allocator-active homes, semantic live-out,
 saved vector/scalar mappings, memory-resident live values, protected expression
 temporaries, frame words, memory instructions, and architectural lane-word
 accesses at every genuine call.
+
+## 30. Default private RAM is 65,536 words
+
+**Classification:** configuration increase; no memory-semantic or ISA change
+
+The standard runtime and Warp C stack/global limit now use 65,536 private
+32-bit words (256 KiB) per VM, up from 16,384 words. RAM remains word-addressed,
+private per VM, dynamically described by `mem_size_words`, and bounds-checked;
+small-memory fault tests can still construct smaller VM images. The framebuffer
+remains a separate 16,384-word memory-mapped region at `VIDEO_BASE`.
+
+Assembly exposes `RAM_SIZE_WORDS`, while Warp C exposes
+`WARP_RAM_SIZE_WORDS`. An acceptance program allocates a 20,000-word global
+array and verifies interpreted/native access at addresses above the old RAM
+boundary.

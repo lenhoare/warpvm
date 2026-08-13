@@ -18,6 +18,7 @@ constexpr uint32_t kFullMask = 0xFFFFFFFFu;
 constexpr uint32_t kMaxCodeWords = 4096;
 constexpr uint32_t kMaxLiterals = 256;
 constexpr uint32_t kMailboxSlots = 16;
+constexpr uint32_t kRamSizeWords = 65536;  // default private RAM: 256 KiB
 
 // ---- Architectural display (docs/isa.md, v0.1.1) ----------------------
 // Fixed memory-mapped framebuffer, word-addressed. Pixels are ordinary u32

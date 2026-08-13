@@ -131,6 +131,7 @@ Recommended initial layout:
 Constants:
 
 ```text
+RAM_SIZE_WORDS = 65536
 VIDEO_BASE_WORD = 0x00100000
 VIDEO_WIDTH     = 128
 VIDEO_HEIGHT    = 128

@@ -7,6 +7,7 @@ pub type LocalId = usize;
 pub type GlobalId = usize;
 pub type FunctionId = usize;
 pub type StructId = usize;
+pub const RAM_SIZE_WORDS: usize = 65_536;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BaseType {
@@ -554,7 +555,7 @@ impl Analyzer {
                     frame_words += type_size(local.ty, &self.structs);
                 }
             }
-            if self.data_words.len() + frame_words * 32 >= 16_384 {
+            if self.data_words.len() + frame_words * 32 >= RAM_SIZE_WORDS {
                 return Err(Diagnostic::new(
                     function.span,
                     "Warp C data and local stack frame exceed VM RAM",
@@ -681,10 +682,13 @@ impl Analyzer {
         }
         let address = self.data_words.len();
         let size = type_size(ty, &self.structs);
-        if address.checked_add(size).is_none_or(|end| end > 16_384) {
+        if address
+            .checked_add(size)
+            .is_none_or(|end| end > RAM_SIZE_WORDS)
+        {
             return Err(Diagnostic::new(
                 global.span,
-                "global data exceeds the 16,384-word VM RAM",
+                "global data exceeds the 65,536-word VM RAM",
             ));
         }
         self.data_words.resize(address + size, 0);
@@ -897,10 +901,10 @@ impl Analyzer {
                 if value == 0 {
                     return Err(Diagnostic::new(expr.span, "array size must be positive"));
                 }
-                if value > 16_384 {
+                if value > RAM_SIZE_WORDS {
                     return Err(Diagnostic::new(
                         expr.span,
-                        "array exceeds the 16,384-word VM RAM",
+                        "array exceeds the 65,536-word VM RAM",
                     ));
                 }
                 Some(value)
@@ -2623,6 +2627,7 @@ pub const WARP_VIDEO_BASE: u32 = 0x0010_0000;
 
 fn builtin_constant(name: &str) -> Option<u32> {
     match name {
+        "WARP_RAM_SIZE_WORDS" => Some(RAM_SIZE_WORDS as u32),
         "WARP_VIDEO_WIDTH" => Some(WARP_VIDEO_WIDTH),
         "WARP_VIDEO_HEIGHT" => Some(WARP_VIDEO_HEIGHT),
         "WARP_VIDEO_WORDS" => Some(WARP_VIDEO_WORDS),
@@ -2862,6 +2867,18 @@ mod tests {
         assert_eq!(p.locals[0].ty, Type::I32);
         assert_eq!(p.locals[1].ty, Type::U32);
         assert_eq!(p.locals[2].ty, Type::CHAR);
+    }
+
+    #[test]
+    fn default_ram_constraint_is_65536_words() {
+        let program = source(
+            "unsigned expanded[20000]; int main(void) { return WARP_RAM_SIZE_WORDS == 65536 ? 42 : 0; }",
+        )
+        .unwrap();
+        assert_eq!(program.data_words.len(), 20_000);
+
+        let error = source("unsigned too_large[65537]; int main(void) { return 0; }").unwrap_err();
+        assert!(error.message.contains("65,536-word VM RAM"));
     }
     #[test]
     fn layouts_words_and_marks_address_taken() {

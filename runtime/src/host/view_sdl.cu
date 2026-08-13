@@ -69,7 +69,7 @@ int RunViewer(const char* path, uint32_t resident_vms, uint32_t first_vm,
   for (VmImage& image : images) {
     image.code = file.code;
     image.literals = file.literals;
-    image.mem_size_words = 16384;  // standard v0.1 VM RAM (64 KiB)
+    image.mem_size_words = kRamSizeWords;
   }
   PersistentRuntime rt;
   PtxResidentProgram resident_program;

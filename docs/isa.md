@@ -200,6 +200,10 @@ else:                                     FAULT_MEM
 Per-lane, potentially scattered. Private-RAM addresses are `0 …
 mem_size_words − 1`.
 
+The standard VM configuration uses `RAM_SIZE_WORDS = 65536` private 32-bit
+words (256 KiB) per VM. Runtimes may still construct deliberately smaller
+memories for bounds and fault tests.
+
 | Op | Name | Form | Semantics |
 |---|---|---|---|
 | 0x50 | `LOAD`  | R | active lanes: `rd[i] = mem[rs1[i]]` |

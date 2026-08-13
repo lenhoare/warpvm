@@ -147,7 +147,7 @@ WarpMeasurement MeasureWarpVm(const WvmFile& file, uint32_t n_vms,
   for (VmImage& image : images) {
     image.code = file.code;
     image.literals = file.literals;
-    image.mem_size_words = 16384;
+    image.mem_size_words = kRamSizeWords;
   }
 
   PersistentRuntime rt;
@@ -226,7 +226,7 @@ WarpMeasurement MeasureCpuWarpVm(const WvmFile& file, uint32_t n_vms,
   WarpMeasurement result;
   std::vector<CpuVm> vms(n_vms);
   for (uint32_t vm = 0; vm < n_vms; ++vm)
-    vms[vm].Init(vm, file, 16384);
+    vms[vm].Init(vm, file, kRamSizeWords);
   if (!WarmCpuWarpVms(vms, 2, err)) return result;
 
   const uint32_t workers = std::max(1u, std::min(requested_workers, n_vms));
@@ -491,7 +491,7 @@ bool CompiledKnownPatternsMatch(const std::vector<VmState>& states,
 WarpMeasurement MeasureCompiledWarpVm(PtxCompiledProgram& compiled,
                                        uint32_t n_vms, int duration_ms,
                                        std::string& err) {
-  constexpr uint32_t kMemoryWords = 16384;
+  constexpr uint32_t kMemoryWords = kRamSizeWords;
   WarpMeasurement result;
   std::vector<VmState> states(n_vms);
   std::vector<uint32_t> memory(static_cast<size_t>(n_vms) * kMemoryWords, 0);
@@ -847,7 +847,7 @@ bool CollectLifeCensus(const WvmFile& file, LifeCensus& census,
     return false;
   }
   CpuVm cpu;
-  cpu.Init(0, file, 16384);
+  cpu.Init(0, file, kRamSizeWords);
   while (cpu.status == kRunning && cpu.frame_seq < 1) cpu.Step();
   if (cpu.status != kRunning) {
     err = "CPU WarpLife stopped before the census generation";
@@ -974,8 +974,8 @@ bool CpuLifeProgramsMatch(const WvmFile& a, const WvmFile& b,
   for (const uint32_t vm_id : kVmIds) {
     CpuVm left;
     CpuVm right;
-    left.Init(vm_id, a, 16384);
-    right.Init(vm_id, b, 16384);
+    left.Init(vm_id, a, kRamSizeWords);
+    right.Init(vm_id, b, kRamSizeWords);
     while (left.status == kRunning && left.frame_seq < 3) left.Step();
     while (right.status == kRunning && right.frame_seq < 3) right.Step();
     const uint32_t left_base = left.sregs[0];
@@ -1061,7 +1061,7 @@ double MeasureGpuMillisecondsPerFrame(const WvmFile& file, int duration_ms,
   VmImage image;
   image.code = file.code;
   image.literals = file.literals;
-  image.mem_size_words = 16384;
+  image.mem_size_words = kRamSizeWords;
   PersistentRuntime runtime;
   if (!runtime.Init({image}, err) || !runtime.Launch(err, mode)) return 0.0;
   runtime.BootAll();
@@ -1145,7 +1145,7 @@ double MedianGpuCyclesPerFrame(const WvmFile& file, uint32_t num_vms,
   VmImage image;
   image.code = file.code;
   image.literals = file.literals;
-  image.mem_size_words = 16384;
+  image.mem_size_words = kRamSizeWords;
   std::vector<VmImage> images(num_vms, image);
   PersistentRuntime runtime;
   if (!runtime.Init(images, err) || !runtime.Launch(err, mode)) return 0.0;
@@ -1954,7 +1954,7 @@ int RunCpuGpuLifeEquivalenceMode(const char* path,
   for (VmImage& image : images) {
     image.code = file.code;
     image.literals = file.literals;
-    image.mem_size_words = 16384;
+    image.mem_size_words = kRamSizeWords;
   }
   PersistentRuntime gpu;
   if (!gpu.Init(images, err) || !gpu.Launch(err, mode)) {
@@ -2004,7 +2004,7 @@ int RunCpuGpuLifeEquivalenceMode(const char* path,
   for (size_t index = 0; index < kSelected.size() && captured; ++index) {
     const uint32_t vm_id = kSelected[index];
     CpuVm cpu;
-    cpu.Init(vm_id, file, 16384);
+    cpu.Init(vm_id, file, kRamSizeWords);
     const uint32_t target = expected[index].frame_seq;
     const uint64_t budget = static_cast<uint64_t>(target + 2) * 200000u;
     while (cpu.status == kRunning && cpu.frame_seq < target &&
@@ -2065,7 +2065,7 @@ int RunNativeCpuLifeEquivalence(const char* path) {
   bool equivalent = true;
   for (uint32_t vm_id : kSelected) {
     CpuVm interpreted;
-    interpreted.Init(vm_id, file, 16384);
+    interpreted.Init(vm_id, file, kRamSizeWords);
     const uint64_t budget =
         static_cast<uint64_t>(kTargetGeneration + 2) * 200000u;
     while (interpreted.status == kRunning &&

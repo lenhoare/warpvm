@@ -43,9 +43,10 @@ enum ImmRes {
 
 impl Asm {
     fn new() -> Self {
-        // Predefined architectural display constants (v0.1.1). Seeded as
+        // Predefined architectural platform constants. Seeded as
         // constants but interned into the literal pool only on use.
         let mut consts: HashMap<String, i64> = HashMap::new();
+        consts.insert("RAM_SIZE_WORDS".to_string(), crate::isa::RAM_SIZE_WORDS);
         consts.insert("VIDEO_BASE".to_string(), crate::isa::VIDEO_BASE);
         consts.insert("VIDEO_WIDTH".to_string(), crate::isa::VIDEO_WIDTH);
         consts.insert("VIDEO_HEIGHT".to_string(), crate::isa::VIDEO_HEIGHT);
@@ -841,6 +842,9 @@ mod tests {
         // VIDEO_WIDTH (128) fits inline.
         let b = assemble("MOV_I r0, VIDEO_WIDTH\nHALT\n").unwrap();
         assert_eq!(b.code[0], enc_i(OP_MOV_I, 0, 0, 0, 128));
+
+        let ram = assemble("MOV_I r0, RAM_SIZE_WORDS\nHALT\n").unwrap();
+        assert!(ram.literals.contains(&65536));
     }
 
     #[test]

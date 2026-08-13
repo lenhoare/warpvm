@@ -2,7 +2,8 @@ use crate::ast::{AssignOp, BinaryOp, UnaryOp};
 use crate::sema::{
     type_size, FunctionId, GlobalInfo, Intrinsic, LValue, LocalId, LocalInfo, StructInfo,
     SwitchLabel, Type, TypedBlock, TypedExpr, TypedExprKind, TypedForInit, TypedFunction,
-    TypedInitializer, TypedProgram, TypedStmt, Uniformity, WARP_VIDEO_BASE, WARP_VIDEO_WIDTH,
+    TypedInitializer, TypedProgram, TypedStmt, Uniformity, RAM_SIZE_WORDS, WARP_VIDEO_BASE,
+    WARP_VIDEO_WIDTH,
 };
 use crate::span::{Diagnostic, Span};
 use std::collections::{HashMap, HashSet};
@@ -21,7 +22,7 @@ const ALLOCATABLE_SCALAR_REGS: usize = 7; // s7 is the stack pointer.
 const LANE_REG: u8 = 13;
 const STACK_ADDR_REG: u8 = 14;
 const STACK_POINTER: &str = "s7";
-const STACK_TOP: u32 = 16_384;
+const STACK_TOP: u32 = RAM_SIZE_WORDS as u32;
 const SIGN_BIT: u32 = 0x8000_0000;
 
 pub fn generate(program: &TypedProgram) -> Result<String, Diagnostic> {
@@ -2833,7 +2834,7 @@ mod tests {
             "int add(int, int); int main(void) { int keep = 20; return add(keep, 22); } int add(int a, int b) { if (a == 20) return a + b; return 0; }",
         );
         assert!(text.contains("LANEID r13"));
-        assert!(text.contains("S_MOV_I s7, 16384"));
+        assert!(text.contains("S_MOV_I s7, 65536"));
         assert!(text.contains("S_ADD_I s7, s7, -"));
         assert!(text.contains("STORE r14"));
         assert!(text.contains("CALL __warpc_fn_add"));

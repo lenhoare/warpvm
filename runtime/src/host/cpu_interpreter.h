@@ -36,7 +36,8 @@ struct CpuVm {
   std::vector<uint32_t> memory;
   std::vector<uint32_t> framebuffer;
 
-  void Init(uint32_t id, const WvmFile& file, uint32_t memory_words = 16384);
+  void Init(uint32_t id, const WvmFile& file,
+            uint32_t memory_words = kRamSizeWords);
   void Reset();
   bool Step();  // true iff an instruction retired
   uint64_t RunQuantum(uint64_t budget = kCpuVmQuantum);

@@ -201,7 +201,7 @@ bool ExecProgram(const std::vector<uint32_t>& code,
   wvm::VmImage img;
   img.code = code;
   img.literals = literals;
-  img.mem_size_words = 16384;  // `run` default: 64 KB VM RAM
+  img.mem_size_words = wvm::kRamSizeWords;
   std::vector<wvm::VmState> states;
   std::vector<std::vector<uint32_t>> mem;
   if (!ExecVmArray({img}, states, mem)) return false;
@@ -521,7 +521,7 @@ int RunCompiledSlice1() {
       wvm::enc_r(wvm::kHalt, 0, 0, 0, 0),
   };
   wvm::CpuVm loop_cpu;
-  loop_cpu.Init(0, loop32, 16384);
+  loop_cpu.Init(0, loop32, wvm::kRamSizeWords);
   loop_cpu.RunQuantum();
   const wvm::VmState loop_reference = StateFromCpu(loop_cpu);
   if (!compiled.Compile(loop32, err)) {
@@ -532,10 +532,10 @@ int RunCompiledSlice1() {
   std::vector<wvm::VmState> loop_states(1);
   loop_states[0].status = wvm::kRunning;
   loop_states[0].rng_state = 0x1234567u;
-  std::vector<uint32_t> loop_memory(16384, 0);
+  std::vector<uint32_t> loop_memory(wvm::kRamSizeWords, 0);
   std::vector<uint32_t> no_framebuffer;
   std::vector<uint32_t> no_frame_seq;
-  if (!compiled.Launch(loop_states, loop_memory, 16384, no_framebuffer,
+  if (!compiled.Launch(loop_states, loop_memory, wvm::kRamSizeWords, no_framebuffer,
                        no_frame_seq, err)) {
     std::printf("compiled slice 3: loop32 launch FAIL: %s\n", err.c_str());
     return 1;
@@ -826,7 +826,7 @@ int EmitCompiledPtx(const char* input, const char* output) {
 }
 
 int RunCompiledHaltEquivalence(const char* path) {
-  constexpr uint32_t kMemoryWords = 16384;
+  constexpr uint32_t kMemoryWords = wvm::kRamSizeWords;
   wvm::WvmFile file;
   std::string err;
   if (!wvm::LoadWvm(path, file, err)) {
@@ -901,7 +901,7 @@ int RunCompiledResident(const char* path, uint32_t num_vms,
   for (wvm::VmImage& image : images) {
     image.code = file.code;
     image.literals = file.literals;
-    image.mem_size_words = 16384;
+    image.mem_size_words = wvm::kRamSizeWords;
   }
   wvm::PersistentRuntime runtime;
   wvm::PtxResidentProgram program;
@@ -962,7 +962,7 @@ int RunCompiledResident(const char* path, uint32_t num_vms,
 
 int RunWarpCDataBenchmark(const char* sequential_path,
                           const char* warp_path) {
-  constexpr uint32_t kMemoryWords = 16384;
+  constexpr uint32_t kMemoryWords = wvm::kRamSizeWords;
   constexpr uint64_t kInstructionLimit = 100000000u;
   struct Measurement {
     uint64_t instructions = 0;
@@ -1068,7 +1068,7 @@ int RunWarpCDataBenchmark(const char* sequential_path,
 
 int RunCompiledLife(const char* path) {
   constexpr uint32_t kVms = 2;
-  constexpr uint32_t kMemoryWords = 16384;
+  constexpr uint32_t kMemoryWords = wvm::kRamSizeWords;
   wvm::WvmFile file;
   std::string err;
   if (!wvm::LoadWvm(path, file, err)) {
@@ -1304,7 +1304,7 @@ int RunCompiledLife(const char* path) {
 }
 
 int RunCompiledLifeBenchmark(const char* path) {
-  constexpr uint32_t kMemoryWords = 16384;
+  constexpr uint32_t kMemoryWords = wvm::kRamSizeWords;
   constexpr uint32_t kCells = 128 * 128;
   struct Case { uint32_t vms; uint32_t checkpoints; };
   const Case cases[] = {
@@ -1384,7 +1384,7 @@ struct CompiledProfileResult {
 bool MeasureCompiledVariant(const wvm::WvmFile& file,
                             CompiledProfileResult& measurement,
                             std::string& err) {
-  constexpr uint32_t kMemoryWords = 16384;
+  constexpr uint32_t kMemoryWords = wvm::kRamSizeWords;
   constexpr uint32_t kCheckpoints = 500;
   wvm::PtxCompiledProgram compiled;
   if (!compiled.Compile(file, err)) return false;
@@ -1848,7 +1848,7 @@ bool MeasureResidentEngine(const wvm::WvmFile& file, uint32_t num_vms,
   for (wvm::VmImage& image : images) {
     image.code = file.code;
     image.literals = file.literals;
-    image.mem_size_words = 16384;
+    image.mem_size_words = wvm::kRamSizeWords;
   }
   wvm::PersistentRuntime runtime;
   std::unique_ptr<wvm::PtxResidentProgram> artifact;
@@ -1939,7 +1939,7 @@ int CmdServe(const char* path, uint32_t n_vms, int seconds, bool compiled) {
   for (uint32_t i = 0; i < n_vms; ++i) {
     images[i].code = file.code;
     images[i].literals = file.literals;
-    images[i].mem_size_words = 16384;
+    images[i].mem_size_words = wvm::kRamSizeWords;
   }
 
   wvm::PersistentRuntime rt;
@@ -2015,7 +2015,7 @@ int CmdAttach(const char* path, uint32_t n_vms, bool compiled) {
   for (uint32_t i = 0; i < n_vms; ++i) {
     images[i].code = file.code;
     images[i].literals = file.literals;
-    images[i].mem_size_words = 16384;
+    images[i].mem_size_words = wvm::kRamSizeWords;
   }
   wvm::PersistentRuntime rt;
   std::unique_ptr<wvm::PtxResidentProgram> compiled_artifact;
@@ -2257,7 +2257,7 @@ int RunSlice2() {
         enc_r(wvm::kLoad, 1, 2, 1, 0),         // @p0 LOAD -> lane-local fault
         enc_r(wvm::kHalt, 0, 0, 0, 0),
     };
-    ExecProgram(prog, {20000u}, st);
+    ExecProgram(prog, {wvm::kRamSizeWords}, st);
     ok &= CheckState("guarded_lane_mem_fault", st, wvm::kFaulted,
                      wvm::kFaultMem, 0);
     ok &= st.instruction_counter == 3;
@@ -3213,7 +3213,7 @@ int RunLifeTest(const char* path) {
   for (wvm::VmImage& image : images) {
     image.code = file.code;
     image.literals = file.literals;
-    image.mem_size_words = 16384;
+    image.mem_size_words = wvm::kRamSizeWords;
   }
 
   wvm::PersistentRuntime rt;

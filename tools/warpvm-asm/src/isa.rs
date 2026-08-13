@@ -94,7 +94,8 @@ pub const OP_SEND: u32 = 0x60;
 pub const OP_TRY_RECV: u32 = 0x61;
 // 0x62-0x6F reserved for more messaging.
 
-// Architectural display constants (v0.1.1), predefined in the assembler.
+// Default architectural private-RAM size and display constants.
+pub const RAM_SIZE_WORDS: i64 = 65536;
 pub const VIDEO_BASE: i64 = 0x00100000;
 pub const VIDEO_WIDTH: i64 = 128;
 pub const VIDEO_HEIGHT: i64 = 128;

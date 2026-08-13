@@ -1,0 +1,13 @@
+#include <warp.h>
+
+/* Exercise private RAM beyond the former 16,384-word boundary. */
+unsigned expanded[20000];
+
+int main(void)
+{
+    unsigned address = 19968u + WARP;
+    expanded[address] = WARP * 7u + 3u;
+    if (WARP_RAM_SIZE_WORDS != 65536u)
+        return 0;
+    return warp_all(expanded[address] == WARP * 7u + 3u) ? 42 : 0;
+}
