@@ -20,6 +20,18 @@ constexpr uint32_t kMaxLiterals = 256;
 constexpr uint32_t kMailboxSlots = 16;
 constexpr uint32_t kRamSizeWords = 65536;  // default private RAM: 256 KiB
 
+// Architectural VM addresses are deliberately separate from resident slots.
+// The v0.1 message header carries a 16-bit source address, so one supervisor
+// epoch may allocate from this logical namespace while hosting at most
+// kMaxVms resident slots simultaneously.
+using VmId = uint32_t;
+using VmSlot = uint32_t;
+using ProgramId = uint32_t;
+constexpr uint32_t kVmIdBits = 16;
+constexpr uint32_t kVmIdCount = 1u << kVmIdBits;
+constexpr VmId kInvalidVmId = 0xFFFFFFFFu;
+constexpr VmSlot kInvalidVmSlot = 0xFFFFFFFFu;
+
 // ---- Architectural display (docs/isa.md, v0.1.1) ----------------------
 // Fixed memory-mapped framebuffer, word-addressed. Pixels are ordinary u32
 // values 0xAARRGGBB accessed through LOAD/STORE.

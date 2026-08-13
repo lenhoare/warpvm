@@ -180,7 +180,7 @@ Operands in the `rd`/`rs1`/`rs2` positions address `p0–p3`.
 | 0x47 | `REDUCE_AND`  | R | all lanes: `rd = & rs1[i]` |
 | 0x48 | `REDUCE_OR`   | R | all lanes: `rd = \| rs1[i]` |
 | 0x49 | `REDUCE_XOR`  | R | all lanes: `rd = ^ rs1[i]` |
-| 0x4A | `VMID`        | R | all lanes: `rd = vm_id` |
+| 0x4A | `VMID`        | R | all lanes: `rd = vm_id` (stable logical address, not resident slot) |
 | 0x4B | `CLOCK`       | R | all lanes: `rd =` coarse tick counter (SM-local cycles, approximate) |
 | 0x4C | `RAND`        | R | `rd[i] =` per-lane xorshift-derived value; advances VM rng state |
 
@@ -269,6 +269,13 @@ and slot reuse distinct ordered events.
 
 `SEND rd, rType, rPayload`: destination is `rd[0]`. Faults (`FAULT_MSG`) if
 the destination VM does not exist or its mailbox is full.
+
+VM addresses are stable logical IDs. They are independent of the destination's
+resident GPU slot and are not reused within one supervisor lifetime. The
+runtime resolves a destination ID to its current mailbox slot; consequently a
+message to a retired ID cannot be delivered to a later VM that reuses the same
+resident storage. The low 16-bit `src_vm` field currently bounds the logical
+address namespace to 65,536 IDs per supervisor epoch.
 
 `TRY_RECV pGot, rPayload, rMeta`: non-blocking. If a message is pending,
 `pGot` = all lanes, `rPayload` = `payload[0]`, `rMeta` = header

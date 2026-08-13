@@ -9,8 +9,10 @@ The instruction contract lives in [isa.md](isa.md).
   geometry is a multiple of 32 so no VM ever straddles a hardware warp.
   Blocks of 256 threads (8 VMs) where the VM count allows, single-warp
   blocks otherwise.
-- Logical `vm_id` is the warp's slot index into the descriptor/state arrays.
-  Nothing in the VM's identity or state references SM or block placement.
+- Logical `vm_id` is a stable architectural address and is independent of the
+  resident slot indexing descriptor/state arrays. A device routing directory
+  maps logical IDs to current slots. Nothing in VM identity or state references
+  SM, block, physical-warp, or resident-slot placement.
 - All warps run the **same interpreter code**; each fetches from its own
   program. Within a warp the opcode stream is uniform, so fetch/decode is
   divergence-free. Divergence between warps is free (independent scheduling).
@@ -113,6 +115,15 @@ complete. v0.1: mailbox full ⇒ `FAULT_MSG` (no blocking). `TRY_RECV` is
 non-blocking and returns a
 got-message predicate.
 
+Message destinations and `src_vm` are stable logical VM IDs, not resident
+mailbox-array indices. `SEND` resolves the destination through the supervisor's
+device routing directory and then writes the mailbox belonging to that resident
+slot. `TRY_RECV` consumes the executing slot's own mailbox. A retired or absent
+logical ID has an invalid route and faults with `FAULT_MSG`; recycling its old
+slot cannot redirect stale messages to the replacement VM. The v0.1 header
+therefore defines a 65,536-address logical namespace, independently of the
+currently configured resident capacity.
+
 ## Graphics (v0.1.1)
 
 Each VM owns a 128×128×32-bit framebuffer (16,384 words). Physical storage is
@@ -143,10 +154,12 @@ through a fixed memory-mapped region (`VIDEO_BASE = 0x00100000`) decoded in
 
 ## Scheduling
 
-Logical `vm_id` is stable; physical warp/SM placement is not part of VM
-identity. v0.1 does not migrate VMs, but state layout must not preclude it:
-everything a VM needs (program, RAM, state, mailbox) is reachable by
-pointer from the VM state block.
+Logical `vm_id` is stable; resident slot and physical warp/SM placement are not
+part of VM identity. Resident slots are recyclable implementation resources,
+but a retired logical ID is not reused during a supervisor epoch. v0.1 does not
+yet migrate a running VM, but state layout must not preclude it: everything a
+VM needs (program, RAM, state, mailbox) is reachable through its resident slot
+and supervisor metadata.
 
 The direct PTX engine has the same resident topology. Generated program code
 runs continuously in one warp per VM and receives pointers to the canonical

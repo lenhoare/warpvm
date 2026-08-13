@@ -101,11 +101,13 @@ class PtxCompiledProgram {
   mutable CUdeviceptr scratch_framebuffers_ = 0;
   mutable CUdeviceptr scratch_frame_seq_ = 0;
   mutable CUdeviceptr scratch_mailboxes_ = 0;
+  mutable CUdeviceptr scratch_vm_routes_ = 0;
   mutable size_t scratch_states_bytes_ = 0;
   mutable size_t scratch_memory_bytes_ = 0;
   mutable size_t scratch_framebuffers_bytes_ = 0;
   mutable size_t scratch_frame_seq_bytes_ = 0;
   mutable size_t scratch_mailboxes_bytes_ = 0;
+  mutable size_t scratch_vm_routes_bytes_ = 0;
   std::string ptx_;
   double jit_milliseconds_ = 0.0;
 };

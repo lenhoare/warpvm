@@ -17,6 +17,7 @@
 
 #include "gpu/control.cuh"
 #include "gpu/vm_state.cuh"
+#include "host/vm_identity.h"
 #include "host/vm_image.h"
 
 namespace wvm {
@@ -84,10 +85,41 @@ class PersistentRuntime {
   ~PersistentRuntime() { Free(); }
 
   bool Init(const std::vector<VmImage>& images, std::string& err) {
+    std::vector<LogicalVmId> vm_ids(images.size());
+    for (uint32_t slot = 0; slot < images.size(); ++slot)
+      vm_ids[slot].value = slot;
+    return Init(images, vm_ids, err);
+  }
+
+  // Initialize resident slots with explicit stable architectural identities.
+  // Existing callers use the overload above and retain the historical 0..N-1
+  // identity assignment. The supervisor uses this form when logical identity
+  // and slot placement differ.
+  bool Init(const std::vector<VmImage>& images,
+            const std::vector<LogicalVmId>& vm_ids, std::string& err) {
     num_vms_ = static_cast<uint32_t>(images.size());
     if (num_vms_ == 0 || num_vms_ > kMaxVms) {
       err = "vm count must be 1.." + std::to_string(kMaxVms);
       return false;
+    }
+    if (vm_ids.size() != images.size()) {
+      err = "logical VM ID count must match resident slot count";
+      return false;
+    }
+    h_vm_ids_.resize(num_vms_);
+    h_vm_routes_.assign(kVmIdCount, kInvalidVmSlot);
+    for (VmSlot slot = 0; slot < num_vms_; ++slot) {
+      const VmId id = vm_ids[slot].value;
+      if (id >= kVmIdCount) {
+        err = "logical VM ID must fit the 16-bit message address space";
+        return false;
+      }
+      if (h_vm_routes_[id] != kInvalidVmSlot) {
+        err = "logical VM IDs must be unique";
+        return false;
+      }
+      h_vm_ids_[slot] = id;
+      h_vm_routes_[id] = slot;
     }
     h_images_ = images;  // retained for inspection / disassembly
 
@@ -106,6 +138,17 @@ class PersistentRuntime {
     d_code_.assign(num_vms_, nullptr);
     d_lit_.assign(num_vms_, nullptr);
     d_mem_.assign(num_vms_, nullptr);
+    if (cudaMalloc(reinterpret_cast<void**>(&d_vm_routes_),
+                   kVmIdCount * sizeof(VmSlot)) != cudaSuccess) {
+      err = "cudaMalloc VM route directory failed";
+      return false;
+    }
+    if (cudaMemcpy(d_vm_routes_, h_vm_routes_.data(),
+                   kVmIdCount * sizeof(VmSlot),
+                   cudaMemcpyHostToDevice) != cudaSuccess) {
+      err = "VM route directory upload failed";
+      return false;
+    }
     // One flat framebuffer pool; VM i owns words [i*kVideoWords, (i+1)*...).
     if (cudaMalloc(reinterpret_cast<void**>(&d_framebuffers_),
                    static_cast<size_t>(num_vms_) * kVideoWords *
@@ -147,7 +190,8 @@ class PersistentRuntime {
                         static_cast<uint32_t>(img.literals.size()),
                         d_mem_[i],
                         img.mem_size_words,
-                        d_framebuffers_ + static_cast<size_t>(i) * kVideoWords};
+                        d_framebuffers_ + static_cast<size_t>(i) * kVideoWords,
+                        d_vm_routes_};
     }
 
     if (cudaMalloc(reinterpret_cast<void**>(&d_descs_),
@@ -163,10 +207,11 @@ class PersistentRuntime {
       return false;
     }
     std::vector<VmState> states(num_vms_);
-    for (uint32_t vm = 0; vm < num_vms_; ++vm) {
-      states[vm].vm_id = vm;
-      states[vm].status = kIdle;
-      states[vm].rng_state = vm * 0x9E3779B9u + 0x1234567u;
+    for (VmSlot slot = 0; slot < num_vms_; ++slot) {
+      states[slot].vm_id = h_vm_ids_[slot];
+      states[slot].status = kIdle;
+      states[slot].rng_state =
+          h_vm_ids_[slot] * 0x9E3779B9u + 0x1234567u;
     }
     if (cudaMemcpy(d_states_, states.data(), num_vms_ * sizeof(VmState),
                    cudaMemcpyHostToDevice) != cudaSuccess) {
@@ -291,6 +336,7 @@ class PersistentRuntime {
   void* DeviceStates() const { return d_states_; }
   void* DeviceControl() const { return d_ctrl_; }
   void* DeviceMailboxes() const { return d_mailboxes_; }
+  void* DeviceVmRoutes() const { return d_vm_routes_; }
   cudaStream_t Stream() const { return stream_; }
 
   // ---- host commands -----------------------------------------------------
@@ -381,6 +427,12 @@ class PersistentRuntime {
 
   // ---- status reads (mapped memory, no sync needed) -----------------------
   uint32_t num_vms() const { return num_vms_; }
+  VmId VmIdAtSlot(VmSlot slot) const {
+    return slot < h_vm_ids_.size() ? h_vm_ids_[slot] : kInvalidVmId;
+  }
+  VmSlot SlotForVmId(VmId id) const {
+    return id < h_vm_routes_.size() ? h_vm_routes_[id] : kInvalidVmSlot;
+  }
   uint32_t Status(uint32_t vm) const { return h_ctrl_->status[vm]; }
   uint32_t Fault(uint32_t vm) const { return h_ctrl_->fault[vm]; }
   uint32_t Pc(uint32_t vm) const { return h_ctrl_->pc[vm]; }
@@ -416,6 +468,7 @@ class PersistentRuntime {
     if (d_descs_) cudaFree(d_descs_), d_descs_ = nullptr;
     if (d_states_) cudaFree(d_states_), d_states_ = nullptr;
     if (d_mailboxes_) cudaFree(d_mailboxes_), d_mailboxes_ = nullptr;
+    if (d_vm_routes_) cudaFree(d_vm_routes_), d_vm_routes_ = nullptr;
     if (d_framebuffers_) cudaFree(d_framebuffers_), d_framebuffers_ = nullptr;
     for (auto p : d_code_) cudaFree(p);
     for (auto p : d_lit_) cudaFree(p);
@@ -423,6 +476,8 @@ class PersistentRuntime {
     d_code_.clear();
     d_lit_.clear();
     d_mem_.clear();
+    h_vm_ids_.clear();
+    h_vm_routes_.clear();
     if (h_ctrl_) cudaFreeHost(h_ctrl_), h_ctrl_ = nullptr;
     d_ctrl_ = nullptr;
     if (stream_) cudaStreamDestroy(stream_), stream_ = nullptr;
@@ -434,9 +489,12 @@ class PersistentRuntime {
   VmDesc* d_descs_ = nullptr;
   VmState* d_states_ = nullptr;
   Mailbox* d_mailboxes_ = nullptr;
+  VmSlot* d_vm_routes_ = nullptr;
   uint32_t* d_framebuffers_ = nullptr;  // flat pool: num_vms_ * kVideoWords
   std::vector<uint32_t*> d_code_, d_lit_, d_mem_;
   std::vector<VmImage> h_images_;
+  std::vector<VmId> h_vm_ids_;
+  std::vector<VmSlot> h_vm_routes_;
   cudaStream_t stream_ = nullptr;
   uint32_t num_vms_ = 0;
   bool launched_ = false;

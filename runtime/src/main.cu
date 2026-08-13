@@ -633,6 +633,137 @@ int RunCompiledSlice1() {
               messaging_ok ? "PASS" : "FAIL");
   ok &= messaging_ok;
 
+  // Architectural IDs need not equal resident slots. Exercise the same
+  // logical route in both one-shot native execution and the resident native
+  // engine; control/status remains slot-indexed in the resident kernel.
+  wvm::WvmFile logical_messaging;
+  logical_messaging.code = {
+      wvm::enc_r(wvm::kVmid, 0, 0, 0, 0),
+      wvm::enc_i(wvm::kCmpEqI, 0, 0, 0, 37),
+      wvm::enc_i(wvm::kJmpIfAny, 1, 0, 0, 6),
+      wvm::enc_i(wvm::kCmpEqI, 0, 1, 0, 91),
+      wvm::enc_i(wvm::kJmpIfAny, 2, 0, 0, 11),
+      wvm::enc_r(wvm::kHalt, 0, 0, 0, 0),
+      wvm::enc_i(wvm::kMovI, 0, 1, 0, 91),
+      wvm::enc_i(wvm::kMovI, 0, 2, 0, 7),
+      wvm::enc_i(wvm::kMovI, 0, 3, 0, 2345),
+      wvm::enc_r(wvm::kSend, 0, 1, 2, 3),
+      wvm::enc_r(wvm::kHalt, 0, 0, 0, 0),
+      wvm::enc_r(wvm::kTryRecv, 0, 2, 4, 5),
+      wvm::enc_r(wvm::kNotMask, 0, 3, 2, 0),
+      wvm::enc_i(wvm::kJmpIfAny, 4, 0, 0, 11),
+      wvm::enc_i(wvm::kMovI, 0, 6, 0, 0),
+      wvm::enc_r(wvm::kStore, 0, 6, 4, 0),
+      wvm::enc_i(wvm::kMovI, 0, 6, 0, 1),
+      wvm::enc_r(wvm::kStore, 0, 6, 5, 0),
+      wvm::enc_r(wvm::kFlip, 0, 0, 0, 0),
+      wvm::enc_r(wvm::kHalt, 0, 0, 0, 0),
+  };
+  if (!compiled.Compile(logical_messaging, err)) {
+    std::printf("compiled logical messaging: compile FAIL: %s\n",
+                err.c_str());
+    return 1;
+  }
+  std::vector<wvm::VmState> logical_states(2);
+  logical_states[0].vm_id = 37;
+  logical_states[1].vm_id = 91;
+  for (wvm::VmState& state : logical_states) {
+    state.status = wvm::kRunning;
+    state.rng_state = state.vm_id * 0x9E3779B9u + 0x1234567u;
+  }
+  std::vector<uint32_t> logical_memory(32, 0);
+  if (!compiled.Launch(logical_states, logical_memory, 16, no_framebuffer,
+                       no_frame_seq, err)) {
+    std::printf("compiled logical messaging: launch FAIL: %s\n",
+                err.c_str());
+    return 1;
+  }
+  const bool logical_compiled_ok =
+      logical_states[0].status == wvm::kHalted &&
+      logical_states[1].status == wvm::kHalted &&
+      logical_states[0].vm_id == 37 && logical_states[1].vm_id == 91 &&
+      logical_memory[16] == 2345 &&
+      logical_memory[17] == ((7u << 16) | 37u);
+  std::printf("compiled messaging: logical IDs one-shot %s\n",
+              logical_compiled_ok ? "PASS" : "FAIL");
+  ok &= logical_compiled_ok;
+
+  std::vector<wvm::VmImage> logical_images(2);
+  for (wvm::VmImage& image : logical_images) {
+    image.code = logical_messaging.code;
+    image.mem_size_words = 16;
+  }
+  const std::vector<wvm::LogicalVmId> logical_ids = {{37}, {91}};
+  wvm::PersistentRuntime logical_runtime;
+  wvm::PtxResidentProgram logical_resident;
+  const bool resident_started =
+      logical_runtime.Init(logical_images, logical_ids, err) &&
+      logical_runtime.EnsureStream(err) &&
+      logical_resident.Compile(logical_messaging, err) &&
+      logical_resident.Launch(
+          reinterpret_cast<CUdeviceptr>(logical_runtime.DeviceStates()), 2,
+          reinterpret_cast<CUdeviceptr>(logical_runtime.DeviceDescs()),
+          reinterpret_cast<CUdeviceptr>(logical_runtime.DeviceControl()),
+          reinterpret_cast<CUdeviceptr>(logical_runtime.DeviceMailboxes()),
+          reinterpret_cast<CUstream>(logical_runtime.Stream()), err);
+  if (!resident_started) {
+    std::printf("compiled logical resident: setup FAIL: %s\n", err.c_str());
+    return 1;
+  }
+  logical_runtime.BootAll();
+  logical_runtime.WaitStatus(0, wvm::kHalted, 2000);
+  logical_runtime.WaitStatus(1, wvm::kHalted, 2000);
+  std::vector<uint32_t> resident_logical_memory;
+  const bool logical_resident_ok =
+      logical_runtime.Status(0) == wvm::kHalted &&
+      logical_runtime.Status(1) == wvm::kHalted &&
+      logical_runtime.ReadMem(1, 0, 2, resident_logical_memory) &&
+      resident_logical_memory.size() == 2 &&
+      resident_logical_memory[0] == 2345 &&
+      resident_logical_memory[1] == ((7u << 16) | 37u) &&
+      logical_runtime.FrameSeq(1) == 1;
+  std::printf("compiled messaging: logical IDs resident %s\n",
+              logical_resident_ok ? "PASS" : "FAIL");
+  ok &= logical_resident_ok;
+  logical_runtime.ShutdownAll();
+  ok &= logical_runtime.Sync() == cudaSuccess;
+
+  // A retired logical address must not alias a replacement occupying slot 1.
+  wvm::WvmFile stale_logical_destination;
+  stale_logical_destination.code = {
+      wvm::enc_r(wvm::kVmid, 0, 0, 0, 0),
+      wvm::enc_i(wvm::kCmpEqI, 0, 0, 0, 37),
+      wvm::enc_i(wvm::kJmpIfAny, 1, 0, 0, 4),
+      wvm::enc_r(wvm::kHalt, 0, 0, 0, 0),
+      wvm::enc_i(wvm::kMovI, 0, 1, 0, 1),
+      wvm::enc_i(wvm::kMovI, 0, 2, 0, 9),
+      wvm::enc_i(wvm::kMovI, 0, 3, 0, 999),
+      wvm::enc_r(wvm::kSend, 0, 1, 2, 3),
+      wvm::enc_r(wvm::kHalt, 0, 0, 0, 0),
+  };
+  if (!compiled.Compile(stale_logical_destination, err)) {
+    std::printf("compiled retired route: compile FAIL: %s\n", err.c_str());
+    return 1;
+  }
+  std::vector<wvm::VmState> stale_states(2);
+  stale_states[0].vm_id = 37;
+  stale_states[1].vm_id = 91;
+  for (wvm::VmState& state : stale_states)
+    state.status = wvm::kRunning;
+  std::vector<uint32_t> stale_memory(32, 0);
+  if (!compiled.Launch(stale_states, stale_memory, 16, no_framebuffer,
+                       no_frame_seq, err)) {
+    std::printf("compiled retired route: launch FAIL: %s\n", err.c_str());
+    return 1;
+  }
+  const bool stale_compiled_ok =
+      stale_states[0].status == wvm::kFaulted &&
+      stale_states[0].fault_code == wvm::kFaultMsg &&
+      stale_states[1].status == wvm::kHalted;
+  std::printf("compiled messaging: retired route rejected %s\n",
+              stale_compiled_ok ? "PASS" : "FAIL");
+  ok &= stale_compiled_ok;
+
   // A false guard suppresses the receive side effect; the following
   // unguarded receive must still consume the self-sent message.
   wvm::WvmFile guarded_receive;
@@ -2517,12 +2648,13 @@ int RunSlice4() {
 }
 
 void PrintVmTable(const wvm::PersistentRuntime& rt) {
-  std::printf("  %-4s %-9s %-8s %-6s %s\n", "vm", "status", "fault", "pc",
-              "instrs");
-  for (uint32_t i = 0; i < rt.num_vms(); ++i) {
-    std::printf("  %-4u %-9s %-8s %-6u %llu\n", i,
-                wvm::StatusName(rt.Status(i)), wvm::FaultName(rt.Fault(i)),
-                rt.Pc(i), (unsigned long long)rt.Instrs(i));
+  std::printf("  %-6s %-4s %-9s %-8s %-6s %s\n", "vm_id", "slot",
+              "status", "fault", "pc", "instrs");
+  for (wvm::VmSlot slot = 0; slot < rt.num_vms(); ++slot) {
+    std::printf("  %-6u %-4u %-9s %-8s %-6u %llu\n",
+                rt.VmIdAtSlot(slot), slot, wvm::StatusName(rt.Status(slot)),
+                wvm::FaultName(rt.Fault(slot)), rt.Pc(slot),
+                (unsigned long long)rt.Instrs(slot));
   }
 }
 
@@ -2631,6 +2763,31 @@ int RunSlice7() {
   using wvm::enc_r;
   bool ok = true;
 
+  // Logical identities survive slot reuse: retiring VM 0 frees its resident
+  // slot, but the replacement receives a fresh address and the old route
+  // remains invalid.
+  {
+    wvm::VmDirectory directory(2);
+    wvm::LogicalVmId first, peer, replacement;
+    std::string directory_err;
+    const bool created =
+        directory.Create(wvm::ResidentSlotId{0}, first, directory_err) &&
+        directory.Create(wvm::ResidentSlotId{1}, peer, directory_err);
+    const wvm::VmId retired_id = first.value;
+    const bool recycled =
+        created && directory.Retire(first, directory_err) &&
+        directory.Create(wvm::ResidentSlotId{0}, replacement, directory_err);
+    const bool identity_ok =
+        recycled && replacement.value != retired_id &&
+        directory.SlotFor(wvm::LogicalVmId{retired_id}) ==
+            wvm::kInvalidVmSlot &&
+        directory.SlotFor(replacement) == 0 &&
+        directory.IdFor(wvm::ResidentSlotId{1}) == peer.value;
+    std::printf("  %-22s %s\n", "stable_identity_directory",
+                identity_ok ? "PASS" : "FAIL");
+    ok &= identity_ok;
+  }
+
   // VM 0 sends payload 1234 to VM 1; VM 1 receives it and stores mem[0].
   // All other VMs halt immediately.
   const std::vector<uint32_t> prog = {
@@ -2735,6 +2892,103 @@ int RunSlice7() {
   ok &= guarded_ok;
   guarded_rt.ShutdownAll();
   ok &= guarded_rt.Sync() == cudaSuccess;
+
+  // Logical addresses are not resident slots. Slot 0 (VM 37) sends to VM 91,
+  // which currently occupies slot 1; the receiver observes logical sender 37.
+  const std::vector<uint32_t> logical_prog = {
+      enc_r(wvm::kVmid, 0, 0, 0, 0),
+      enc_i(wvm::kCmpEqI, 0, 0, 0, 37),
+      enc_i(wvm::kJmpIfAny, 1, 0, 0, 6),
+      enc_i(wvm::kCmpEqI, 0, 1, 0, 91),
+      enc_i(wvm::kJmpIfAny, 2, 0, 0, 11),
+      enc_r(wvm::kHalt, 0, 0, 0, 0),
+      enc_i(wvm::kMovI, 0, 1, 0, 91),
+      enc_i(wvm::kMovI, 0, 2, 0, 7),
+      enc_i(wvm::kMovI, 0, 3, 0, 2345),
+      enc_r(wvm::kSend, 0, 1, 2, 3),
+      enc_r(wvm::kHalt, 0, 0, 0, 0),
+      enc_r(wvm::kTryRecv, 0, 2, 4, 5),
+      enc_r(wvm::kNotMask, 0, 3, 2, 0),
+      enc_i(wvm::kJmpIfAny, 4, 0, 0, 11),
+      enc_i(wvm::kMovI, 0, 6, 0, 0),
+      enc_r(wvm::kStore, 0, 6, 4, 0),
+      enc_i(wvm::kMovI, 0, 6, 0, 1),
+      enc_r(wvm::kStore, 0, 6, 5, 0),
+      enc_r(wvm::kFlip, 0, 0, 0, 0),
+      enc_r(wvm::kHalt, 0, 0, 0, 0),
+  };
+  std::vector<wvm::VmImage> logical_images(2);
+  for (wvm::VmImage& image : logical_images) {
+    image.code = logical_prog;
+    image.mem_size_words = 16;
+  }
+  const std::vector<wvm::LogicalVmId> logical_ids = {{37}, {91}};
+  wvm::PersistentRuntime logical_rt;
+  if (!logical_rt.Init(logical_images, logical_ids, err) ||
+      !logical_rt.Launch(err)) {
+    std::printf("  %-22s FAIL (%s)\n", "logical_message_route",
+                err.c_str());
+    return 1;
+  }
+  logical_rt.BootAll();
+  logical_rt.WaitStatus(0, wvm::kHalted, 2000);
+  logical_rt.WaitStatus(1, wvm::kHalted, 2000);
+  std::vector<uint32_t> logical_mem;
+  wvm::VmState logical_sender{}, logical_receiver{};
+  const bool logical_ok =
+      logical_rt.Status(0) == wvm::kHalted &&
+      logical_rt.Status(1) == wvm::kHalted &&
+      logical_rt.ReadMem(1, 0, 2, logical_mem) &&
+      logical_mem.size() == 2 && logical_mem[0] == 2345 &&
+      logical_mem[1] == ((7u << 16) | 37u) &&
+      logical_rt.FrameSeq(1) == 1 &&
+      logical_rt.ReadState(0, logical_sender) &&
+      logical_rt.ReadState(1, logical_receiver) &&
+      logical_sender.vm_id == 37 && logical_receiver.vm_id == 91 &&
+      logical_rt.SlotForVmId(37) == 0 &&
+      logical_rt.SlotForVmId(91) == 1;
+  std::printf("  %-22s %s\n", "logical_message_route",
+              logical_ok ? "PASS" : "FAIL");
+  ok &= logical_ok;
+  logical_rt.ShutdownAll();
+  ok &= logical_rt.Sync() == cudaSuccess;
+
+  // Address 1 represents a retired VM while its former slot is occupied by
+  // logical VM 91. A stale send must fault rather than reach slot 1.
+  const std::vector<uint32_t> stale_prog = {
+      enc_r(wvm::kVmid, 0, 0, 0, 0),
+      enc_i(wvm::kCmpEqI, 0, 0, 0, 37),
+      enc_i(wvm::kJmpIfAny, 1, 0, 0, 4),
+      enc_r(wvm::kHalt, 0, 0, 0, 0),
+      enc_i(wvm::kMovI, 0, 1, 0, 1),
+      enc_i(wvm::kMovI, 0, 2, 0, 9),
+      enc_i(wvm::kMovI, 0, 3, 0, 999),
+      enc_r(wvm::kSend, 0, 1, 2, 3),
+      enc_r(wvm::kHalt, 0, 0, 0, 0),
+  };
+  std::vector<wvm::VmImage> stale_images(2);
+  for (wvm::VmImage& image : stale_images) {
+    image.code = stale_prog;
+    image.mem_size_words = 16;
+  }
+  wvm::PersistentRuntime stale_rt;
+  if (!stale_rt.Init(stale_images, logical_ids, err) ||
+      !stale_rt.Launch(err)) {
+    std::printf("  %-22s FAIL (%s)\n", "retired_route_rejected",
+                err.c_str());
+    return 1;
+  }
+  stale_rt.BootAll();
+  stale_rt.WaitStatus(0, wvm::kFaulted, 2000);
+  stale_rt.WaitStatus(1, wvm::kHalted, 2000);
+  const bool stale_ok = stale_rt.Status(0) == wvm::kFaulted &&
+                        stale_rt.Fault(0) == wvm::kFaultMsg &&
+                        stale_rt.Status(1) == wvm::kHalted;
+  std::printf("  %-22s %s\n", "retired_route_rejected",
+              stale_ok ? "PASS" : "FAIL");
+  ok &= stale_ok;
+  stale_rt.ShutdownAll();
+  ok &= stale_rt.Sync() == cudaSuccess;
 
   std::printf(ok ? "slice7: PASS\n" : "slice7: FAIL\n");
   return ok ? 0 : 1;

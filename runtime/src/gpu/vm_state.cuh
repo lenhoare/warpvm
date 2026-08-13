@@ -10,7 +10,7 @@
 namespace wvm {
 
 struct VmState {
-  uint32_t vm_id;
+  uint32_t vm_id;  // stable logical identity, independent of resident slot
   uint32_t status;
   uint32_t pc;
   uint32_t fault_code;
@@ -24,8 +24,8 @@ struct VmState {
 };
 
 // Per-VM execution descriptor: everything a warp needs to run one machine.
-// Keyed by logical VM ID (slot index into the descriptor/state arrays);
-// physical warp/SM placement never appears here.
+// Descriptor/state/control pools are keyed by resident slot. Logical identity
+// and physical warp/SM placement never determine those array positions.
 struct VmDesc {
   const uint32_t* code;
   uint32_t code_len;
@@ -34,6 +34,9 @@ struct VmDesc {
   uint32_t* mem;  // private RAM, word-addressed
   uint32_t mem_size_words;
   uint32_t* fb;   // framebuffer (kVideoWords words), nullptr if absent
+  // Logical VM address -> resident slot. Program-visible addressing uses
+  // this directory; RAM/framebuffer/control/mailbox arrays remain slot based.
+  const VmSlot* vm_routes = nullptr;
 };
 
 inline const char* StatusName(uint32_t s) {

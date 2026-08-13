@@ -38,7 +38,7 @@ enum StopReason : uint32_t {
 };
 
 struct LogEntry {
-  uint32_t vm_id;
+  uint32_t vm_id;  // stable logical ID
   uint32_t tag;
   uint32_t value;
 };
@@ -46,7 +46,9 @@ struct LogEntry {
 struct Control {
   // ---- host → GPU ----
   volatile uint32_t shutdown;        // all warps exit
-  volatile uint32_t cmd[kMaxVms];    // per-VM command word
+  // Runtime control arrays are resident-slot indexed. Log records and
+  // architectural messages carry logical VM IDs instead.
+  volatile uint32_t cmd[kMaxVms];    // per-slot command word
 
   // ---- GPU → host ----
   volatile uint32_t status[kMaxVms]; // live Status values

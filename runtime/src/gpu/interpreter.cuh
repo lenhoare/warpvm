@@ -25,11 +25,13 @@ struct VmCtx {
   uint32_t* mem;
   uint32_t mem_size_words;
   uint32_t* fb;   // framebuffer base (kVideoWords words), nullptr if absent
-  uint32_t vm_id;
+  VmId vm_id;       // stable architectural identity returned by VMID
+  VmSlot slot_id;   // resident array index; never visible to the program
   uint32_t lane;
 
-  Mailbox* mailboxes;   // global mailbox array (nullptr if messaging absent)
-  uint32_t num_vms;     // for validating SEND destinations
+  Mailbox* mailboxes;        // resident-slot-indexed inbound mailboxes
+  const VmSlot* vm_routes;   // logical VM address -> resident slot
+  uint32_t num_slots;        // resident slot count for route validation
 
   uint32_t pc;
   uint32_t vregs[kVectorRegs];  // this lane's slice of each vector register
@@ -633,14 +635,14 @@ __device__ StopReason VmRun(VmCtx& ctx, Control* ctrl = nullptr,
           if constexpr (kProfileFrameCycles) {
             const uint64_t now = clock64();
             const uint64_t previous =
-                ReadOnce64(&ctrl->profile_frame_clock[ctx.vm_id]);
+                ReadOnce64(&ctrl->profile_frame_clock[ctx.slot_id]);
             if (previous != 0)
-              WriteOnce64(&ctrl->profile_frame_cycles[ctx.vm_id],
+              WriteOnce64(&ctrl->profile_frame_cycles[ctx.slot_id],
                           now - previous);
-            WriteOnce64(&ctrl->profile_frame_clock[ctx.vm_id], now);
+            WriteOnce64(&ctrl->profile_frame_clock[ctx.slot_id], now);
           }
-          WriteOnce(&ctrl->frame_seq[ctx.vm_id],
-                    ReadOnce(&ctrl->frame_seq[ctx.vm_id]) + 1u);
+          WriteOnce(&ctrl->frame_seq[ctx.slot_id],
+                    ReadOnce(&ctrl->frame_seq[ctx.slot_id]) + 1u);
         }
         break;
 
@@ -652,17 +654,22 @@ __device__ StopReason VmRun(VmCtx& ctx, Control* ctrl = nullptr,
           if (ctx.mailboxes == nullptr) {
             err = 1;
           } else {
-            const uint32_t dest = vregs.Get(rd);
-            if (dest >= ctx.num_vms) {
+            const VmId dest = vregs.Get(rd);
+            if (dest >= kVmIdCount || ctx.vm_routes == nullptr) {
               err = 1;
             } else {
-              Message m;
-              m.header = (ctx.vm_id & 0xFFFFu) |
-                         ((vregs.Get(rs1) & 0xFFFFu) << 16);
-              m.payload[0] = vregs.Get(rs2);
-              m.payload[1] = 0;
-              m.payload[2] = 0;
-              if (!MailboxTrySend(ctx.mailboxes[dest], m)) err = 1;
+              const VmSlot dest_slot = ctx.vm_routes[dest];
+              if (dest_slot >= ctx.num_slots) {
+                err = 1;
+              } else {
+                Message m;
+                m.header = (ctx.vm_id & 0xFFFFu) |
+                           ((vregs.Get(rs1) & 0xFFFFu) << 16);
+                m.payload[0] = vregs.Get(rs2);
+                m.payload[1] = 0;
+                m.payload[2] = 0;
+                if (!MailboxTrySend(ctx.mailboxes[dest_slot], m)) err = 1;
+              }
             }
           }
         }
@@ -681,7 +688,7 @@ __device__ StopReason VmRun(VmCtx& ctx, Control* ctrl = nullptr,
         uint32_t got = 0, payload = 0, meta = 0;
         if (active && ctx.lane == 0 && ctx.mailboxes != nullptr) {
           Message m;
-          if (MailboxTryReceive(ctx.mailboxes[ctx.vm_id], m)) {
+          if (MailboxTryReceive(ctx.mailboxes[ctx.slot_id], m)) {
             got = 1;
             payload = m.payload[0];
             meta = m.header;

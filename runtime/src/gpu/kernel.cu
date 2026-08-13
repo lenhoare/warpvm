@@ -30,9 +30,9 @@ __device__ static void SpillState(const VmCtx& ctx, VmState* state) {
 }
 
 // Reset a VM context to its power-on state for the given descriptor.
-__device__ static void InitVmCtx(VmCtx& ctx, const VmDesc& d, uint32_t vm_id,
-                                 uint32_t lane, Mailbox* mailboxes,
-                                 uint32_t num_vms) {
+__device__ static void InitVmCtx(VmCtx& ctx, const VmDesc& d, VmId vm_id,
+                                 VmSlot slot_id, uint32_t lane,
+                                 Mailbox* mailboxes, uint32_t num_slots) {
   ctx = VmCtx{};
   ctx.code = d.code;
   ctx.code_len = d.code_len;
@@ -42,9 +42,11 @@ __device__ static void InitVmCtx(VmCtx& ctx, const VmDesc& d, uint32_t vm_id,
   ctx.mem_size_words = d.mem_size_words;
   ctx.fb = d.fb;
   ctx.vm_id = vm_id;
+  ctx.slot_id = slot_id;
   ctx.lane = lane;
   ctx.mailboxes = mailboxes;
-  ctx.num_vms = num_vms;
+  ctx.vm_routes = d.vm_routes;
+  ctx.num_slots = num_slots;
   // Deterministic per-VM rng seed; a later slice may let the host set it.
   ctx.rng_state = vm_id * 0x9E3779B9u + 0x1234567u;
   // Reset clears only this VM's framebuffer to opaque black. All 32 lanes
@@ -57,13 +59,13 @@ __device__ static void InitVmCtx(VmCtx& ctx, const VmDesc& d, uint32_t vm_id,
 
 __global__ void VmArrayKernel(const VmDesc* descs, VmState* states) {
   const uint32_t global = blockIdx.x * blockDim.x + threadIdx.x;
-  const uint32_t vm_id = global >> 5;
-  const VmDesc d = descs[vm_id];
+  const VmSlot slot_id = global >> 5;
+  const VmDesc d = descs[slot_id];
 
   VmCtx ctx{};
-  InitVmCtx(ctx, d, vm_id, global & (kLanes - 1), nullptr, 0);
+  InitVmCtx(ctx, d, slot_id, slot_id, global & (kLanes - 1), nullptr, 0);
   VmRun(ctx);
-  SpillState(ctx, &states[vm_id]);
+  SpillState(ctx, &states[slot_id]);
 }
 
 // ---------------------------------------------------------------------------
@@ -80,38 +82,38 @@ template <bool kResolveFaultVotes, bool kPollBackwardControl,
           int kHotOpcodeCount = 0,
           bool kProfileFrameCycles = false>
 __device__ static bool RunVmUntilStop(VmCtx& ctx, const VmDesc& d,
-                                      Control* ctrl, uint32_t vm_id,
+                                      Control* ctrl, VmSlot slot_id,
                                       uint32_t lane, VmState* state,
-                                      Mailbox* mailboxes, uint32_t num_vms,
+                                      Mailbox* mailboxes, uint32_t num_slots,
                                       uint32_t* shared_vregs = nullptr) {
   for (;;) {
-    PublishStatus(ctrl, vm_id, lane, kRunning, ctx.fault, ctx.pc,
+    PublishStatus(ctrl, slot_id, lane, kRunning, ctx.fault, ctx.pc,
                   ctx.instr_count);
     const StopReason reason =
         VmRun<kResolveFaultVotes, kPollBackwardControl, kScalarizedVectorRegs,
               kAlternativeDispatch, kSharedVectorRegs,
-              kHotOpcodeCount, kProfileFrameCycles>(ctx, ctrl, vm_id,
+              kHotOpcodeCount, kProfileFrameCycles>(ctx, ctrl, slot_id,
                                                     shared_vregs);
     SpillState(ctx, state);
 
     if (reason == kStopShutdown) return false;
     if (reason == kStopHalted) {
-      PublishStatus(ctrl, vm_id, lane, kHalted, ctx.fault, ctx.pc,
+      PublishStatus(ctrl, slot_id, lane, kHalted, ctx.fault, ctx.pc,
                     ctx.instr_count);
       return true;
     }
     if (reason == kStopFaulted) {
-      PublishStatus(ctrl, vm_id, lane, kFaulted, ctx.fault, ctx.pc,
+      PublishStatus(ctrl, slot_id, lane, kFaulted, ctx.fault, ctx.pc,
                     ctx.instr_count);
       return true;
     }
 
     // reason == kStopPaused: hold at the control point until the host acts.
-    PublishStatus(ctrl, vm_id, lane, kPaused, ctx.fault, ctx.pc,
+    PublishStatus(ctrl, slot_id, lane, kPaused, ctx.fault, ctx.pc,
                   ctx.instr_count);
     for (;;) {
       if (ReadOnce(&ctrl->shutdown)) return false;
-      const uint32_t next = ConsumeCmd(ctrl, vm_id, lane);
+      const uint32_t next = ConsumeCmd(ctrl, slot_id, lane);
       if (next == kCmdRun) break;  // resume: outer loop re-runs VmRun
       if (next == kCmdStep) {
         // Retire exactly one instruction, then re-pause. Bump seq so the host
@@ -121,33 +123,36 @@ __device__ static bool RunVmUntilStop(VmCtx& ctx, const VmDesc& d,
             VmRun<kResolveFaultVotes, kPollBackwardControl,
                   kScalarizedVectorRegs, kAlternativeDispatch,
                   kSharedVectorRegs, kHotOpcodeCount, kProfileFrameCycles>(
-                ctx, ctrl, vm_id, shared_vregs);
+                ctx, ctrl, slot_id, shared_vregs);
         ctx.step = false;
         SpillState(ctx, state);
         if (r == kStopShutdown) return false;
         if (r == kStopHalted) {
-          PublishStatus(ctrl, vm_id, lane, kHalted, ctx.fault, ctx.pc,
+          PublishStatus(ctrl, slot_id, lane, kHalted, ctx.fault, ctx.pc,
                         ctx.instr_count);
           if (lane == 0)
-            WriteOnce(&ctrl->seq[vm_id], ReadOnce(&ctrl->seq[vm_id]) + 1u);
+            WriteOnce(&ctrl->seq[slot_id],
+                      ReadOnce(&ctrl->seq[slot_id]) + 1u);
           return true;
         }
         if (r == kStopFaulted) {
-          PublishStatus(ctrl, vm_id, lane, kFaulted, ctx.fault, ctx.pc,
+          PublishStatus(ctrl, slot_id, lane, kFaulted, ctx.fault, ctx.pc,
                         ctx.instr_count);
           if (lane == 0)
-            WriteOnce(&ctrl->seq[vm_id], ReadOnce(&ctrl->seq[vm_id]) + 1u);
+            WriteOnce(&ctrl->seq[slot_id],
+                      ReadOnce(&ctrl->seq[slot_id]) + 1u);
           return true;
         }
-        PublishStatus(ctrl, vm_id, lane, kPaused, ctx.fault, ctx.pc,
+        PublishStatus(ctrl, slot_id, lane, kPaused, ctx.fault, ctx.pc,
                       ctx.instr_count);
         if (lane == 0)
-          WriteOnce(&ctrl->seq[vm_id], ReadOnce(&ctrl->seq[vm_id]) + 1u);
+          WriteOnce(&ctrl->seq[slot_id],
+                    ReadOnce(&ctrl->seq[slot_id]) + 1u);
         continue;  // still paused: wait for the next command
       }
       if (next == kCmdReset) {
-        InitVmCtx(ctx, d, vm_id, lane, mailboxes, num_vms);
-        PublishStatus(ctrl, vm_id, lane, kIdle, 0, 0, 0);
+        InitVmCtx(ctx, d, ctx.vm_id, slot_id, lane, mailboxes, num_slots);
+        PublishStatus(ctrl, slot_id, lane, kIdle, 0, 0, 0);
         return true;
       }
       if (next == kCmdExit) return false;
@@ -168,36 +173,38 @@ __device__ void PersistentKernelBody(const VmDesc* descs, VmState* states,
                                      Mailbox* mailboxes,
                                      uint32_t* block_shared_vregs = nullptr) {
   const uint32_t global = blockIdx.x * blockDim.x + threadIdx.x;
-  const uint32_t vm_id = global >> 5;
+  const VmSlot slot_id = global >> 5;
   const uint32_t lane = global & (kLanes - 1);
-  if (vm_id >= num_vms) return;
+  if (slot_id >= num_vms) return;
   uint32_t* shared_vregs =
       kSharedVectorRegs
           ? block_shared_vregs + threadIdx.x
           : nullptr;
 
-  const VmDesc d = descs[vm_id];
+  const VmDesc d = descs[slot_id];
+  const VmId vm_id = states[slot_id].vm_id;
   VmCtx ctx{};
-  InitVmCtx(ctx, d, vm_id, lane, mailboxes, num_vms);
-  PublishStatus(ctrl, vm_id, lane, kIdle, 0, 0, 0);
+  InitVmCtx(ctx, d, vm_id, slot_id, lane, mailboxes, num_vms);
+  PublishStatus(ctrl, slot_id, lane, kIdle, 0, 0, 0);
 
   bool alive = true;
   while (alive) {
     if (ReadOnce(&ctrl->shutdown)) break;
-    const uint32_t cmd = ConsumeCmd(ctrl, vm_id, lane);
+    const uint32_t cmd = ConsumeCmd(ctrl, slot_id, lane);
     switch (cmd) {
       case kCmdRun:
-        InitVmCtx(ctx, d, vm_id, lane, mailboxes, num_vms);  // RUN = reset+run
+        InitVmCtx(ctx, d, vm_id, slot_id, lane, mailboxes,
+                  num_vms);  // RUN = reset+run
         alive = RunVmUntilStop<kResolveFaultVotes, kPollBackwardControl,
                                kScalarizedVectorRegs, kAlternativeDispatch,
                                kSharedVectorRegs, kHotOpcodeCount,
                                kProfileFrameCycles>(
-            ctx, d, ctrl, vm_id, lane, &states[vm_id], mailboxes, num_vms,
+            ctx, d, ctrl, slot_id, lane, &states[slot_id], mailboxes, num_vms,
             shared_vregs);
         break;
       case kCmdReset:
-        InitVmCtx(ctx, d, vm_id, lane, mailboxes, num_vms);
-        PublishStatus(ctrl, vm_id, lane, kIdle, 0, 0, 0);
+        InitVmCtx(ctx, d, vm_id, slot_id, lane, mailboxes, num_vms);
+        PublishStatus(ctrl, slot_id, lane, kIdle, 0, 0, 0);
         break;
       case kCmdExit:
         alive = false;
@@ -210,7 +217,7 @@ __device__ void PersistentKernelBody(const VmDesc* descs, VmState* states,
   }
 
   // Final state so the host can observe a clean exit.
-  if (lane == 0) WriteOnce(&ctrl->status[vm_id], kIdle);
+  if (lane == 0) WriteOnce(&ctrl->status[slot_id], kIdle);
 }
 
 __global__ void PersistentKernel(const VmDesc* descs, VmState* states,

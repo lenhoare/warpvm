@@ -46,13 +46,13 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err,
          << "    setp.eq.u32 %p7, %t3, 0;\n"
          << "    @%p7 ld.global.u32 %t10, [%rd17+"
          << offsetof(Control, shutdown) << "];\n"
-         << "    @%p7 mul.wide.u32 %rd18, %vid, 4;\n"
+         << "    @%p7 mul.wide.u32 %rd18, %t2, 4;\n"
          << "    @%p7 add.u64 %rd18, %rd17, %rd18;\n"
          << "    @%p7 st.global.u32 [%rd18+" << offsetof(Control, pc)
          << "], %t7;\n"
          << "    @%p7 st.global.u32 [%rd18+" << offsetof(Control, status)
          << "], " << kRunning << ";\n"
-         << "    @%p7 mul.wide.u32 %rd19, %vid, 8;\n"
+         << "    @%p7 mul.wide.u32 %rd19, %t2, 8;\n"
          << "    @%p7 add.u64 %rd19, %rd17, %rd19;\n"
          << "    @%p7 st.global.u64 [%rd19+" << offsetof(Control, instrs)
          << "], %ic;\n"
@@ -463,9 +463,15 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err,
              << "    @!%p3 bra " << done << ";\n"
              << "    setp.eq.u64 %p4, %rd14, 0;\n"
              << "    @%p4 bra " << full << ";\n"
-             << "    setp.ge.u32 %p4, " << VReg(rd) << ", %t0;\n"
+             << "    setp.ge.u32 %p4, " << VReg(rd) << ", "
+             << kVmIdCount << ";\n"
              << "    @%p4 bra " << full << ";\n"
-             << "    mul.wide.u32 %rd15, " << VReg(rd) << ", "
+             << "    mul.wide.u32 %rd13, " << VReg(rd) << ", 4;\n"
+             << "    add.u64 %rd13, %rd12, %rd13;\n"
+             << "    ld.global.u32 %t15, [%rd13];\n"
+             << "    setp.ge.u32 %p4, %t15, %t0;\n"
+             << "    @%p4 bra " << full << ";\n"
+             << "    mul.wide.u32 %rd15, %t15, "
              << sizeof(Mailbox) << ";\n"
              << "    add.u64 %rd15, %rd14, %rd15;\n"
              << retry << ":\n"
@@ -533,7 +539,7 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err,
              << "    setp.ne.u64 %p4, %rd14, 0;\n"
              << "    and.pred %p3, %p3, %p4;\n"
              << "    @!%p3 bra " << done << ";\n"
-             << "    mul.wide.u32 %rd15, %vid, " << sizeof(Mailbox)
+             << "    mul.wide.u32 %rd15, %t2, " << sizeof(Mailbox)
              << ";\n"
              << "    add.u64 %rd15, %rd14, %rd15;\n"
              << "    atom.global.add.u32 %t13, [%rd15+"
@@ -703,13 +709,13 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err,
   };
 
   auto emit_control_status = [&](std::ostringstream& target) {
-    target << "    @%p1 mul.wide.u32 %rd18, %vid, 4;\n"
+    target << "    @%p1 mul.wide.u32 %rd18, %t2, 4;\n"
            << "    @%p1 add.u64 %rd18, %rd17, %rd18;\n"
            << "    @%p1 st.global.u32 [%rd18+" << offsetof(Control, fault)
            << "], %t4;\n"
            << "    @%p1 st.global.u32 [%rd18+" << offsetof(Control, pc)
            << "], %t7;\n"
-           << "    @%p1 mul.wide.u32 %rd19, %vid, 8;\n"
+           << "    @%p1 mul.wide.u32 %rd19, %t2, 8;\n"
            << "    @%p1 add.u64 %rd19, %rd17, %rd19;\n"
            << "    @%p1 st.global.u64 [%rd19+" << offsetof(Control, instrs)
            << "], %ic;\n"
@@ -737,7 +743,8 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err,
         << "    .param .u32 memory_words_param,\n"
         << "    .param .u64 framebuffer_param,\n"
         << "    .param .u64 frame_seq_param,\n"
-        << "    .param .u64 mailboxes_param\n"
+        << "    .param .u64 mailboxes_param,\n"
+        << "    .param .u64 vm_routes_param\n"
         << ")\n";
   }
   out
@@ -764,7 +771,8 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err,
         << "    ld.param.u32 %t5, [memory_words_param];\n"
         << "    ld.param.u64 %rd8, [framebuffer_param];\n"
         << "    ld.param.u64 %rd10, [frame_seq_param];\n"
-        << "    ld.param.u64 %rd14, [mailboxes_param];\n";
+        << "    ld.param.u64 %rd14, [mailboxes_param];\n"
+        << "    ld.param.u64 %rd12, [vm_routes_param];\n";
   }
   out
       << "    mov.u32 %t1, %tid.x;\n"
@@ -790,6 +798,8 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err,
         << offsetof(VmDesc, mem_size_words) << "];\n"
         << "    ld.global.u64 %rd9, [%rd19+" << offsetof(VmDesc, fb)
         << "];\n"
+        << "    ld.global.u64 %rd12, [%rd19+"
+        << offsetof(VmDesc, vm_routes) << "];\n"
         << "    add.u64 %rd10, %rd17, " << offsetof(Control, frame_seq)
         << ";\n\n";
   } else {
@@ -833,7 +843,7 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err,
       << "];\n";
   if (resident) {
     out << "    setp.eq.u32 %p7, %t3, 0;\n"
-        << "    @%p7 mul.wide.u32 %rd18, %vid, 4;\n"
+        << "    @%p7 mul.wide.u32 %rd18, %t2, 4;\n"
         << "    @%p7 add.u64 %rd18, %rd17, %rd18;\n"
         << "    @%p7 st.global.u32 [%rd18+" << offsetof(Control, status)
         << "], " << kIdle << ";\n"
@@ -842,7 +852,7 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err,
         << "    mov.u32 %t11, 0;\n"
         << "    @%p7 ld.global.u32 %t10, [%rd17+"
         << offsetof(Control, shutdown) << "];\n"
-        << "    @%p7 mul.wide.u32 %rd18, %vid, 4;\n"
+        << "    @%p7 mul.wide.u32 %rd18, %t2, 4;\n"
         << "    @%p7 add.u64 %rd18, %rd17, %rd18;\n"
         << "    @%p7 ld.global.u32 %t11, [%rd18+"
         << offsetof(Control, cmd) << "];\n"
@@ -965,7 +975,7 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err,
         << "    mov.u32 %t11, 0;\n"
         << "    @%p1 ld.global.u32 %t10, [%rd17+"
         << offsetof(Control, shutdown) << "];\n"
-        << "    @%p1 mul.wide.u32 %rd18, %vid, 4;\n"
+        << "    @%p1 mul.wide.u32 %rd18, %t2, 4;\n"
         << "    @%p1 add.u64 %rd18, %rd17, %rd18;\n"
         << "    @%p1 ld.global.u32 %t11, [%rd18+"
         << offsetof(Control, cmd) << "];\n"
@@ -1101,6 +1111,7 @@ bool PtxResidentProgram::Launch(CUdeviceptr states, uint32_t num_vms,
 
 PtxCompiledProgram::~PtxCompiledProgram() {
   if (context_ != nullptr) cuCtxSetCurrent(context_);
+  if (scratch_vm_routes_ != 0) cuMemFree(scratch_vm_routes_);
   if (scratch_mailboxes_ != 0) cuMemFree(scratch_mailboxes_);
   if (scratch_frame_seq_ != 0) cuMemFree(scratch_frame_seq_);
   if (scratch_framebuffers_ != 0) cuMemFree(scratch_framebuffers_);
@@ -1224,14 +1235,28 @@ bool PtxCompiledProgram::LaunchCheckpoints(
     err = "CUDA context activation failed: " + DriverError(result);
     return false;
   }
-  for (size_t vm = 0; vm < states.size(); ++vm) {
-    const bool runnable = states[vm].status == kRunning ||
-                          states[vm].status == kPaused;
-    if (states[vm].fault_code != kFaultOk || !runnable) {
+  std::vector<VmSlot> vm_routes(kVmIdCount, kInvalidVmSlot);
+  for (VmSlot slot = 0; slot < states.size(); ++slot) {
+    const bool runnable = states[slot].status == kRunning ||
+                          states[slot].status == kPaused;
+    if (states[slot].fault_code != kFaultOk || !runnable) {
       err = "compiled launch requires runnable, non-faulted state for vm " +
-            std::to_string(vm);
+            std::to_string(slot);
       return false;
     }
+    const VmId id = states[slot].vm_id;
+    if (id >= kVmIdCount) {
+      err = "compiled launch VM ID is outside the 16-bit message address "
+            "space at slot " +
+            std::to_string(slot);
+      return false;
+    }
+    if (vm_routes[id] != kInvalidVmSlot) {
+      err = "compiled launch VM IDs must be unique; duplicate ID " +
+            std::to_string(id);
+      return false;
+    }
+    vm_routes[id] = slot;
   }
   const size_t expected_memory = states.size() * memory_words;
   if (memory.size() != expected_memory) {
@@ -1275,6 +1300,7 @@ bool PtxCompiledProgram::LaunchCheckpoints(
   const size_t framebuffer_bytes = framebuffers.size() * sizeof(uint32_t);
   const size_t frame_seq_bytes = frame_seq.size() * sizeof(uint32_t);
   const size_t mailbox_bytes = states.size() * sizeof(Mailbox);
+  const size_t vm_routes_bytes = vm_routes.size() * sizeof(VmSlot);
   if (!reserve(scratch_states_, scratch_states_bytes_, bytes,
                "compiled-state") ||
       !reserve(scratch_memory_, scratch_memory_bytes_, memory_bytes,
@@ -1284,7 +1310,9 @@ bool PtxCompiledProgram::LaunchCheckpoints(
       !reserve(scratch_frame_seq_, scratch_frame_seq_bytes_, frame_seq_bytes,
                "compiled-frame-counter") ||
       !reserve(scratch_mailboxes_, scratch_mailboxes_bytes_, mailbox_bytes,
-               "compiled-mailboxes"))
+               "compiled-mailboxes") ||
+      !reserve(scratch_vm_routes_, scratch_vm_routes_bytes_, vm_routes_bytes,
+               "compiled-VM-routes"))
     return false;
   CUdeviceptr device_states = scratch_states_;
   CUdeviceptr device_memory = memory.empty() ? 0 : scratch_memory_;
@@ -1292,6 +1320,7 @@ bool PtxCompiledProgram::LaunchCheckpoints(
       framebuffers.empty() ? 0 : scratch_framebuffers_;
   CUdeviceptr device_frame_seq = frame_seq.empty() ? 0 : scratch_frame_seq_;
   CUdeviceptr device_mailboxes = scratch_mailboxes_;
+  CUdeviceptr device_vm_routes = scratch_vm_routes_;
   auto fail = [&](const char* operation, CUresult failure) {
     err = std::string(operation) + ": " + DriverError(failure);
     return false;
@@ -1322,11 +1351,15 @@ bool PtxCompiledProgram::LaunchCheckpoints(
   result = cuMemcpyHtoD(device_mailboxes, mailboxes.data(), mailbox_bytes);
   if (result != CUDA_SUCCESS)
     return fail("compiled-mailbox upload failed", result);
+  result = cuMemcpyHtoD(device_vm_routes, vm_routes.data(), vm_routes_bytes);
+  if (result != CUDA_SUCCESS)
+    return fail("compiled-VM-route upload failed", result);
 
   uint32_t num_vms = static_cast<uint32_t>(states.size());
   void* parameters[] = {&device_states, &num_vms, &device_memory,
                         &memory_words, &device_framebuffers,
-                        &device_frame_seq, &device_mailboxes};
+                        &device_frame_seq, &device_mailboxes,
+                        &device_vm_routes};
   constexpr uint32_t kBlockThreads = 256;
   const uint32_t grid =
       (num_vms * kLanes + kBlockThreads - 1) / kBlockThreads;
@@ -1377,7 +1410,7 @@ bool PtxCompilationCache::GetOrCompile(
     }
   };
   mix(kWvmVersion);
-  mix(1);  // PTX backend ABI/compiler version.
+  mix(2);  // PTX backend ABI/compiler version.
   mix(static_cast<uint32_t>(file.code.size()));
   for (uint32_t word : file.code) mix(word);
   mix(static_cast<uint32_t>(file.literals.size()));
