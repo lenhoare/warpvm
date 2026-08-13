@@ -1,0 +1,106 @@
+#include <warp.h>
+
+/*
+ * Abelian sandpile on a 64x64 lattice, drawn 2x2 onto the 128x128 display.
+ *
+ * A cell of height >= 4 topples by keeping height-4 and giving one grain to
+ * each cardinal neighbour. Each cell computes its own next height from the
+ * neighbours' topple predicates, so there are no conflicting writes. Grains
+ * that would leave the board fall off. One grain is added per frame; a few
+ * parallel topple sweeps run before the paint so avalanches are visible.
+ */
+
+int g_cur[4096];
+int g_nxt[4096];
+
+int topple(int *cur, int *nxt)
+{
+    int seen;
+    int y;
+    int base;
+    int x;
+    int i;
+    int h;
+    int n;
+    int s;
+    int e;
+    int w;
+    int recv;
+    int out;
+
+    seen = 0;
+    for (y = 0; y < 64; y = y + 1) {
+        for (base = 0; base < 64; base = base + 32) {
+            x = base + WARP;
+            i = y * 64 + x;
+            h = cur[i];
+            n = (y == 0) ? 0 : cur[i - 64];
+            s = (y == 63) ? 0 : cur[i + 64];
+            w = (x == 0) ? 0 : cur[i - 1];
+            e = (x == 63) ? 0 : cur[i + 1];
+            recv = (n >= 4) + (s >= 4) + (e >= 4) + (w >= 4);
+            out = h - ((h >= 4) ? 4 : 0) + recv;
+            nxt[i] = out;
+            seen = seen | (out >= 4);
+        }
+    }
+    return warp_any(seen);
+}
+
+int height_colour(int h)
+{
+    int v;
+    v = h * 48;
+    v = (v > 220) ? 220 : v;
+    return warp_argb(255, v, 40 + v / 2, 30);
+}
+
+int main(void)
+{
+    int vm;
+    int drop;
+    int sweep;
+    int y;
+    int base;
+    int x;
+    int h;
+    int sx;
+    int sy;
+    int colour;
+
+    vm = warp_vm_id();
+    drop = (32 + vm) & 63;
+
+    for (y = 0; y < 64; y = y + 1) {
+        for (base = 0; base < 64; base = base + 32)
+            g_cur[y * 64 + base + WARP] = 0;
+    }
+
+    while (1) {
+        if (WARP == 0)
+            g_cur[drop * 64 + drop] = g_cur[drop * 64 + drop] + 1;
+
+        for (sweep = 0; sweep < 8; sweep = sweep + 1) {
+            topple(g_cur, g_nxt);
+            for (y = 0; y < 64; y = y + 1) {
+                for (base = 0; base < 64; base = base + 32)
+                    g_cur[y * 64 + base + WARP] = g_nxt[y * 64 + base + WARP];
+            }
+        }
+
+        for (y = 0; y < 64; y = y + 1) {
+            for (base = 0; base < 64; base = base + 32) {
+                x = base + WARP;
+                h = g_cur[y * 64 + x];
+                colour = height_colour(h);
+                sx = x * 2;
+                sy = y * 2;
+                warp_set_pixel(sx, sy, colour);
+                warp_set_pixel(sx + 1, sy, colour);
+                warp_set_pixel(sx, sy + 1, colour);
+                warp_set_pixel(sx + 1, sy + 1, colour);
+            }
+        }
+        warp_flip();
+    }
+}

@@ -1,0 +1,117 @@
+#include <warp.h>
+
+/*
+ * 64x64 toroidal 2D wave, drawn 2x2 onto the 128x128 framebuffer.
+ *
+ * Full 128x128 double-buffering is 32,768 words; VM RAM is 16,384. This
+ * lattice is 3 x 4,096 = 12,288 words: u^t, u^{t-1}, and the next field,
+ * rotated by pointer each step so the stencil does not copy the grid.
+ *
+ * Discrete wave: u_new = 2 u - u_prev + (n+s+e+w-4u) >> 3
+ * (Courant 1/8, arithmetic shift). A VM-local pebble keeps ripples going.
+ */
+
+int g_a[4096];
+int g_b[4096];
+int g_c[4096];
+
+void wave_step(int *u, int *prev, int *out)
+{
+    int y;
+    int base;
+    int x;
+    int i;
+    int c;
+    int lap;
+    int n;
+    int s;
+    int e;
+    int w;
+
+    for (y = 0; y < 64; y = y + 1) {
+        for (base = 0; base < 64; base = base + 32) {
+            x = base + WARP;
+            i = y * 64 + x;
+            c = u[i];
+            n = u[((y - 1) & 63) * 64 + x];
+            s = u[((y + 1) & 63) * 64 + x];
+            w = u[y * 64 + ((x - 1) & 63)];
+            e = u[y * 64 + ((x + 1) & 63)];
+            lap = n + s + e + w - 4 * c;
+            out[i] = 2 * c - prev[i] + (lap >> 3);
+        }
+    }
+}
+
+int wave_colour(int h)
+{
+    int mag;
+    mag = (h < 0) ? -h : h;
+    mag = (mag > 220) ? 220 : mag;
+    return (h >= 0) ? warp_argb(255, 40 + mag, 80 + mag / 2, 30)
+                    : warp_argb(255, 20, 40 + mag / 2, 40 + mag);
+}
+
+int main(void)
+{
+    int *u;
+    int *prev;
+    int *nxt;
+    int *tmp;
+    int vm;
+    int drop;
+    int frame;
+    int y;
+    int base;
+    int x;
+    int h;
+    int sx;
+    int sy;
+    int colour;
+
+    vm = warp_vm_id();
+    drop = (32 + vm) & 63;
+
+    for (y = 0; y < 64; y = y + 1) {
+        for (base = 0; base < 64; base = base + 32) {
+            g_a[y * 64 + base + WARP] = 0;
+            g_b[y * 64 + base + WARP] = 0;
+        }
+    }
+    if (WARP == 0)
+        g_a[drop * 64 + drop] = 192;
+
+    u = g_a;
+    prev = g_b;
+    nxt = g_c;
+    frame = 0;
+
+    while (1) {
+        if ((frame & 63) == 0) {
+            if (WARP == 0)
+                u[drop * 64 + drop] = u[drop * 64 + drop] + 160;
+        }
+
+        wave_step(u, prev, nxt);
+        tmp = prev;
+        prev = u;
+        u = nxt;
+        nxt = tmp;
+
+        for (y = 0; y < 64; y = y + 1) {
+            for (base = 0; base < 64; base = base + 32) {
+                x = base + WARP;
+                h = u[y * 64 + x];
+                colour = wave_colour(h);
+                sx = x * 2;
+                sy = y * 2;
+                warp_set_pixel(sx, sy, colour);
+                warp_set_pixel(sx + 1, sy, colour);
+                warp_set_pixel(sx, sy + 1, colour);
+                warp_set_pixel(sx + 1, sy + 1, colour);
+            }
+        }
+        warp_flip();
+        frame = frame + 1;
+    }
+}

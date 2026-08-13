@@ -1,0 +1,47 @@
+#include <warp.h>
+
+int g_fail;
+
+int main(void)
+{
+    int x;
+    int y;
+    int vx;
+    int vy;
+    int t;
+    int wall_x;
+    int wall_v;
+
+    g_fail = 0;
+
+    x = WARP;
+    y = WARP + 3;
+    vx = 1;
+    vy = 1;
+    for (t = 0; t < 10; t = t + 1) {
+        x = x + vx;
+        y = y + vy;
+    }
+    if (!warp_all((x == WARP + 10) & (y == WARP + 13)))
+        g_fail = 1;
+
+    /* Uniform wall bounce: 125 + 1 four times. Separate locals: x was
+     * already divergent from the ramp test, so it cannot guard a branch. */
+    wall_x = 125;
+    wall_v = 1;
+    for (t = 0; t < 4; t = t + 1) {
+        wall_x = wall_x + wall_v;
+        if (wall_x > 127) {
+            wall_x = 127;
+            wall_v = -wall_v;
+        }
+    }
+    if (wall_x != 126)
+        g_fail = 2;
+    if (wall_v != -1)
+        g_fail = 3;
+
+    if (g_fail)
+        return 0;
+    return 42;
+}

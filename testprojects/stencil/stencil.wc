@@ -1,0 +1,69 @@
+#include <warp.h>
+
+/*
+ * 3-point neighbour stencil.
+ *
+ * Inside one warp the neighbours are shuffles, done under uniform control so
+ * the edges wrap to the opposite lane; those wrapped values are then replaced
+ * with a replicate-edge (Dirichlet) choice via `?:`. Across several warps the
+ * same idea uses ordinary halo loads, still 32-wide.
+ */
+
+int g_out[32];
+int g_long_in[96];
+int g_long_out[96];
+int g_fail;
+
+int blur3(int v)
+{
+    int left = warp_shuffle(v, WARP - 1);
+    int right = warp_shuffle(v, WARP + 1);
+    left = (WARP == 0) ? v : left;
+    right = (WARP == 31) ? v : right;
+    return (left + v + right) / 3;
+}
+
+int main(void)
+{
+    int v;
+    int got;
+    int expected;
+    int base;
+    int i;
+    int left;
+    int right;
+
+    g_fail = 0;
+
+    /* Ramp 0..31. Interior stays put; the last lane replicates 31's left. */
+    got = blur3(WARP);
+    g_out[WARP] = got;
+    expected = (WARP == 31) ? 30 : WARP;
+    if (!warp_all(got == expected))
+        g_fail = 1;
+
+    /* 96-word ramp in RAM: three warp chunks with real halo loads. */
+    for (base = 0; base < 96; base = base + 32)
+        g_long_in[base + WARP] = base + WARP;
+
+    for (base = 0; base < 96; base = base + 32) {
+        i = base + WARP;
+        v = g_long_in[i];
+        left = (i == 0) ? v : g_long_in[i - 1];
+        right = (i == 95) ? v : g_long_in[i + 1];
+        g_long_out[i] = (left + v + right) / 3;
+    }
+
+    expected = (i == 95) ? 94 : i;
+    /* i is left at 64+WARP from the last chunk; check every chunk. */
+    if (!warp_all(g_long_out[WARP] == WARP))
+        g_fail = 2;
+    if (!warp_all(g_long_out[32 + WARP] == 32 + WARP))
+        g_fail = 3;
+    if (!warp_all(g_long_out[64 + WARP] == ((WARP == 31) ? 94 : 64 + WARP)))
+        g_fail = 4;
+
+    if (g_fail)
+        return 0;
+    return 42;
+}

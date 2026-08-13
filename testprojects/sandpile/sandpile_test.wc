@@ -1,0 +1,95 @@
+#include <warp.h>
+
+int g_cur[4096];
+int g_nxt[4096];
+int g_fail;
+
+int topple(int *cur, int *nxt)
+{
+    int seen;
+    int y;
+    int base;
+    int x;
+    int i;
+    int h;
+    int n;
+    int s;
+    int e;
+    int w;
+    int recv;
+    int out;
+
+    seen = 0;
+    for (y = 0; y < 64; y = y + 1) {
+        for (base = 0; base < 64; base = base + 32) {
+            x = base + WARP;
+            i = y * 64 + x;
+            h = cur[i];
+            n = (y == 0) ? 0 : cur[i - 64];
+            s = (y == 63) ? 0 : cur[i + 64];
+            w = (x == 0) ? 0 : cur[i - 1];
+            e = (x == 63) ? 0 : cur[i + 1];
+            recv = (n >= 4) + (s >= 4) + (e >= 4) + (w >= 4);
+            out = h - ((h >= 4) ? 4 : 0) + recv;
+            nxt[i] = out;
+            seen = seen | (out >= 4);
+        }
+    }
+    return warp_any(seen);
+}
+
+void copy_grid(int *dst, int *src)
+{
+    int base;
+    for (base = 0; base < 4096; base = base + 32)
+        dst[base + WARP] = src[base + WARP];
+}
+
+int main(void)
+{
+    int y;
+    int base;
+    int busy;
+    int guard;
+    int total;
+
+    g_fail = 0;
+
+    for (y = 0; y < 64; y = y + 1) {
+        for (base = 0; base < 64; base = base + 32)
+            g_cur[y * 64 + base + WARP] = 0;
+    }
+    if (WARP == 0)
+        g_cur[32 * 64 + 32] = 16;
+
+    busy = 1;
+    guard = 0;
+    while (busy) {
+        busy = topple(g_cur, g_nxt);
+        copy_grid(g_cur, g_nxt);
+        guard = guard + 1;
+        if (guard == 6)
+            busy = 0;
+    }
+
+    if (guard != 6)
+        g_fail = 1;
+    if (g_cur[32 * 64 + 32] != 0)
+        g_fail = 2;
+    if (g_cur[32 * 64 + 31] != 1)
+        g_fail = 3;
+    if (g_cur[31 * 64 + 31] != 2)
+        g_fail = 4;
+    if (g_cur[30 * 64 + 32] != 1)
+        g_fail = 5;
+
+    total = 0;
+    for (base = 0; base < 4096; base = base + 32)
+        total = total + warp_reduce_add(g_cur[base + WARP]);
+    if (total != 16)
+        g_fail = 6;
+
+    if (g_fail)
+        return 0;
+    return 42;
+}

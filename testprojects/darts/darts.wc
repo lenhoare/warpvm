@@ -1,0 +1,59 @@
+#include <warp.h>
+
+/*
+ * Integer dartboard: 32 throws in one warp.
+ *
+ * Each lane owns one dart at (4*WARP, 4*WARP) against a circle of radius 50
+ * centred at (64, 64). The hit predicate reduces to a count; the same
+ * predicate paints the board and the darts.
+ */
+
+int g_hits;
+int g_fail;
+
+int in_circle(int x, int y)
+{
+    int dx = x - 64;
+    int dy = y - 64;
+    return dx * dx + dy * dy <= 2500;
+}
+
+int main(void)
+{
+    int dart_x;
+    int dart_y;
+    int row;
+    int col;
+    int hit;
+    int colour;
+    int board;
+
+    g_fail = 0;
+
+    dart_x = WARP * 4;
+    dart_y = WARP * 4;
+    hit = in_circle(dart_x, dart_y);
+    g_hits = warp_reduce_add(hit);
+    if (g_hits != 17)
+        g_fail = 1;
+
+    for (row = 0; row < 128; row = row + 1) {
+        for (col = 0; col < 128; col = col + 32) {
+            dart_x = col + WARP;
+            board = in_circle(dart_x, row);
+            colour = board ? warp_argb(255, 20, 40, 90) : warp_argb(255, 8, 8, 12);
+            warp_set_pixel(dart_x, row, colour);
+        }
+    }
+
+    dart_x = WARP * 4;
+    dart_y = WARP * 4;
+    colour = hit ? warp_argb(255, 220, 220, 80) : warp_argb(255, 180, 40, 40);
+    warp_set_pixel(dart_x, dart_y, colour);
+
+    warp_flip();
+
+    if (g_fail)
+        return 0;
+    return 42;
+}

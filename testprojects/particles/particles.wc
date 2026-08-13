@@ -1,0 +1,80 @@
+#include <warp.h>
+
+/*
+ * 32 particles: one per lane.
+ *
+ * Positions and velocities are ordinary locals — automatic storage is already
+ * lane-private, so there is no particle array. All-pairs probes are shuffles
+ * in a uniform k-loop; bounce and collision responses are predicated adds.
+ */
+
+int main(void)
+{
+    int vm;
+    int x;
+    int y;
+    int vx;
+    int vy;
+    int k;
+    int ox;
+    int oy;
+    int hit;
+    int base;
+    int py;
+    int colour;
+
+    vm = warp_vm_id();
+    x = WARP * 4 + 2;
+    y = ((WARP * 5 + vm) & 63) + 32;
+    vx = (WARP & 1) ? 1 : -1;
+    vy = (WARP & 2) ? 1 : -1;
+
+    while (1) {
+        x = x + vx;
+        y = y + vy;
+        if (x < 0) {
+            x = 0;
+            vx = -vx;
+        }
+        if (x > 127) {
+            x = 127;
+            vx = -vx;
+        }
+        if (y < 0) {
+            y = 0;
+            vy = -vy;
+        }
+        if (y > 127) {
+            y = 127;
+            vy = -vy;
+        }
+
+        for (k = 0; k < 32; k = k + 1) {
+            ox = warp_shuffle(x, k);
+            oy = warp_shuffle(y, k);
+            hit = (k != WARP) & (x == ox) & (y == oy);
+            if (hit) {
+                vx = -vx;
+                vy = -vy;
+            }
+        }
+
+        for (py = 0; py < 128; py = py + 1) {
+            for (base = 0; base < 128; base = base + 32)
+                warp_set_pixel(base + WARP, py, warp_argb(255, 6, 8, 14));
+        }
+
+        colour = warp_argb(255, 80 + WARP * 5, 140 + vm, 255 - WARP * 6);
+        warp_set_pixel(x, y, colour);
+        if (x > 0)
+            warp_set_pixel(x - 1, y, colour);
+        if (x < 127)
+            warp_set_pixel(x + 1, y, colour);
+        if (y > 0)
+            warp_set_pixel(x, y - 1, colour);
+        if (y < 127)
+            warp_set_pixel(x, y + 1, colour);
+
+        warp_flip();
+    }
+}

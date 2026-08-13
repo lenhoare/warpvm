@@ -1,0 +1,56 @@
+#include <warp.h>
+
+/*
+ * Rule 30: next = left XOR (centre OR right).
+ *
+ * 128 toroidal cells, four warp chunks per generation. Wrap is `& 127` on a
+ * signed index, which does the right thing for -1 at the left edge. Each
+ * frame paints one history row; 64 VMs start the seed at different cells.
+ */
+
+int g_cells[128];
+int g_next[128];
+
+int main(void)
+{
+    int vm;
+    int seed;
+    int base;
+    int i;
+    int left;
+    int centre;
+    int right;
+    int y;
+    int colour;
+
+    vm = warp_vm_id();
+    seed = (64 + vm) & 127;
+
+    for (base = 0; base < 128; base = base + 32)
+        g_cells[base + WARP] = 0;
+    if (WARP == 0)
+        g_cells[seed] = 1;
+
+    y = 0;
+    while (1) {
+        for (base = 0; base < 128; base = base + 32) {
+            i = base + WARP;
+            colour = g_cells[i] ? warp_argb(255, 220, 230, 240)
+                                : warp_argb(255, 8, 10, 18);
+            warp_set_pixel(i, y, colour);
+        }
+        warp_flip();
+
+        for (base = 0; base < 128; base = base + 32) {
+            i = base + WARP;
+            left = g_cells[(i - 1) & 127];
+            centre = g_cells[i];
+            right = g_cells[(i + 1) & 127];
+            g_next[i] = left ^ (centre | right);
+        }
+        for (base = 0; base < 128; base = base + 32)
+            g_cells[base + WARP] = g_next[base + WARP];
+
+        y = (y + 1) & 127;
+    }
+}

@@ -1,0 +1,64 @@
+#include <warp.h>
+
+/* 32 generations of Rule 30 from a single 1 at cell 64. */
+
+int g_cells[128];
+int g_next[128];
+int g_fail;
+
+int main(void)
+{
+    int gen;
+    int base;
+    int i;
+    int left;
+    int centre;
+    int right;
+    int weighted;
+
+    g_fail = 0;
+
+    for (base = 0; base < 128; base = base + 32)
+        g_cells[base + WARP] = 0;
+    if (WARP == 0)
+        g_cells[64] = 1;
+
+    for (gen = 0; gen < 32; gen = gen + 1) {
+        for (base = 0; base < 128; base = base + 32) {
+            i = base + WARP;
+            left = g_cells[(i - 1) & 127];
+            centre = g_cells[i];
+            right = g_cells[(i + 1) & 127];
+            g_next[i] = left ^ (centre | right);
+        }
+        for (base = 0; base < 128; base = base + 32)
+            g_cells[base + WARP] = g_next[base + WARP];
+    }
+
+    weighted = warp_reduce_add(g_cells[WARP] * WARP)
+             + warp_reduce_add(g_cells[32 + WARP] * (32 + WARP))
+             + warp_reduce_add(g_cells[64 + WARP] * (64 + WARP))
+             + warp_reduce_add(g_cells[96 + WARP] * (96 + WARP));
+    if (weighted != 1523)
+        g_fail = 1;
+
+    /* Spot-check the known triangle around the seed. */
+    if (WARP == 0) {
+        if (g_cells[57] != 1)
+            g_fail = 2;
+        if (g_cells[61] != 1)
+            g_fail = 3;
+        if (g_cells[65] != 1)
+            g_fail = 4;
+        if (g_cells[66] != 1)
+            g_fail = 5;
+        if (g_cells[70] != 1)
+            g_fail = 6;
+        if (g_cells[64] != 0)
+            g_fail = 7;
+    }
+
+    if (g_fail)
+        return 0;
+    return 42;
+}

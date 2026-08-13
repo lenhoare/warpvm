@@ -1,0 +1,91 @@
+#include <warp.h>
+
+int g_a[4096];
+int g_b[4096];
+int g_c[4096];
+int g_fail;
+
+void wave_step(int *u, int *prev, int *out)
+{
+    int y;
+    int base;
+    int x;
+    int i;
+    int c;
+    int lap;
+    int n;
+    int s;
+    int e;
+    int w;
+
+    for (y = 0; y < 64; y = y + 1) {
+        for (base = 0; base < 64; base = base + 32) {
+            x = base + WARP;
+            i = y * 64 + x;
+            c = u[i];
+            n = u[((y - 1) & 63) * 64 + x];
+            s = u[((y + 1) & 63) * 64 + x];
+            w = u[y * 64 + ((x - 1) & 63)];
+            e = u[y * 64 + ((x + 1) & 63)];
+            lap = n + s + e + w - 4 * c;
+            out[i] = 2 * c - prev[i] + (lap >> 3);
+        }
+    }
+}
+
+int main(void)
+{
+    int *u;
+    int *prev;
+    int *nxt;
+    int *tmp;
+    int y;
+    int base;
+    int t;
+    int total;
+
+    g_fail = 0;
+
+    for (y = 0; y < 64; y = y + 1) {
+        for (base = 0; base < 64; base = base + 32) {
+            g_a[y * 64 + base + WARP] = 0;
+            g_b[y * 64 + base + WARP] = 0;
+        }
+    }
+    if (WARP == 0)
+        g_a[32 * 64 + 32] = 256;
+
+    u = g_a;
+    prev = g_b;
+    nxt = g_c;
+
+    for (t = 0; t < 4; t = t + 1) {
+        wave_step(u, prev, nxt);
+        tmp = prev;
+        prev = u;
+        u = nxt;
+        nxt = tmp;
+    }
+
+    /* t=4 from a single 256 pebble at (32,32), arithmetic >> 3 Laplacian. */
+    if (u[32 * 64 + 32] != -6)
+        g_fail = 1;
+    if (u[32 * 64 + 31] != 170)
+        g_fail = 2;
+    if (u[31 * 64 + 31] != 85)
+        g_fail = 3;
+    if (u[32 * 64 + 30] != 42)
+        g_fail = 4;
+    if (u[30 * 64 + 32] != 42)
+        g_fail = 5;
+
+    total = 0;
+    for (base = 0; base < 4096; base = base + 32)
+        total = total + warp_reduce_add(u[base + WARP]);
+    if (total != 1254)
+        g_fail = 6;
+
+    if (g_fail)
+        return 0;
+    return 42;
+}

@@ -1,0 +1,75 @@
+#include <warp.h>
+
+/*
+ * 32x32 signed matvec: y = A x.
+ *
+ * Lane k holds x[k]. Each row is one warp-wide dot: load A[row][WARP]
+ * (adjacent lanes, adjacent columns), multiply, warp_reduce_add.
+ * Uniform row index, 32-wide inner product. Lane 0 writes the scalar result.
+ */
+
+int g_A[1024];
+int g_x[32];
+int g_y[32];
+int g_fail;
+
+void matvec(int *A, int *x_in, int *y)
+{
+    int x = x_in[WARP];
+    int row;
+    for (row = 0; row < 32; row = row + 1) {
+        int acc = warp_reduce_add(A[row * 32 + WARP] * x);
+        if (WARP == 0)
+            y[row] = acc;
+    }
+}
+
+int main(void)
+{
+    int row;
+    int expected;
+    int total;
+    int sumsq;
+
+    g_fail = 0;
+    g_x[WARP] = WARP + 1;
+
+    /* A = I  =>  y = x */
+    for (row = 0; row < 32; row = row + 1)
+        g_A[row * 32 + WARP] = (WARP == row) ? 1 : 0;
+    matvec(g_A, g_x, g_y);
+    if (!warp_all(g_y[WARP] == g_x[WARP]))
+        g_fail = 1;
+
+    /* A = 1  =>  every y[i] = sum(x) */
+    for (row = 0; row < 32; row = row + 1)
+        g_A[row * 32 + WARP] = 1;
+    matvec(g_A, g_x, g_y);
+    total = warp_reduce_add(g_x[WARP]);
+    if (!warp_all(g_y[WARP] == total))
+        g_fail = 2;
+
+    /* A[i][j] = i + j, x[j] = j  =>  y[i] = i * sum(j) + sum(j^2) */
+    g_x[WARP] = WARP;
+    for (row = 0; row < 32; row = row + 1)
+        g_A[row * 32 + WARP] = row + WARP;
+    matvec(g_A, g_x, g_y);
+    total = warp_reduce_add(WARP);
+    sumsq = warp_reduce_add(WARP * WARP);
+    expected = WARP * total + sumsq;
+    if (!warp_all(g_y[WARP] == expected))
+        g_fail = 3;
+
+    /* Signed values: x[j] = j - 16, A = 1  =>  y[i] = sum(j) - 512 = -16 */
+    g_x[WARP] = WARP - 16;
+    for (row = 0; row < 32; row = row + 1)
+        g_A[row * 32 + WARP] = 1;
+    matvec(g_A, g_x, g_y);
+    total = warp_reduce_add(g_x[WARP]);
+    if (!warp_all(g_y[WARP] == total))
+        g_fail = 4;
+
+    if (g_fail)
+        return 0;
+    return 42;
+}
