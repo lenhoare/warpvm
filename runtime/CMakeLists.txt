@@ -132,6 +132,11 @@ add_test(NAME warpc_call_arguments
           ${WVM_WARPC} $<TARGET_FILE:warpvm>
           ${CMAKE_SOURCE_DIR}/programs/warpc/call_arguments.wc
           ${CMAKE_BINARY_DIR}/warpc_call_arguments warpc_call_arguments)
+add_test(NAME warpc_call_liveness
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_acceptance.sh
+          ${WVM_WARPC} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/programs/warpc/call_liveness.wc
+          ${CMAKE_BINARY_DIR}/warpc_call_liveness warpc_call_liveness)
 add_test(NAME warpc_histogram
   COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_acceptance.sh
           ${WVM_WARPC} $<TARGET_FILE:warpvm>

@@ -51,6 +51,7 @@ struct FunctionAllocation {
     scalar_homes: usize,
     spills: usize,
     vector_home_limit: usize,
+    call_live_out: HashMap<usize, HashSet<LocalId>>,
 }
 
 struct LifetimeCollector {
@@ -260,6 +261,338 @@ impl LifetimeCollector {
     }
 }
 
+#[derive(Clone, Default)]
+struct LiveTargets {
+    break_live: Option<HashSet<LocalId>>,
+    continue_live: Option<HashSet<LocalId>>,
+}
+
+struct CallLiveAnalyzer {
+    call_live_out: HashMap<usize, HashSet<LocalId>>,
+    switch_entries: Vec<Vec<HashSet<LocalId>>>,
+}
+
+impl CallLiveAnalyzer {
+    fn function(function: &TypedFunction) -> HashMap<usize, HashSet<LocalId>> {
+        let mut analyzer = Self {
+            call_live_out: HashMap::new(),
+            switch_entries: Vec::new(),
+        };
+        analyzer.block(&function.body, HashSet::new(), &LiveTargets::default());
+        analyzer.call_live_out
+    }
+
+    fn union(mut left: HashSet<LocalId>, right: &HashSet<LocalId>) -> HashSet<LocalId> {
+        left.extend(right.iter().copied());
+        left
+    }
+
+    fn block(
+        &mut self,
+        block: &TypedBlock,
+        mut live: HashSet<LocalId>,
+        targets: &LiveTargets,
+    ) -> HashSet<LocalId> {
+        for statement in block.statements.iter().rev() {
+            live = self.statement(statement, live, targets);
+        }
+        live
+    }
+
+    fn statement(
+        &mut self,
+        statement: &TypedStmt,
+        live_after: HashSet<LocalId>,
+        targets: &LiveTargets,
+    ) -> HashSet<LocalId> {
+        match statement {
+            TypedStmt::Decl { local, init, .. } => {
+                let mut before_init = live_after;
+                before_init.remove(local);
+                match init {
+                    Some(TypedInitializer::Expr(expr)) => self.expr(expr, before_init),
+                    _ => before_init,
+                }
+            }
+            TypedStmt::Expr(expr) => expr
+                .as_ref()
+                .map_or(live_after.clone(), |expr| self.expr(expr, live_after)),
+            TypedStmt::Return(expr, _) => expr
+                .as_ref()
+                .map_or_else(HashSet::new, |expr| self.expr(expr, HashSet::new())),
+            TypedStmt::Block(block) => self.block(block, live_after, targets),
+            TypedStmt::If {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                let then_live = self.statement(then_branch, live_after.clone(), targets);
+                let else_live = if let Some(branch) = else_branch {
+                    self.statement(branch, live_after.clone(), targets)
+                } else {
+                    live_after
+                };
+                self.expr(condition, Self::union(then_live, &else_live))
+            }
+            TypedStmt::While {
+                condition, body, ..
+            } => {
+                let mut condition_live = live_after.clone();
+                loop {
+                    let loop_targets = LiveTargets {
+                        break_live: Some(live_after.clone()),
+                        continue_live: Some(condition_live.clone()),
+                    };
+                    let body_live = self.statement(body, condition_live.clone(), &loop_targets);
+                    let successors = Self::union(live_after.clone(), &body_live);
+                    let next = self.expr(condition, successors);
+                    let joined = Self::union(condition_live.clone(), &next);
+                    if joined == condition_live {
+                        return condition_live;
+                    }
+                    condition_live = joined;
+                }
+            }
+            TypedStmt::DoWhile {
+                body, condition, ..
+            } => {
+                let mut body_live = live_after.clone();
+                loop {
+                    let condition_successors = Self::union(live_after.clone(), &body_live);
+                    let condition_live = self.expr(condition, condition_successors);
+                    let loop_targets = LiveTargets {
+                        break_live: Some(live_after.clone()),
+                        continue_live: Some(condition_live.clone()),
+                    };
+                    let next = self.statement(body, condition_live, &loop_targets);
+                    let joined = Self::union(body_live.clone(), &next);
+                    if joined == body_live {
+                        return body_live;
+                    }
+                    body_live = joined;
+                }
+            }
+            TypedStmt::For {
+                init,
+                condition,
+                step,
+                body,
+                local_ids,
+                ..
+            } => {
+                let mut condition_live = live_after.clone();
+                loop {
+                    let step_live = step.as_ref().map_or_else(
+                        || condition_live.clone(),
+                        |step| self.expr(step, condition_live.clone()),
+                    );
+                    let loop_targets = LiveTargets {
+                        break_live: Some(live_after.clone()),
+                        continue_live: Some(step_live.clone()),
+                    };
+                    let body_live = self.statement(body, step_live, &loop_targets);
+                    let condition_successors = if condition.is_some() {
+                        Self::union(live_after.clone(), &body_live)
+                    } else {
+                        body_live
+                    };
+                    let next = condition
+                        .as_ref()
+                        .map_or(condition_successors.clone(), |condition| {
+                            self.expr(condition, condition_successors)
+                        });
+                    let joined = Self::union(condition_live.clone(), &next);
+                    if joined == condition_live {
+                        break;
+                    }
+                    condition_live = joined;
+                }
+                let mut before = match init.as_deref() {
+                    Some(TypedForInit::Decl { local, init, .. }) => {
+                        let mut before_init = condition_live;
+                        before_init.remove(local);
+                        match init {
+                            Some(TypedInitializer::Expr(expr)) => self.expr(expr, before_init),
+                            _ => before_init,
+                        }
+                    }
+                    Some(TypedForInit::Expr(expr)) => self.expr(expr, condition_live),
+                    None => condition_live,
+                };
+                for local in local_ids {
+                    before.remove(local);
+                }
+                before
+            }
+            TypedStmt::Break(_) => targets.break_live.clone().unwrap_or(live_after),
+            TypedStmt::Continue(_) => targets.continue_live.clone().unwrap_or(live_after),
+            TypedStmt::Switch {
+                expression, body, ..
+            } => {
+                self.switch_entries.push(Vec::new());
+                let switch_targets = LiveTargets {
+                    break_live: Some(live_after.clone()),
+                    continue_live: targets.continue_live.clone(),
+                };
+                let body_live = self.statement(body, live_after, &switch_targets);
+                let entries = self.switch_entries.pop().unwrap();
+                let dispatch_live = entries
+                    .iter()
+                    .fold(body_live, |live, entry| Self::union(live, entry));
+                self.expr(expression, dispatch_live)
+            }
+            TypedStmt::Case { body, .. } | TypedStmt::Default { body, .. } => {
+                let live = self.statement(body, live_after, targets);
+                if let Some(entries) = self.switch_entries.last_mut() {
+                    entries.push(live.clone());
+                }
+                live
+            }
+        }
+    }
+
+    fn expr_sequence(
+        &mut self,
+        expressions: &[TypedExpr],
+        mut live: HashSet<LocalId>,
+    ) -> HashSet<LocalId> {
+        let mut prefix_dependencies = Vec::with_capacity(expressions.len());
+        let mut prefix = HashSet::new();
+        for expression in expressions {
+            prefix_dependencies.push(prefix.clone());
+            prefix.extend(value_home_dependencies(expression));
+        }
+        for (expression, dependencies) in expressions.iter().zip(prefix_dependencies).rev() {
+            live.extend(dependencies);
+            live = self.expr(expression, live);
+        }
+        live
+    }
+
+    fn expr(&mut self, expr: &TypedExpr, live_after: HashSet<LocalId>) -> HashSet<LocalId> {
+        match &expr.kind {
+            TypedExprKind::Literal(_) | TypedExprKind::StringAddress(_) => live_after,
+            TypedExprKind::Intrinsic { args, .. } => self.expr_sequence(args, live_after),
+            TypedExprKind::Call { args, .. } => {
+                self.call_live_out
+                    .entry(expr as *const TypedExpr as usize)
+                    .or_default()
+                    .extend(live_after.iter().copied());
+                self.expr_sequence(args, live_after)
+            }
+            TypedExprKind::LValue(lvalue) => self.read_lvalue(lvalue, live_after),
+            TypedExprKind::AddressOf(lvalue) => self.lvalue_address(lvalue, live_after),
+            TypedExprKind::Unary(_, operand) => self.expr(operand, live_after),
+            TypedExprKind::Binary {
+                op, left, right, ..
+            } if *op == BinaryOp::LogicalAnd || *op == BinaryOp::LogicalOr => {
+                let right_live = self.expr(right, live_after.clone());
+                self.expr(left, Self::union(live_after, &right_live))
+            }
+            TypedExprKind::Binary {
+                op, left, right, ..
+            } if *op == BinaryOp::Comma => {
+                let right_live = self.expr(right, live_after);
+                self.expr(left, right_live)
+            }
+            TypedExprKind::Binary { left, right, .. }
+            | TypedExprKind::PointerDiff { left, right, .. } => {
+                let mut right_after = live_after;
+                right_after.extend(value_home_dependencies(left));
+                let right_live = self.expr(right, right_after);
+                self.expr(left, right_live)
+            }
+            TypedExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                let then_live = self.expr(then_expr, live_after.clone());
+                let else_live = self.expr(else_expr, live_after);
+                self.expr(condition, Self::union(then_live, &else_live))
+            }
+            TypedExprKind::PointerAdd { pointer, index, .. } => {
+                let mut index_after = live_after;
+                index_after.extend(value_home_dependencies(pointer));
+                let index_live = self.expr(index, index_after);
+                self.expr(pointer, index_live)
+            }
+            TypedExprKind::Assign {
+                target, op, right, ..
+            } => {
+                let mut right_after = live_after;
+                if let LValue::Local(local) = target {
+                    right_after.remove(local);
+                } else {
+                    right_after = self.lvalue_address(target, right_after);
+                }
+                if *op != AssignOp::Assign {
+                    right_after = self.read_lvalue(target, right_after);
+                }
+                self.expr(right, right_after)
+            }
+            TypedExprKind::IncDec { target, .. } => self.read_lvalue(target, live_after),
+            TypedExprKind::Inline { statements, result } => {
+                let mut live = self.expr(result, live_after);
+                for statement in statements.iter().rev() {
+                    live = self.statement(statement, live, &LiveTargets::default());
+                }
+                live
+            }
+        }
+    }
+
+    fn read_lvalue(&mut self, lvalue: &LValue, mut live: HashSet<LocalId>) -> HashSet<LocalId> {
+        match lvalue {
+            LValue::Local(local) => {
+                live.insert(*local);
+                live
+            }
+            LValue::Global(_) => live,
+            LValue::Deref(pointer) => self.expr(pointer, live),
+            LValue::Index { base, index, .. } => {
+                let mut index_after = live;
+                index_after.extend(value_home_dependencies(base));
+                let index_live = self.expr(index, index_after);
+                self.expr(base, index_live)
+            }
+            LValue::Member { base, .. } => self.read_lvalue(base, live),
+        }
+    }
+
+    fn lvalue_address(&mut self, lvalue: &LValue, live: HashSet<LocalId>) -> HashSet<LocalId> {
+        match lvalue {
+            LValue::Local(_) | LValue::Global(_) => live,
+            LValue::Deref(pointer) => self.expr(pointer, live),
+            LValue::Index { base, index, .. } => {
+                let mut index_after = live;
+                index_after.extend(value_home_dependencies(base));
+                let index_live = self.expr(index, index_after);
+                self.expr(base, index_live)
+            }
+            LValue::Member { base, .. } => self.lvalue_address(base, live),
+        }
+    }
+}
+
+fn value_home_dependencies(expr: &TypedExpr) -> HashSet<LocalId> {
+    match &expr.kind {
+        TypedExprKind::LValue(LValue::Local(local)) => HashSet::from([*local]),
+        TypedExprKind::Unary(crate::ast::UnaryOp::Plus, operand) => {
+            value_home_dependencies(operand)
+        }
+        TypedExprKind::Binary {
+            op: BinaryOp::Comma,
+            right,
+            ..
+        }
+        | TypedExprKind::Assign { right, .. } => value_home_dependencies(right),
+        TypedExprKind::Inline { result, .. } => value_home_dependencies(result),
+        _ => HashSet::new(),
+    }
+}
+
 fn intervals_overlap(
     left: LocalId,
     right: LocalId,
@@ -281,6 +614,7 @@ fn allocate_function(
         lifetime.touch(parameter, 0);
     }
     lifetime.block(&function.body);
+    let call_live_out = CallLiveAnalyzer::function(function);
 
     let mut function_locals: Vec<LocalId> = lifetime
         .starts
@@ -367,6 +701,7 @@ fn allocate_function(
             .unwrap_or(0),
         spills,
         vector_home_limit: local_vector_regs,
+        call_live_out,
     })
 }
 
@@ -384,10 +719,13 @@ struct Generator<'a> {
     allocation_scalar_homes: usize,
     allocation_spills: usize,
     allocation_vector_home_limit: usize,
+    call_live_out: HashMap<usize, HashSet<LocalId>>,
+    protected: [usize; ALLOCATABLE_REGS],
     next_label: usize,
     controls: Vec<ControlTarget>,
     switch_labels: Vec<Vec<(usize, String)>>,
     function_labels: Vec<String>,
+    function_names: &'a [String],
     current_function: Option<FunctionId>,
     current_return_type: Type,
     current_frame_words: usize,
@@ -421,6 +759,8 @@ impl<'a> Generator<'a> {
             allocation_scalar_homes: 0,
             allocation_spills: 0,
             allocation_vector_home_limit: MAX_LOCAL_VECTOR_REGS,
+            call_live_out: HashMap::new(),
+            protected: [0; ALLOCATABLE_REGS],
             next_label: 0,
             controls: Vec::new(),
             switch_labels: Vec::new(),
@@ -429,6 +769,7 @@ impl<'a> Generator<'a> {
                 .iter()
                 .map(|name| format!("__warpc_fn_{name}"))
                 .collect(),
+            function_names: &program.function_names,
             current_function: None,
             current_return_type: Type::VOID,
             current_frame_words: 0,
@@ -511,6 +852,8 @@ impl<'a> Generator<'a> {
         self.allocation_scalar_homes = allocation.scalar_homes;
         self.allocation_spills = allocation.spills;
         self.allocation_vector_home_limit = allocation.vector_home_limit;
+        self.call_live_out = allocation.call_live_out;
+        self.protected.fill(0);
         self.controls.clear();
         self.switch_labels.clear();
         self.current_guard = None;
@@ -1028,7 +1371,9 @@ impl<'a> Generator<'a> {
                 subtract,
             } => {
                 let pointer = self.expr(pointer)?;
+                self.protect(pointer);
                 let index = self.expr(index)?;
+                self.unprotect(pointer);
                 let scaled = if *scale == 1 {
                     index
                 } else {
@@ -1055,7 +1400,9 @@ impl<'a> Generator<'a> {
             }
             TypedExprKind::PointerDiff { left, right, scale } => {
                 let left = self.expr(left)?;
+                self.protect(left);
                 let right = self.expr(right)?;
+                self.unprotect(left);
                 let delta = self.alloc_reg(expr.span)?;
                 self.instr(&format!("SUB r{delta}, r{}, r{}", left.reg, right.reg));
                 self.release(left);
@@ -1084,9 +1431,13 @@ impl<'a> Generator<'a> {
                 operation_type,
                 scale,
             } => self.assignment(target, *op, right, *operation_type, *scale, expr),
-            TypedExprKind::Call { function, args } => {
-                self.call(*function, args, expr.ty, expr.span)
-            }
+            TypedExprKind::Call { function, args } => self.call(
+                *function,
+                args,
+                expr.ty,
+                expr.span,
+                expr as *const TypedExpr as usize,
+            ),
             TypedExprKind::Inline { statements, result } => {
                 for statement in statements {
                     match statement {
@@ -1117,23 +1468,35 @@ impl<'a> Generator<'a> {
                     let mnemonic = if *increment { "ADD" } else { "SUB" };
                     let updated = self.alloc_reg(expr.span)?;
                     self.instr(&format!("{mnemonic} r{updated}, r{}, {scale}", current.reg));
-                    self.store_lvalue(target, updated, expr.span)?;
-                    self.free_reg(updated);
-                    self.release(current);
-                    Ok(Value {
+                    let old_value = Value {
                         reg: old,
                         owned: true,
-                    })
+                    };
+                    let updated_value = Value {
+                        reg: updated,
+                        owned: true,
+                    };
+                    self.protect(old_value);
+                    self.protect(updated_value);
+                    self.store_lvalue(target, updated, expr.span)?;
+                    self.unprotect(updated_value);
+                    self.unprotect(old_value);
+                    self.free_reg(updated);
+                    self.release(current);
+                    Ok(old_value)
                 } else {
                     let mnemonic = if *increment { "ADD" } else { "SUB" };
                     let updated = self.alloc_reg(expr.span)?;
                     self.instr(&format!("{mnemonic} r{updated}, r{}, {scale}", current.reg));
-                    self.store_lvalue(target, updated, expr.span)?;
-                    self.release(current);
-                    Ok(Value {
+                    let updated_value = Value {
                         reg: updated,
                         owned: true,
-                    })
+                    };
+                    self.protect(updated_value);
+                    self.store_lvalue(target, updated, expr.span)?;
+                    self.unprotect(updated_value);
+                    self.release(current);
+                    Ok(updated_value)
                 }
             }
         }
@@ -1170,10 +1533,7 @@ impl<'a> Generator<'a> {
                 })
             }
             Intrinsic::Argb => {
-                let mut values = Vec::with_capacity(args.len());
-                for arg in args {
-                    values.push(self.expr(arg)?);
-                }
+                let values = self.expr_values(args)?;
                 let out = self.alloc_reg(span)?;
                 self.instr(&format!("AND r{out}, r{}, 255", values[0].reg));
                 self.release(values[0]);
@@ -1195,9 +1555,11 @@ impl<'a> Generator<'a> {
                 })
             }
             Intrinsic::SetPixel => {
-                let x = self.expr(&args[0])?;
-                let y = self.expr(&args[1])?;
-                let colour = self.expr(&args[2])?;
+                let values = self.expr_values(args)?;
+                let [x, y, colour] = values.as_slice() else {
+                    unreachable!("set_pixel arity checked by semantic analysis")
+                };
+                let (x, y, colour) = (*x, *y, *colour);
                 let address = self.alloc_reg(span)?;
                 self.instr(&format!("MUL r{address}, r{}, {WARP_VIDEO_WIDTH}", y.reg));
                 self.release(y);
@@ -1213,9 +1575,11 @@ impl<'a> Generator<'a> {
                 })
             }
             Intrinsic::Send => {
-                let destination = self.expr(&args[0])?;
-                let message_type = self.expr(&args[1])?;
-                let payload = self.expr(&args[2])?;
+                let values = self.expr_values(args)?;
+                let [destination, message_type, payload] = values.as_slice() else {
+                    unreachable!("warp_send arity checked by semantic analysis")
+                };
+                let (destination, message_type, payload) = (*destination, *message_type, *payload);
                 self.instr(&format!(
                     "SEND r{}, r{}, r{}",
                     destination.reg, message_type.reg, payload.reg
@@ -1229,8 +1593,11 @@ impl<'a> Generator<'a> {
                 })
             }
             Intrinsic::TryRecv => {
-                let payload_address = self.expr(&args[0])?;
-                let metadata_address = self.expr(&args[1])?;
+                let values = self.expr_values(args)?;
+                let [payload_address, metadata_address] = values.as_slice() else {
+                    unreachable!("warp_try_recv arity checked by semantic analysis")
+                };
+                let (payload_address, metadata_address) = (*payload_address, *metadata_address);
                 let payload = self.alloc_reg(span)?;
                 let metadata = self.alloc_reg(span)?;
                 let received = self.alloc_reg(span)?;
@@ -1264,7 +1631,9 @@ impl<'a> Generator<'a> {
                 if let TypedExprKind::Literal(lane) = args[1].kind {
                     self.instr(&format!("BROADCAST r{out}, r{}, {lane}", value.reg));
                 } else {
+                    self.protect(value);
                     let lane = self.expr(&args[1])?;
+                    self.unprotect(value);
                     self.instr(&format!("SHUFFLE r{out}, r{}, r{}", value.reg, lane.reg));
                     self.release(lane);
                 }
@@ -1276,7 +1645,9 @@ impl<'a> Generator<'a> {
             }
             Intrinsic::Shuffle => {
                 let value = self.expr(&args[0])?;
+                self.protect(value);
                 let lane = self.expr(&args[1])?;
+                self.unprotect(value);
                 let out = self.alloc_reg(span)?;
                 self.instr(&format!("SHUFFLE r{out}, r{}, r{}", value.reg, lane.reg));
                 self.release(value);
@@ -1390,7 +1761,9 @@ impl<'a> Generator<'a> {
             | Intrinsic::MinSigned
             | Intrinsic::MaxSigned => {
                 let left = self.expr(&args[0])?;
+                self.protect(left);
                 let right = self.expr(&args[1])?;
+                self.unprotect(left);
                 let signed = matches!(intrinsic, Intrinsic::MinSigned | Intrinsic::MaxSigned);
                 let maximum = matches!(intrinsic, Intrinsic::MaxSigned | Intrinsic::MaxUnsigned);
                 let (left, right) = if signed {
@@ -1543,24 +1916,56 @@ impl<'a> Generator<'a> {
         args: &[TypedExpr],
         return_type: Type,
         span: Span,
+        call_site: usize,
     ) -> Result<Value, Diagnostic> {
-        let mut values = Vec::new();
-        for arg in args {
-            values.push(self.expr(arg)?);
-        }
+        let values = self.expr_values(args)?;
 
-        let saved: Vec<u8> = self
-            .used
+        let semantic_live = self.call_live_out.get(&call_site).cloned().ok_or_else(|| {
+            Diagnostic::new(
+                span,
+                "internal error: missing call-site live-out information",
+            )
+        })?;
+        let mut semantic_locals: Vec<LocalId> = semantic_live.iter().copied().collect();
+        semantic_locals.sort_unstable();
+        let mut saved = Vec::new();
+        let mut saved_scalars = Vec::new();
+        let mut saved_vector_homes = Vec::new();
+        let mut saved_scalar_homes = Vec::new();
+        let mut memory_resident = Vec::new();
+        for &local in &semantic_locals {
+            match self.local_storage[local] {
+                Some(LocalStorage::Vector(reg)) => {
+                    if !saved.contains(&reg) {
+                        saved.push(reg);
+                    }
+                    saved_vector_homes.push(format!("{}->r{reg}", self.locals[local].name));
+                }
+                Some(LocalStorage::Scalar(reg)) => {
+                    if !saved_scalars.contains(&reg) {
+                        saved_scalars.push(reg);
+                    }
+                    saved_scalar_homes.push(format!("{}->s{reg}", self.locals[local].name));
+                }
+                Some(LocalStorage::Frame(offset)) => {
+                    memory_resident.push(format!("{}->frame[{offset}]", self.locals[local].name));
+                }
+                None => {}
+            }
+        }
+        let protected_vectors: Vec<u8> = self
+            .protected
             .iter()
             .enumerate()
-            .filter_map(|(reg, used)| used.then_some(reg as u8))
+            .filter_map(|(reg, count)| (*count != 0).then_some(reg as u8))
             .collect();
-        let saved_scalars: Vec<u8> = self
-            .scalar_used
-            .iter()
-            .enumerate()
-            .filter_map(|(reg, used)| used.then_some(reg as u8))
-            .collect();
+        for &reg in &protected_vectors {
+            if !saved.contains(&reg) {
+                saved.push(reg);
+            }
+        }
+        saved.sort_unstable();
+        saved_scalars.sort_unstable();
         // Stage every argument in ABI-owned stack slots. The old lowering
         // reloaded arguments from their incidental caller-save slots, which
         // was invalid for values such as WARP in reserved r13 and needlessly
@@ -1569,6 +1974,77 @@ impl<'a> Generator<'a> {
         let return_slot = (return_type != Type::VOID).then_some(argument_base + values.len());
         let frame_slots = argument_base + values.len() + usize::from(return_slot.is_some());
         let frame_words = frame_slots * 32;
+        let allocator_active_vector_homes: Vec<String> = self
+            .local_active
+            .iter()
+            .enumerate()
+            .filter_map(
+                |(local, active)| match (*active, self.local_storage[local]) {
+                    (true, Some(LocalStorage::Vector(reg))) => {
+                        Some(format!("r{reg}={}", self.locals[local].name))
+                    }
+                    _ => None,
+                },
+            )
+            .collect();
+        let allocator_active_scalar_homes: Vec<String> = self
+            .local_active
+            .iter()
+            .enumerate()
+            .filter_map(
+                |(local, active)| match (*active, self.local_storage[local]) {
+                    (true, Some(LocalStorage::Scalar(reg))) => {
+                        Some(format!("s{reg}={}", self.locals[local].name))
+                    }
+                    _ => None,
+                },
+            )
+            .collect();
+        let semantic_names: Vec<&str> = semantic_locals
+            .iter()
+            .map(|local| self.locals[*local].name.as_str())
+            .collect();
+        let protected_names: Vec<String> = protected_vectors
+            .iter()
+            .map(|reg| format!("r{reg}"))
+            .collect();
+        let target_name = self.function_names[function].clone();
+        self.line(&format!(
+            "; call {target_name}: allocator_active_vector_homes={} [{}] allocator_active_scalar_homes={} [{}]",
+            allocator_active_vector_homes.len(),
+            allocator_active_vector_homes.join(", "),
+            allocator_active_scalar_homes.len(),
+            allocator_active_scalar_homes.join(", ")
+        ));
+        self.line(&format!(
+            "; call {target_name}: semantic_live_out={} [{}] saved_vector_homes={} [{}] saved_scalar_homes={} [{}] memory_resident={} [{}] protected_temporaries={} [{}]",
+            semantic_names.len(),
+            semantic_names.join(", "),
+            saved_vector_homes.len(),
+            saved_vector_homes.join(", "),
+            saved_scalar_homes.len(),
+            saved_scalar_homes.join(", "),
+            memory_resident.len(),
+            memory_resident.join(", "),
+            protected_names.len(),
+            protected_names.join(", ")
+        ));
+        self.line(&format!(
+            "; call {target_name}: saved_vector_slots={} saved_scalar_slots={} argument_slots={} return_slots={} call_frame_slots={} call_frame_words={}",
+            saved.len(),
+            saved_scalars.len(),
+            values.len(),
+            usize::from(return_slot.is_some()),
+            frame_slots,
+            frame_words
+        ));
+        self.line(&format!(
+            "; call {target_name}: dynamic_memory_instructions={} dynamic_lane_word_accesses={} caller_fixed_frame_words_per_lane={} allocator_spill_slots_per_lane={}",
+            frame_slots * 2,
+            frame_slots * 64,
+            self.current_frame_words,
+            self.allocation_spills
+        ));
         if frame_words != 0 {
             self.instr(&format!(
                 "S_ADD_I {STACK_POINTER}, {STACK_POINTER}, -{frame_words}"
@@ -1693,7 +2169,9 @@ impl<'a> Generator<'a> {
             return self.logical(op, left_expr, right_expr, expr.span);
         }
         let left = self.expr(left_expr)?;
+        self.protect(left);
         let right = self.expr(right_expr)?;
+        self.unprotect(left);
         let out = self.emit_binary(op, left.reg, right.reg, operand_type, expr.span)?;
         self.release(left);
         self.release(right);
@@ -1720,7 +2198,15 @@ impl<'a> Generator<'a> {
                 self.instr(&format!("MOV r{out}, 0"));
                 self.instr("NOTMASK p1, p0");
                 self.instr(&format!("JMP_IF_ANY p1, {end}"));
+                self.protect(Value {
+                    reg: out,
+                    owned: true,
+                });
                 let right = self.expr(right_expr)?;
+                self.unprotect(Value {
+                    reg: out,
+                    owned: true,
+                });
                 self.instr(&format!("CMP_NE p0, r{}, 0", right.reg));
                 self.release(right);
                 self.guarded_instr(0, false, &format!("MOV r{out}, 1"));
@@ -1728,7 +2214,15 @@ impl<'a> Generator<'a> {
             BinaryOp::LogicalOr => {
                 self.instr(&format!("MOV r{out}, 1"));
                 self.instr(&format!("JMP_IF_ANY p0, {end}"));
+                self.protect(Value {
+                    reg: out,
+                    owned: true,
+                });
                 let right = self.expr(right_expr)?;
+                self.unprotect(Value {
+                    reg: out,
+                    owned: true,
+                });
                 self.instr(&format!("CMP_EQ p0, r{}, 0", right.reg));
                 self.release(right);
                 self.guarded_instr(0, false, &format!("MOV r{out}, 0"));
@@ -1752,11 +2246,14 @@ impl<'a> Generator<'a> {
         expr: &TypedExpr,
     ) -> Result<Value, Diagnostic> {
         let right = self.expr(right_expr)?;
+        self.protect(right);
         if op == AssignOp::Assign {
             self.store_lvalue(target, right.reg, expr.span)?;
+            self.unprotect(right);
             Ok(right)
         } else {
             let current = self.load_lvalue(target, expr.span)?;
+            self.unprotect(right);
             let right = if scale == 1 {
                 right
             } else {
@@ -1773,11 +2270,14 @@ impl<'a> Generator<'a> {
                 self.emit_binary(binary, current.reg, right.reg, operation_type, expr.span)?;
             self.release(current);
             self.release(right);
-            self.store_lvalue(target, out, expr.span)?;
-            Ok(Value {
+            let output = Value {
                 reg: out,
                 owned: true,
-            })
+            };
+            self.protect(output);
+            self.store_lvalue(target, out, expr.span)?;
+            self.unprotect(output);
+            Ok(output)
         }
     }
 
@@ -1984,7 +2484,9 @@ impl<'a> Generator<'a> {
             LValue::Deref(pointer) => self.expr(pointer),
             LValue::Index { base, index, scale } => {
                 let base = self.expr(base)?;
+                self.protect(base);
                 let index = self.expr(index)?;
+                self.unprotect(base);
                 let scaled = if *scale == 1 {
                     index
                 } else {
@@ -2118,6 +2620,32 @@ impl<'a> Generator<'a> {
         if value.owned {
             self.free_reg(value.reg);
         }
+    }
+
+    fn protect(&mut self, value: Value) {
+        if (value.reg as usize) < ALLOCATABLE_REGS {
+            self.protected[value.reg as usize] += 1;
+        }
+    }
+
+    fn unprotect(&mut self, value: Value) {
+        if (value.reg as usize) < ALLOCATABLE_REGS {
+            debug_assert!(self.protected[value.reg as usize] != 0);
+            self.protected[value.reg as usize] -= 1;
+        }
+    }
+
+    fn expr_values(&mut self, expressions: &[TypedExpr]) -> Result<Vec<Value>, Diagnostic> {
+        let mut values = Vec::with_capacity(expressions.len());
+        for expression in expressions {
+            let value = self.expr(expression)?;
+            self.protect(value);
+            values.push(value);
+        }
+        for &value in &values {
+            self.unprotect(value);
+        }
+        Ok(values)
     }
 
     fn update_peak_vector_regs(&mut self) {
@@ -2323,6 +2851,154 @@ mod tests {
         // valid STORE sources for dedicated argument staging slots.
         assert!(text.contains("STORE r14, r13"), "{text}");
         assert!(!text.contains("argument register was not saved"));
+    }
+
+    #[test]
+    fn call_diagnostics_separate_save_transport_and_fixed_frames() {
+        let almost_empty = assembly(
+            "int id(int x) { if (x) return x; return 0; } int main(void) { return id(WARP); }",
+        );
+        assert!(almost_empty.contains(
+            "; call id: saved_vector_slots=0 saved_scalar_slots=0 argument_slots=1 return_slots=1 call_frame_slots=2 call_frame_words=64"
+        ), "{almost_empty}");
+        assert!(almost_empty.contains(
+            "; call id: dynamic_memory_instructions=4 dynamic_lane_word_accesses=128 caller_fixed_frame_words_per_lane=0 allocator_spill_slots_per_lane=0"
+        ), "{almost_empty}");
+
+        let live_caller = assembly(
+            "int id(int x) { if (x) return x; return 0; } int main(void) { int a=WARP+1; int b=WARP+2; int c=WARP+3; int d=WARP+4; return id(WARP)+a+b+c+d; }",
+        );
+        assert!(live_caller.contains(
+            "; call id: saved_vector_slots=4 saved_scalar_slots=0 argument_slots=1 return_slots=1 call_frame_slots=6 call_frame_words=192"
+        ), "{live_caller}");
+        assert!(
+            live_caller.contains("allocator_active_vector_homes=4 [r0=a, r1=b, r2=c, r3=d]"),
+            "{live_caller}"
+        );
+
+        let many_live = assembly(
+            "int id(int x) { if (x) return x; return 0; } int main(void) { int a=WARP+1; int b=WARP+2; int c=WARP+3; int d=WARP+4; int e=WARP+5; int f=WARP+6; int u=11; int v=13; int w=17; return id(WARP)+a+b+c+d+e+f+u+v+w; }",
+        );
+        assert!(many_live.contains(
+            "; call id: saved_vector_slots=6 saved_scalar_slots=3 argument_slots=1 return_slots=1 call_frame_slots=11 call_frame_words=352"
+        ), "{many_live}");
+        assert!(
+            many_live.contains("allocator_active_scalar_homes=3 [s0=u, s1=v, s2=w]"),
+            "{many_live}"
+        );
+    }
+
+    #[test]
+    fn call_live_out_is_definition_sensitive_across_control_flow() {
+        let helper = "int id(int x) { if (x < 0) return 0; return x; }";
+
+        let dead = assembly(&format!(
+            "{helper} int main(void) {{ int a=WARP+1; id(3); a=7; return a; }}"
+        ));
+        assert!(dead.contains("; call id: semantic_live_out=0 []"), "{dead}");
+        assert!(
+            dead.contains("saved_vector_slots=0 saved_scalar_slots=0"),
+            "{dead}"
+        );
+
+        for source in [
+            format!("{helper} int main(void) {{ int a=WARP+1; id(3); return a; }}"),
+            format!("{helper} int main(void) {{ int a=WARP+1; id(3); a=a+1; return a; }}"),
+        ] {
+            let live = assembly(&source);
+            assert!(live.contains("semantic_live_out=1 [a]"), "{live}");
+            assert!(live.contains("saved_vector_homes=1 [a->r0]"), "{live}");
+        }
+
+        let branch_union = assembly(&format!(
+            "{helper} int main(void) {{ int a=WARP+1; int b=WARP+2; int out; id(3); if(warp_vm_id()) out=a; else out=b; return out; }}"
+        ));
+        assert!(
+            branch_union.contains("semantic_live_out=2 [a, b]"),
+            "{branch_union}"
+        );
+
+        let branch_kill = assembly(&format!(
+            "{helper} int main(void) {{ int a=WARP+1; id(3); if(warp_vm_id()) a=1; else a=2; return a; }}"
+        ));
+        assert!(
+            branch_kill.contains("; call id: semantic_live_out=0 []"),
+            "{branch_kill}"
+        );
+
+        let loop_carried = assembly(&format!(
+            "{helper} int main(void) {{ int a=WARP; for(int i=0;i<3;++i) a=a+id(i); return a; }}"
+        ));
+        assert!(
+            loop_carried.contains("semantic_live_out=2 [a, i]"),
+            "{loop_carried}"
+        );
+        assert!(
+            loop_carried.contains("saved_vector_homes=1 [a->r0] saved_scalar_homes=1 [i->s0]"),
+            "{loop_carried}"
+        );
+
+        let while_carried = assembly(&format!(
+            "{helper} int main(void) {{ int a=WARP; int i=0; while(i<3) {{ a=a+id(i); ++i; }} return a; }}"
+        ));
+        assert!(
+            while_carried.contains("semantic_live_out=2 [a, i]"),
+            "{while_carried}"
+        );
+
+        let do_carried = assembly(&format!(
+            "{helper} int main(void) {{ int a=WARP; int i=0; do {{ a=a+id(i); ++i; }} while(i<3); return a; }}"
+        ));
+        assert!(
+            do_carried.contains("semantic_live_out=2 [a, i]"),
+            "{do_carried}"
+        );
+
+        let switch_union = assembly(&format!(
+            "{helper} int main(void) {{ int a=WARP+1; int b=WARP+2; int out; id(3); switch(warp_vm_id()) {{ case 0: out=a; break; default: out=b; }} return out; }}"
+        ));
+        assert!(
+            switch_union.contains("semantic_live_out=2 [a, b]"),
+            "{switch_union}"
+        );
+
+        let many_dead = assembly(&format!(
+            "{helper} int main(void) {{ int a=WARP+1; int b=WARP+2; int c=WARP+3; int d=WARP+4; int e=WARP+5; int f=WARP+6; id(3); return 42; }}"
+        ));
+        assert!(
+            many_dead.contains("saved_vector_slots=0 saved_scalar_slots=0"),
+            "{many_dead}"
+        );
+    }
+
+    #[test]
+    fn calls_preserve_crossing_temporaries_without_resaving_spills() {
+        let nested = assembly(
+            "int id(int x) { if(x<0)return 0; return x; } int main(void) { return id(WARP)+id(WARP+1); }",
+        );
+        assert_eq!(
+            nested.matches("; call id: semantic_live_out=0 []").count(),
+            2,
+            "{nested}"
+        );
+        assert!(nested.contains("protected_temporaries=1 [r0]"), "{nested}");
+        assert!(nested.contains("saved_vector_slots=1 saved_scalar_slots=0 argument_slots=1 return_slots=1 call_frame_slots=3 call_frame_words=96"), "{nested}");
+
+        let spills = assembly(
+            "int id(int x) { if(x<0)return 0; return x; } int main(void) { int a=WARP+1; int b=WARP+2; int c=WARP+3; int d=WARP+4; int e=WARP+5; int f=WARP+6; int g=WARP+7; int h=WARP+8; int i=WARP+9; int j=WARP+10; int r=id(5); return a+b+c+d+e+f+g+h+i+j+r; }",
+        );
+        assert!(
+            spills.contains("semantic_live_out=10 [a, b, c, d, e, f, g, h, i, j]"),
+            "{spills}"
+        );
+        assert!(
+            spills.contains("memory_resident=2 [i->frame[0], j->frame[1]]"),
+            "{spills}"
+        );
+        assert!(
+            spills.contains("saved_vector_slots=8 saved_scalar_slots=0"),
+            "{spills}"
+        );
     }
 
     #[test]

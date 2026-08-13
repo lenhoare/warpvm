@@ -1,0 +1,145 @@
+#include <warp.h>
+
+/* Control flow keeps these helpers and every test wrapper on CALL/RET. */
+unsigned identity(unsigned value)
+{
+    if (value == 0xffffffffu)
+        return 0u;
+    return value;
+}
+
+unsigned add_pair(unsigned a, unsigned b)
+{
+    if (a == 0xffffffffu)
+        return 0u;
+    return a + b;
+}
+
+unsigned test_dead_overwrite(void)
+{
+    unsigned a = WARP + 1u;
+    identity(3u);
+    a = 7u;
+    return a == 7u;
+}
+
+unsigned test_read_after(void)
+{
+    unsigned a = WARP + 1u;
+    identity(3u);
+    return a == WARP + 1u;
+}
+
+unsigned test_read_modify_write(void)
+{
+    unsigned a = WARP + 1u;
+    identity(3u);
+    a = a + 1u;
+    return a == WARP + 2u;
+}
+
+unsigned test_branch_union(void)
+{
+    unsigned a = WARP + 11u;
+    unsigned b = WARP + 17u;
+    unsigned selected;
+    identity(3u);
+    if (warp_vm_id() == 0u)
+        selected = a;
+    else
+        selected = b;
+    return selected == WARP + 11u;
+}
+
+unsigned test_branch_kill(void)
+{
+    unsigned a = WARP + 1u;
+    identity(3u);
+    if (warp_vm_id() == 0u)
+        a = 19u;
+    else
+        a = 23u;
+    return a == 19u;
+}
+
+unsigned test_loop_carried(void)
+{
+    unsigned carried = WARP;
+    for (unsigned i = 0u; i < 5u; ++i) {
+        carried = carried + identity(i);
+        if (i == 1u)
+            continue;
+        if (i == 3u)
+            break;
+        carried = carried + 10u;
+    }
+    return carried == WARP + 26u;
+}
+
+unsigned test_many_dead(void)
+{
+    unsigned a = WARP + 1u;
+    unsigned b = WARP + 2u;
+    unsigned c = WARP + 3u;
+    unsigned d = WARP + 4u;
+    unsigned e = WARP + 5u;
+    unsigned f = WARP + 6u;
+    identity(3u);
+    return 1u;
+}
+
+unsigned test_spilled_live(void)
+{
+    unsigned a = WARP + 1u;
+    unsigned b = WARP + 2u;
+    unsigned c = WARP + 3u;
+    unsigned d = WARP + 4u;
+    unsigned e = WARP + 5u;
+    unsigned f = WARP + 6u;
+    unsigned g = WARP + 7u;
+    unsigned h = WARP + 8u;
+    unsigned i = WARP + 9u;
+    unsigned j = WARP + 10u;
+    unsigned result = identity(5u);
+    unsigned sum = a + b + c + d + e + f + g + h + i + j + result;
+    return sum == WARP * 10u + 60u;
+}
+
+unsigned test_genuine_high_live(void)
+{
+    unsigned a = WARP + 1u;
+    unsigned b = WARP + 2u;
+    unsigned c = WARP + 3u;
+    unsigned d = WARP + 4u;
+    unsigned e = WARP + 5u;
+    unsigned f = WARP + 6u;
+    unsigned u = 11u;
+    unsigned v = 13u;
+    unsigned w = 17u;
+    unsigned result = identity(WARP);
+    unsigned sum = a + b + c + d + e + f + u + v + w + result;
+    return sum == WARP * 7u + 62u;
+}
+
+unsigned test_ordered_calls(void)
+{
+    unsigned direct = identity(WARP) + identity(WARP + 1u);
+    unsigned arguments = add_pair(identity(WARP), identity(WARP + 1u));
+    return (direct == WARP * 2u + 1u) & (arguments == direct);
+}
+
+int main(void)
+{
+    unsigned ok = 1u;
+    ok = ok & test_dead_overwrite();
+    ok = ok & test_read_after();
+    ok = ok & test_read_modify_write();
+    ok = ok & test_branch_union();
+    ok = ok & test_branch_kill();
+    ok = ok & test_loop_carried();
+    ok = ok & test_many_dead();
+    ok = ok & test_spilled_live();
+    ok = ok & test_genuine_high_live();
+    ok = ok & test_ordered_calls();
+    return warp_all(ok) ? 42 : 0;
+}

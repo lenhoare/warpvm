@@ -794,3 +794,119 @@ On the 64-VM warp-native graphics/message capstone, the interpreter averaged
 43.46 published frames/s per VM and compiled resident PTX averaged 792.55,
 an 18.24x improvement. All machines remained healthy, exchanged messages,
 published frames, accepted pause/resume, and shut down cleanly.
+
+## 28. Warp C call frames preserve allocator activity, not call live-out
+
+**Discovered by:** `count_chunk` call-frame accounting
+
+**Classification:** compiler-only optimization opportunity; no ISA/ABI change
+
+Warp C's software call frame is a sequence of 32-word lane slots. It contains,
+in order, every currently marked vector register, every currently marked
+scalar register (broadcast into 32 identical words), dedicated argument
+slots, and an optional return slot. Every slot is both written and read on
+every invocation; moving `s7` reserves the range, but the lowering is not
+lazy. The architectural `CALL` stack contains only the VM-wide return PC and
+is separate from this RAM frame.
+
+The histogram's original 320-word first call was six vector saves (192
+words), three scalar saves (96), and one return slot (32). At that time the
+compiler reused caller-save slots as argument transport. Dedicated argument
+staging, required so values such as `WARP` can be passed safely, makes the
+same current call 384 words by adding two 32-word argument slots. The callee
+`count_chunk` itself has no allocator spill frame.
+
+The old layout was offsets 0..191 for `r0`..`r5`, 192..287 for `s0`..`s2`,
+and 288..319 for the return. It executed 22 frame `LOAD`/`STORE` instructions:
+18 for save/restore, two extra argument reloads from those save slots, and two
+for the return, or 704 architectural lane-word accesses. The current layout
+keeps the first nine slots, puts arguments at 288..351 and the return at
+352..383, and executes 24 frame memory instructions / 768 lane-word accesses.
+These are architectural word accesses; the GPU may coalesce them into fewer
+physical memory transactions.
+
+No predicate, active-mask, or software-stack metadata is hidden in the frame.
+Ordinary non-inlined calls are permitted only under uniform control, predicates
+are scratch, `r13` remains the lane ID, `r14`/`r15` are address/save scratch,
+and `s7` is adjusted then restored. `CALL`/`RET` push and pop their continuation
+through the VM's separate eight-entry architectural call stack.
+
+The excess is caused by the lifetime collector's first-touch-to-last-touch
+intervals. A declaration and an assignment target both count as touches, so
+the first histogram call considers `hits`, `sample`, `index`, `live`,
+`expected`, `base`, and two later reduction locals active even though none of
+their current values is used after that call. It also saves a transient
+literal register. Thus none of the nine saved caller registers at that call
+is genuinely live across it; only the two arguments and return transport are
+semantically required by the current convention.
+
+Generated assembly now includes permanent `; call ...` diagnostics separating
+allocator-active vector/scalar homes, transient vectors, arguments, return,
+RAM frame words, dynamic memory instructions, lane-word accesses, and the
+caller's independent fixed spill frame. Measurements were:
+
+| case | vector saves | scalar saves | args + return | call frame | lane-word accesses |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `identity(WARP)`, no caller value live | 0 | 0 | 2 slots | 64 words | 128 |
+| `identity(WARP)`, 6 vector + 3 scalar values live | 6 | 3 | 2 slots | 352 words | 704 |
+| first histogram `count_chunk(WARP, 1)` | 6 | 3 | 3 slots | 384 words | 768 |
+| histogram loop `count_chunk(sample, live)` | 5 | 1 | 3 slots | 288 words | 576 |
+
+The smallest sound next step is a backward live-out analysis at call
+expressions and saving only homes whose current definitions survive the call.
+The existing interval allocation and per-call `used` set already provide the
+register/home mapping, but not definition-sensitive live-out information.
+This can remain entirely in `warpc`; the caller-save CALL/RET architecture,
+dedicated argument staging, and architectural register file need not change.
+A later independent optimization could store uniform scalar saves as one word
+instead of 32 identical lane copies.
+
+## 29. CALL preservation follows semantic value live-out
+
+**Discovered by:** histogram `count_chunk` optimization
+
+**Classification:** compiler implementation; no ISA/ABI change
+
+Warp C now performs a separate backward analysis over its typed structured
+representation. The analysis tracks semantic local IDs and annotates each
+genuine `Call` expression with values live immediately after it. A local read
+generates liveness; a plain local assignment or declaration kills the previous
+value before analyzing its right-hand side; compound assignment and inc/dec
+also generate the old value. Branch successors are unioned. While, do/while,
+and for loops iterate monotonically to a fixed point over their backedges;
+break exits use loop/switch live-out and continue edges use condition/step
+live-in. Inline expansions are analyzed as ordinary statements and expressions
+and create no CALL annotation.
+
+Expression order is handled twice. The semantic pass carries dependencies of
+an already-evaluated direct local value into later operands and arguments.
+Code generation additionally protects all concrete vector results retained
+while a later subexpression is generated. Thus `f(a) + g(b)` saves the first
+result across `g`, including when it is a temporary rather than a named local.
+Current call arguments remain dedicated, evaluated-once stack slots and are
+not mistaken for crossing temporaries.
+
+At lowering, live semantic locals map to their allocator homes. Vector and
+scalar homes are saved once even if aliases share a home. Frame/spill locals
+are reported as memory-resident and need no duplicate preservation because a
+callee's stack allocation grows below the caller frame. Reserved `r13` and
+scratch `r14`/`r15` retain their existing ABI meanings.
+
+Histogram results were:
+
+| call | old frame | new semantic saves | new frame | old/new memory ops | old/new lane-word accesses |
+| --- | ---: | --- | ---: | ---: | ---: |
+| first `count_chunk(WARP, 1)` | 384 | none | 96 | 24 / 6 | 768 / 192 |
+| loop `count_chunk(sample, live)` | 288 | `hits` vector, `base` scalar | 160 | 18 / 10 | 576 / 320 |
+
+The complete histogram artifact fell from 673 to 407 words. Interpreter
+retirement fell from 6,945 to 6,583 instructions, 362 fewer or 5.21%, while
+the result remained 42 and native compiled state/memory/framebuffer
+equivalence passed. A deliberately high-live call saved six vector and three
+scalar homes in a 352-word frame. A spill regression reported two live values
+as `memory_resident` and did not duplicate them in the call save set.
+
+Permanent emitted comments now show allocator-active homes, semantic live-out,
+saved vector/scalar mappings, memory-resident live values, protected expression
+temporaries, frame words, memory instructions, and architectural lane-word
+accesses at every genuine call.

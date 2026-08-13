@@ -197,12 +197,20 @@ Warp C's first calling convention is deliberately small:
 
 Entry initializes `s7` to word address 16,384. The software stack grows down.
 Every saved vector value occupies 32 consecutive words: slot lane `i` belongs
-to lane `i`. A call frame stores live caller vector and scalar registers in
-ascending register order and, for non-void calls, one return-value slot after them. Arguments are
-then loaded into `r0`–`r3`; after `RET`, the return is parked in its stack slot,
+to lane `i`. A call frame currently stores every allocator-active caller
+vector and scalar register in ascending register order, followed by dedicated
+argument slots and, for a non-void call, one return-value slot. Arguments are
+loaded into `r0`–`r3`; after `RET`, the return is parked in its stack slot,
 caller registers are restored, and the result is reloaded into a free
-temporary. This layout is somewhat verbose but already preserves genuinely
-lane-varying values correctly.
+temporary. Uniform scalar saves currently replicate the same value into all
+32 lane words. This layout is deliberately conservative and preserves
+genuinely lane-varying values correctly, but allocator-active intervals can be
+larger than the values genuinely live across a particular call. A second
+backward pass therefore annotates every real call with definition-sensitive
+semantic live-out. CALL lowering saves only those register homes plus any
+already-evaluated expression temporaries that must survive a nested or later
+call; live values whose authoritative home is already in the function's RAM
+frame need no duplicate call save.
 
 Before assembly lowering, a small structured lifetime pass records every
 local's first and last required program point. Lifetimes are conservatively
