@@ -334,7 +334,7 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err,
              << "    setp.lt.u32 %p5, " << VReg(rs1) << ", "
              << kVideoEndWord << ";\n"
              << "    and.pred %p4, %p4, %p5;\n"
-             << "    setp.ne.u64 %p6, %rd8, 0;\n"
+             << "    setp.ne.u64 %p6, %rd9, 0;\n"
              << "    and.pred %p4, %p4, %p6;\n"
              << "    and.pred %p4, %p4, %p2;\n"
              << "    @%p4 sub.u32 %t8, " << VReg(rs1) << ", "
@@ -365,7 +365,7 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err,
              << "    setp.lt.u32 %p5, " << VReg(rd) << ", "
              << kVideoEndWord << ";\n"
              << "    and.pred %p4, %p4, %p5;\n"
-             << "    setp.ne.u64 %p6, %rd8, 0;\n"
+             << "    setp.ne.u64 %p6, %rd9, 0;\n"
              << "    and.pred %p4, %p4, %p6;\n"
              << "    and.pred %p4, %p4, %p2;\n"
              << "    @%p4 sub.u32 %t8, " << VReg(rd) << ", "
@@ -435,6 +435,12 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err,
         if (rs1 >= kScalarRegs) return reject("invalid scalar broadcast source");
         body << predicated << "mov.b32 " << VReg(rd) << ", %s" << rs1
              << ";\n";
+        break;
+      case kSGet:
+        if (rd >= kScalarRegs) return reject("invalid scalar get destination");
+        body << "    shfl.sync.idx.b32 %t8, " << VReg(rs1)
+             << ", 0, 0x1f, 0xffffffff;\n"
+             << predicated << "mov.b32 %s" << rd << ", %t8;\n";
         break;
       case kFlip:
         if (guard != 0) return reject("FLIP cannot be guarded");

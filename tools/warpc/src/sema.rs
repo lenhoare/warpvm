@@ -1602,7 +1602,7 @@ impl Analyzer {
                 operand.uniformity
             };
             if let LValue::Local(local) = &target {
-                self.locals[*local].uniformity = uniformity;
+                self.locals[*local].uniformity = self.locals[*local].uniformity.join(uniformity);
             }
             let scale = if ty.is_pointer() {
                 type_size(ty.pointee().unwrap(), &self.structs)
@@ -1883,7 +1883,7 @@ impl Analyzer {
             left_uniformity.join(right.uniformity)
         };
         if let LValue::Local(local) = &target {
-            self.locals[*local].uniformity = uniformity;
+            self.locals[*local].uniformity = self.locals[*local].uniformity.join(uniformity);
         }
         Ok(TypedExpr {
             kind: TypedExprKind::Assign {
@@ -2490,6 +2490,15 @@ mod tests {
         assert_eq!(p.locals[1].uniformity, Uniformity::Divergent);
         assert_eq!(p.locals[2].uniformity, Uniformity::Divergent);
         assert_eq!(p.locals[3].uniformity, Uniformity::Divergent);
+    }
+
+    #[test]
+    fn local_uniformity_never_downgrades_after_divergent_assignment() {
+        let p = source(
+            "int main(void) { int value=1; if (warp_lane_id()<16) value=2; if (warp_vm_id()==0) value=3; return value; }",
+        )
+        .unwrap();
+        assert_eq!(p.locals[0].uniformity, Uniformity::Divergent);
     }
 
     #[test]

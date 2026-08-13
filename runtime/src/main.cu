@@ -1599,6 +1599,241 @@ bool LaunchPersistentEngine(wvm::PersistentRuntime& runtime,
              reinterpret_cast<CUstream>(runtime.Stream()), err);
 }
 
+struct ResidentFramebufferSnapshot {
+  std::vector<uint32_t> status;
+  std::vector<uint32_t> fault;
+  std::vector<uint32_t> pc;
+  std::vector<uint32_t> frame_seq;
+  std::vector<std::vector<uint32_t>> memory;
+  std::vector<uint32_t> framebuffers;
+};
+
+bool RunResidentToTerminal(const wvm::WvmFile& file, uint32_t num_vms,
+                           uint32_t memory_words, bool compiled,
+                           ResidentFramebufferSnapshot& snapshot,
+                           std::string& err) {
+  std::vector<wvm::VmImage> images(num_vms);
+  for (wvm::VmImage& image : images) {
+    image.code = file.code;
+    image.literals = file.literals;
+    image.mem_size_words = memory_words;
+  }
+
+  wvm::PersistentRuntime runtime;
+  std::unique_ptr<wvm::PtxResidentProgram> artifact;
+  if (!runtime.Init(images, err) ||
+      !LaunchPersistentEngine(runtime, file, compiled, artifact, err))
+    return false;
+
+  runtime.BootAll();
+  bool terminal = false;
+  for (int waited = 0; waited < 5000 && !terminal; ++waited) {
+    terminal = true;
+    for (uint32_t vm = 0; vm < num_vms; ++vm) {
+      const uint32_t status = runtime.Status(vm);
+      terminal &= status == wvm::kHalted || status == wvm::kFaulted;
+    }
+    if (!terminal) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  bool copied = terminal;
+  snapshot.status.resize(num_vms);
+  snapshot.fault.resize(num_vms);
+  snapshot.pc.resize(num_vms);
+  snapshot.frame_seq.resize(num_vms);
+  snapshot.memory.resize(num_vms);
+  for (uint32_t vm = 0; vm < num_vms; ++vm) {
+    snapshot.status[vm] = runtime.Status(vm);
+    snapshot.fault[vm] = runtime.Fault(vm);
+    snapshot.pc[vm] = runtime.Pc(vm);
+    snapshot.frame_seq[vm] = runtime.FrameSeq(vm);
+    copied &= runtime.ReadMem(vm, 0, memory_words, snapshot.memory[vm]);
+  }
+  copied &= runtime.ReadFramebuffers(0, num_vms, snapshot.framebuffers);
+
+  runtime.ShutdownAll();
+  const cudaError_t sync = runtime.Sync();
+  if (!terminal) {
+    err = compiled ? "compiled resident test timed out"
+                   : "interpreted resident test timed out";
+    return false;
+  }
+  if (!copied) {
+    err = "resident test state copy failed";
+    return false;
+  }
+  if (sync != cudaSuccess) {
+    err = std::string("resident test shutdown failed: ") +
+          cudaGetErrorString(sync);
+    return false;
+  }
+  return true;
+}
+
+int RunCompiledResidentFramebufferTests() {
+  constexpr uint32_t kVms = 4;
+  constexpr uint32_t kMemoryWords = 64;
+  wvm::WvmFile program;
+  program.literals = {wvm::kVideoBaseWord};
+  program.code = {
+      wvm::enc_r(wvm::kLaneId, 0, 0, 0, 0),
+      wvm::enc_i(wvm::kLdw, 0, 1, 0, 0),
+      wvm::enc_r(wvm::kAdd, 0, 1, 1, 0),
+      wvm::enc_r(wvm::kVmid, 0, 2, 0, 0),
+      wvm::enc_i(wvm::kAddI, 0, 2, 2, 1),
+      wvm::enc_i(wvm::kShlI, 0, 2, 2, 8),
+      wvm::enc_r(wvm::kAdd, 0, 2, 2, 0),
+      wvm::enc_r(wvm::kStore, 0, 1, 2, 0),
+      wvm::enc_r(wvm::kStore, 0, 0, 2, 0),
+      wvm::enc_r(wvm::kLoad, 0, 3, 1, 0),
+      wvm::enc_i(wvm::kAddI, 0, 4, 0, 32),
+      wvm::enc_r(wvm::kStore, 0, 4, 3, 0),
+      wvm::enc_r(wvm::kFlip, 0, 0, 0, 0),
+      wvm::enc_r(wvm::kHalt, 0, 0, 0, 0),
+  };
+
+  std::string err;
+  std::string resident_ptx;
+  if (!wvm::TranslateWvmToResidentPtx(program, resident_ptx, err)) {
+    std::printf("resident framebuffer: translation FAIL: %s\n", err.c_str());
+    return 1;
+  }
+  const std::string correct_guard = "setp.ne.u64 %p6, %rd9, 0;";
+  const std::string stale_guard = "setp.ne.u64 %p6, %rd8, 0;";
+  size_t guard_count = 0;
+  for (size_t pos = resident_ptx.find(correct_guard); pos != std::string::npos;
+       pos = resident_ptx.find(correct_guard, pos + correct_guard.size()))
+    ++guard_count;
+  const bool translation_ok = guard_count == 4 &&
+                              resident_ptx.find(stale_guard) ==
+                                  std::string::npos;
+
+  ResidentFramebufferSnapshot interpreted;
+  ResidentFramebufferSnapshot resident;
+  if (!RunResidentToTerminal(program, kVms, kMemoryWords, false, interpreted,
+                             err) ||
+      !RunResidentToTerminal(program, kVms, kMemoryWords, true, resident,
+                             err)) {
+    std::printf("resident framebuffer: launch FAIL: %s\n", err.c_str());
+    return 1;
+  }
+
+  bool valid_store = true;
+  bool vm0 = true;
+  bool isolated = true;
+  bool lane_varying = true;
+  bool ram_unchanged = true;
+  for (uint32_t vm = 0; vm < kVms; ++vm) {
+    valid_store &= resident.status[vm] == wvm::kHalted &&
+                   resident.fault[vm] == wvm::kFaultOk &&
+                   resident.frame_seq[vm] == 1;
+    const uint32_t* framebuffer =
+        resident.framebuffers.data() + static_cast<size_t>(vm) *
+                                           wvm::kVideoWords;
+    for (uint32_t lane = 0; lane < wvm::kLanes; ++lane) {
+      const uint32_t expected = ((vm + 1) << 8) + lane;
+      lane_varying &= framebuffer[lane] == expected;
+      ram_unchanged &= resident.memory[vm][lane] == expected &&
+                       resident.memory[vm][32 + lane] == expected;
+      if (vm == 0) vm0 &= framebuffer[lane] == 0x100u + lane;
+      for (uint32_t other = 0; other < kVms; ++other) {
+        if (other == vm) continue;
+        const uint32_t* other_framebuffer =
+            resident.framebuffers.data() +
+            static_cast<size_t>(other) * wvm::kVideoWords;
+        isolated &= framebuffer[lane] != other_framebuffer[lane];
+      }
+    }
+    for (uint32_t pixel = wvm::kLanes; pixel < wvm::kVideoWords; ++pixel)
+      isolated &= framebuffer[pixel] == wvm::kVideoResetColor;
+  }
+
+  bool engine_equal = resident.framebuffers == interpreted.framebuffers &&
+                      resident.status == interpreted.status &&
+                      resident.fault == interpreted.fault &&
+                      resident.frame_seq == interpreted.frame_seq;
+  for (uint32_t vm = 0; vm < kVms; ++vm)
+    engine_equal &= resident.memory[vm] == interpreted.memory[vm];
+
+  wvm::PtxCompiledProgram one_shot;
+  std::vector<wvm::VmState> one_shot_states(kVms);
+  for (uint32_t vm = 0; vm < kVms; ++vm) {
+    one_shot_states[vm].vm_id = vm;
+    one_shot_states[vm].status = wvm::kRunning;
+    one_shot_states[vm].rng_state = vm * 0x9E3779B9u + 0x1234567u;
+  }
+  std::vector<uint32_t> one_shot_memory(kVms * kMemoryWords, 0);
+  std::vector<uint32_t> one_shot_framebuffers(
+      kVms * wvm::kVideoWords, wvm::kVideoResetColor);
+  std::vector<uint32_t> one_shot_frame_seq(kVms, 0);
+  bool one_shot_ok = one_shot.Compile(program, err) &&
+                     one_shot.Launch(one_shot_states, one_shot_memory,
+                                     kMemoryWords, one_shot_framebuffers,
+                                     one_shot_frame_seq, err);
+  if (one_shot_ok) {
+    one_shot_ok &= one_shot_framebuffers == interpreted.framebuffers &&
+                   one_shot_frame_seq == interpreted.frame_seq;
+    for (uint32_t vm = 0; vm < kVms; ++vm) {
+      one_shot_ok &= one_shot_states[vm].status == wvm::kHalted &&
+                     one_shot_states[vm].fault_code == wvm::kFaultOk;
+      one_shot_ok &= std::equal(
+          one_shot_memory.begin() + vm * kMemoryWords,
+          one_shot_memory.begin() + (vm + 1) * kMemoryWords,
+          interpreted.memory[vm].begin());
+    }
+  }
+
+  wvm::WvmFile invalid;
+  invalid.literals = {wvm::kVideoEndWord};
+  invalid.code = {
+      wvm::enc_i(wvm::kLdw, 0, 0, 0, 0),
+      wvm::enc_i(wvm::kMovI, 0, 1, 0, 1),
+      wvm::enc_r(wvm::kStore, 0, 0, 1, 0),
+      wvm::enc_r(wvm::kHalt, 0, 0, 0, 0),
+  };
+  ResidentFramebufferSnapshot invalid_result;
+  bool invalid_fault = RunResidentToTerminal(
+      invalid, 1, kMemoryWords, true, invalid_result, err);
+  if (invalid_fault) {
+    invalid_fault = invalid_result.status[0] == wvm::kFaulted &&
+                    invalid_result.fault[0] == wvm::kFaultMem &&
+                    invalid_result.pc[0] == 2 &&
+                    std::all_of(invalid_result.framebuffers.begin(),
+                                invalid_result.framebuffers.end(),
+                                [](uint32_t value) {
+                                  return value == wvm::kVideoResetColor;
+                                });
+  }
+
+  std::printf("resident framebuffer: translated base guard  %s\n",
+              translation_ok ? "PASS" : "FAIL");
+  std::printf("resident framebuffer: valid STORE / HALT     %s\n",
+              valid_store ? "PASS" : "FAIL");
+  std::printf("resident framebuffer: VM 0                  %s\n",
+              vm0 ? "PASS" : "FAIL");
+  std::printf("resident framebuffer: per-VM isolation      %s\n",
+              isolated ? "PASS" : "FAIL");
+  std::printf("resident framebuffer: 32 lane-varying STORE %s\n",
+              lane_varying ? "PASS" : "FAIL");
+  std::printf("resident framebuffer: ordinary RAM STORE    %s\n",
+              ram_unchanged ? "PASS" : "FAIL");
+  std::printf("resident framebuffer: interpreter equality  %s\n",
+              engine_equal ? "PASS" : "FAIL");
+  std::printf("resident framebuffer: one-shot equality     %s\n",
+              one_shot_ok ? "PASS" : "FAIL");
+  std::printf("resident framebuffer: VIDEO_END FAULT_MEM   %s\n",
+              invalid_fault ? "PASS" : "FAIL");
+  if (!one_shot_ok && !err.empty())
+    std::printf("resident framebuffer: one-shot detail: %s\n", err.c_str());
+
+  const bool ok = translation_ok && valid_store && vm0 && isolated &&
+                  lane_varying && ram_unchanged && engine_equal &&
+                  one_shot_ok && invalid_fault;
+  std::printf(ok ? "resident framebuffer tests: PASS\n"
+                 : "resident framebuffer tests: FAIL\n");
+  return ok ? 0 : 1;
+}
+
 struct ResidentMeasurement {
   double frames_per_second = 0.0;
   uint64_t messages_received = 0;
@@ -3223,6 +3458,7 @@ void Usage(const char* argv0) {
   std::printf("                  exact CPU/compiled equivalence through HALT\n");
   std::printf("  compiled_resident <file.wvm> [--vms N] [--for S]\n");
   std::printf("                  continuously resident compiled VMs\n");
+  std::printf("  compiled_fb_tests     resident compiled framebuffer regressions\n");
   std::printf("  resident_bench <file.wvm> [--vms N] [--ms N]\n");
   std::printf("                  interpreted/compiled resident frame benchmark\n");
   std::printf("  warpc_bench <sequential.wvm> <warp.wvm>\n");
@@ -3356,6 +3592,8 @@ int main(int argc, char** argv) {
   std::printf("device: %s  SMs=%d  cc=%d.%d\n", prop.name,
               prop.multiProcessorCount, prop.major, prop.minor);
 
+  if (std::strcmp(cmd, "compiled_fb_tests") == 0)
+    return RunCompiledResidentFramebufferTests();
   if (std::strcmp(cmd, "slice1") == 0) return RunSlice1();
   if (std::strcmp(cmd, "slice2") == 0) return RunSlice2();
   if (std::strcmp(cmd, "slice3") == 0) return RunSlice3();

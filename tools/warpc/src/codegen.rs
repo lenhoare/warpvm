@@ -5,8 +5,16 @@ use crate::sema::{
     TypedInitializer, TypedProgram, TypedStmt, Uniformity, WARP_VIDEO_BASE, WARP_VIDEO_WIDTH,
 };
 use crate::span::{Diagnostic, Span};
+use std::collections::{HashMap, HashSet};
 
 const ALLOCATABLE_REGS: usize = 13; // r13/r14 are ABI scratch; r15 is assembler scratch.
+                                    // Begin with eight local homes (five transient registers). If actual lowering
+                                    // needs more transient registers because spilled operands must be reloaded,
+                                    // retry the function with one or two fewer homes. This makes spilling follow
+                                    // measured peak pressure instead of imposing one pessimistic reserve globally.
+const MAX_LOCAL_VECTOR_REGS: usize = 8;
+const MIN_LOCAL_VECTOR_REGS: usize = 6;
+const ALLOCATABLE_SCALAR_REGS: usize = 7; // s7 is the stack pointer.
 const LANE_REG: u8 = 13;
 const STACK_ADDR_REG: u8 = 14;
 const STACK_POINTER: &str = "s7";
@@ -23,10 +31,329 @@ struct Value {
     owned: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalStorage {
+    Vector(u8),
+    Scalar(u8),
+    Frame(usize),
+}
+
+struct FunctionAllocation {
+    storage: Vec<Option<LocalStorage>>,
+    starts: Vec<Option<usize>>,
+    ends: Vec<Option<usize>>,
+    statement_points: HashMap<usize, usize>,
+    end_point: usize,
+    frame_words: usize,
+    scalar_homes: usize,
+    spills: usize,
+    vector_home_limit: usize,
+}
+
+struct LifetimeCollector {
+    next_point: usize,
+    starts: Vec<Option<usize>>,
+    ends: Vec<Option<usize>>,
+    statement_points: HashMap<usize, usize>,
+}
+
+impl LifetimeCollector {
+    fn new(local_count: usize) -> Self {
+        Self {
+            next_point: 1,
+            starts: vec![None; local_count],
+            ends: vec![None; local_count],
+            statement_points: HashMap::new(),
+        }
+    }
+
+    fn touch(&mut self, local: LocalId, point: usize) {
+        self.starts[local] = Some(self.starts[local].map_or(point, |old| old.min(point)));
+        self.ends[local] = Some(self.ends[local].map_or(point, |old| old.max(point)));
+    }
+
+    fn expr(&mut self, expr: &TypedExpr, point: usize, touched: &mut HashSet<LocalId>) {
+        match &expr.kind {
+            TypedExprKind::Literal(_) | TypedExprKind::StringAddress(_) => {}
+            TypedExprKind::Intrinsic { args, .. } | TypedExprKind::Call { args, .. } => {
+                for arg in args {
+                    self.expr(arg, point, touched);
+                }
+            }
+            TypedExprKind::LValue(value) | TypedExprKind::AddressOf(value) => {
+                self.lvalue(value, point, touched)
+            }
+            TypedExprKind::Unary(_, operand) => self.expr(operand, point, touched),
+            TypedExprKind::Binary { left, right, .. }
+            | TypedExprKind::PointerDiff { left, right, .. } => {
+                self.expr(left, point, touched);
+                self.expr(right, point, touched);
+            }
+            TypedExprKind::PointerAdd { pointer, index, .. } => {
+                self.expr(pointer, point, touched);
+                self.expr(index, point, touched);
+            }
+            TypedExprKind::Assign { target, right, .. } => {
+                self.lvalue(target, point, touched);
+                self.expr(right, point, touched);
+            }
+            TypedExprKind::IncDec { target, .. } => self.lvalue(target, point, touched),
+        }
+    }
+
+    fn lvalue(&mut self, value: &LValue, point: usize, touched: &mut HashSet<LocalId>) {
+        match value {
+            LValue::Local(local) => {
+                self.touch(*local, point);
+                touched.insert(*local);
+            }
+            LValue::Global(_) => {}
+            LValue::Deref(pointer) => self.expr(pointer, point, touched),
+            LValue::Index { base, index, .. } => {
+                self.expr(base, point, touched);
+                self.expr(index, point, touched);
+            }
+            LValue::Member { base, .. } => self.lvalue(base, point, touched),
+        }
+    }
+
+    fn initializer(
+        &mut self,
+        init: Option<&TypedInitializer>,
+        point: usize,
+        touched: &mut HashSet<LocalId>,
+    ) {
+        if let Some(TypedInitializer::Expr(expr)) = init {
+            self.expr(expr, point, touched);
+        }
+    }
+
+    fn block(&mut self, block: &TypedBlock) -> HashSet<LocalId> {
+        let mut touched = HashSet::new();
+        for statement in &block.statements {
+            touched.extend(self.statement(statement));
+        }
+        touched
+    }
+
+    fn statement(&mut self, statement: &TypedStmt) -> HashSet<LocalId> {
+        let point = self.next_point;
+        self.next_point += 1;
+        self.statement_points
+            .insert(statement as *const TypedStmt as usize, point);
+        let mut touched = HashSet::new();
+        match statement {
+            TypedStmt::Decl { local, init, .. } => {
+                self.touch(*local, point);
+                touched.insert(*local);
+                self.initializer(init.as_ref(), point, &mut touched);
+            }
+            TypedStmt::Expr(expr) | TypedStmt::Return(expr, _) => {
+                if let Some(expr) = expr {
+                    self.expr(expr, point, &mut touched);
+                }
+            }
+            TypedStmt::Block(block) => touched.extend(self.block(block)),
+            TypedStmt::If {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                self.expr(condition, point, &mut touched);
+                touched.extend(self.statement(then_branch));
+                if let Some(else_branch) = else_branch {
+                    touched.extend(self.statement(else_branch));
+                }
+            }
+            TypedStmt::While {
+                condition, body, ..
+            } => {
+                self.expr(condition, point, &mut touched);
+                touched.extend(self.statement(body));
+                let loop_exit = self.next_point;
+                for &local in &touched {
+                    self.ends[local] = Some(self.ends[local].unwrap().max(loop_exit));
+                }
+            }
+            TypedStmt::DoWhile {
+                body, condition, ..
+            } => {
+                touched.extend(self.statement(body));
+                self.expr(condition, point, &mut touched);
+                let loop_exit = self.next_point;
+                for &local in &touched {
+                    self.ends[local] = Some(self.ends[local].unwrap().max(loop_exit));
+                }
+            }
+            TypedStmt::For {
+                init,
+                condition,
+                step,
+                body,
+                ..
+            } => {
+                if let Some(init) = init.as_deref() {
+                    match init {
+                        TypedForInit::Decl { local, init, .. } => {
+                            self.touch(*local, point);
+                            touched.insert(*local);
+                            self.initializer(init.as_ref(), point, &mut touched);
+                        }
+                        TypedForInit::Expr(expr) => self.expr(expr, point, &mut touched),
+                    }
+                }
+                if let Some(condition) = condition.as_deref() {
+                    self.expr(condition, point, &mut touched);
+                }
+                touched.extend(self.statement(body));
+                if let Some(step) = step.as_deref() {
+                    self.expr(step, point, &mut touched);
+                }
+                let loop_exit = self.next_point;
+                for &local in &touched {
+                    self.ends[local] = Some(self.ends[local].unwrap().max(loop_exit));
+                }
+            }
+            TypedStmt::Switch {
+                expression, body, ..
+            } => {
+                self.expr(expression, point, &mut touched);
+                touched.extend(self.statement(body));
+            }
+            TypedStmt::Case { body, .. } | TypedStmt::Default { body, .. } => {
+                touched.extend(self.statement(body));
+            }
+            TypedStmt::Break(_) | TypedStmt::Continue(_) => {}
+        }
+        touched
+    }
+}
+
+fn intervals_overlap(
+    left: LocalId,
+    right: LocalId,
+    starts: &[Option<usize>],
+    ends: &[Option<usize>],
+) -> bool {
+    starts[left].unwrap() <= ends[right].unwrap() && starts[right].unwrap() <= ends[left].unwrap()
+}
+
+fn allocate_function(
+    function: &TypedFunction,
+    locals: &[LocalInfo],
+    local_count: usize,
+    data_words: usize,
+    local_vector_regs: usize,
+) -> Result<FunctionAllocation, Diagnostic> {
+    let mut lifetime = LifetimeCollector::new(local_count);
+    for &parameter in &function.params {
+        lifetime.touch(parameter, 0);
+    }
+    lifetime.block(&function.body);
+
+    let mut function_locals: Vec<LocalId> = lifetime
+        .starts
+        .iter()
+        .enumerate()
+        .filter_map(|(local, start)| start.map(|_| local))
+        .collect();
+    function_locals.sort_by_key(|&local| (lifetime.starts[local].unwrap(), local));
+
+    let mut storage = vec![None; local_count];
+    let mut frame_words = function.frame_words;
+    for &local in &function_locals {
+        if let Some(offset) = locals[local].frame_offset {
+            storage[local] = Some(LocalStorage::Frame(offset));
+        }
+    }
+
+    let mut scalar_assignments: Vec<(LocalId, u8)> = Vec::new();
+    let parameters: HashSet<LocalId> = function.params.iter().copied().collect();
+    for &local in &function_locals {
+        if storage[local].is_some()
+            || parameters.contains(&local)
+            || locals[local].uniformity != Uniformity::Uniform
+        {
+            continue;
+        }
+        let reg = (0..ALLOCATABLE_SCALAR_REGS).find(|&candidate| {
+            scalar_assignments.iter().all(|&(other, assigned)| {
+                assigned as usize != candidate
+                    || !intervals_overlap(local, other, &lifetime.starts, &lifetime.ends)
+            })
+        });
+        if let Some(reg) = reg {
+            storage[local] = Some(LocalStorage::Scalar(reg as u8));
+            scalar_assignments.push((local, reg as u8));
+        }
+    }
+
+    let mut vector_assignments: Vec<(LocalId, u8)> = Vec::new();
+    for (reg, &parameter) in function.params.iter().enumerate() {
+        if storage[parameter].is_none() {
+            storage[parameter] = Some(LocalStorage::Vector(reg as u8));
+            vector_assignments.push((parameter, reg as u8));
+        }
+    }
+    let mut spills = 0;
+    for &local in &function_locals {
+        if storage[local].is_some() {
+            continue;
+        }
+        let reg = (0..local_vector_regs).find(|&candidate| {
+            vector_assignments.iter().all(|&(other, assigned)| {
+                assigned as usize != candidate
+                    || !intervals_overlap(local, other, &lifetime.starts, &lifetime.ends)
+            })
+        });
+        if let Some(reg) = reg {
+            storage[local] = Some(LocalStorage::Vector(reg as u8));
+            vector_assignments.push((local, reg as u8));
+        } else {
+            storage[local] = Some(LocalStorage::Frame(frame_words));
+            frame_words += 1;
+            spills += 1;
+        }
+    }
+
+    if data_words + frame_words * 32 >= STACK_TOP as usize {
+        return Err(Diagnostic::new(
+            function.span,
+            "Warp C data and register-spill frame exceed VM RAM",
+        ));
+    }
+    Ok(FunctionAllocation {
+        storage,
+        starts: lifetime.starts,
+        ends: lifetime.ends,
+        statement_points: lifetime.statement_points,
+        end_point: lifetime.next_point + 1,
+        frame_words,
+        scalar_homes: scalar_assignments
+            .iter()
+            .map(|(_, reg)| *reg as usize + 1)
+            .max()
+            .unwrap_or(0),
+        spills,
+        vector_home_limit: local_vector_regs,
+    })
+}
+
 struct Generator<'a> {
     assembly: String,
     used: [bool; ALLOCATABLE_REGS],
-    local_regs: Vec<Option<u8>>,
+    scalar_used: [bool; ALLOCATABLE_SCALAR_REGS],
+    local_storage: Vec<Option<LocalStorage>>,
+    local_starts: Vec<Option<usize>>,
+    local_ends: Vec<Option<usize>>,
+    local_active: Vec<bool>,
+    statement_points: HashMap<usize, usize>,
+    allocation_end_point: usize,
+    peak_vector_regs: usize,
+    allocation_scalar_homes: usize,
+    allocation_spills: usize,
+    allocation_vector_home_limit: usize,
     next_label: usize,
     controls: Vec<ControlTarget>,
     switch_labels: Vec<Vec<(usize, String)>>,
@@ -38,6 +365,7 @@ struct Generator<'a> {
     locals: &'a [LocalInfo],
     globals: &'a [GlobalInfo],
     structs: &'a [StructInfo],
+    data_words: usize,
     current_guard: Option<u8>,
     mask_stack: Vec<u8>,
 }
@@ -52,7 +380,17 @@ impl<'a> Generator<'a> {
         Self {
             assembly: String::new(),
             used: [false; ALLOCATABLE_REGS],
-            local_regs: vec![None; program.locals.len()],
+            scalar_used: [false; ALLOCATABLE_SCALAR_REGS],
+            local_storage: vec![None; program.locals.len()],
+            local_starts: vec![None; program.locals.len()],
+            local_ends: vec![None; program.locals.len()],
+            local_active: vec![false; program.locals.len()],
+            statement_points: HashMap::new(),
+            allocation_end_point: 0,
+            peak_vector_regs: 0,
+            allocation_scalar_homes: 0,
+            allocation_spills: 0,
+            allocation_vector_home_limit: MAX_LOCAL_VECTOR_REGS,
             next_label: 0,
             controls: Vec::new(),
             switch_labels: Vec::new(),
@@ -68,6 +406,7 @@ impl<'a> Generator<'a> {
             locals: &program.locals,
             globals: &program.globals,
             structs: &program.structs,
+            data_words: program.data_words.len(),
             current_guard: None,
             mask_stack: Vec::new(),
         }
@@ -98,33 +437,94 @@ impl<'a> Generator<'a> {
     }
 
     fn function(&mut self, function: &TypedFunction) -> Result<(), Diagnostic> {
+        let assembly_start = self.assembly.len();
+        let label_start = self.next_label;
+        let mut last_pressure_error = None;
+        for local_vector_regs in (MIN_LOCAL_VECTOR_REGS..=MAX_LOCAL_VECTOR_REGS).rev() {
+            self.assembly.truncate(assembly_start);
+            self.next_label = label_start;
+            match self.function_with_limit(function, local_vector_regs) {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if error.message.contains("temporary vector-register demand")
+                        && local_vector_regs > MIN_LOCAL_VECTOR_REGS =>
+                {
+                    last_pressure_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_pressure_error.expect("allocation retry must retain its diagnostic"))
+    }
+
+    fn function_with_limit(
+        &mut self,
+        function: &TypedFunction,
+        local_vector_regs: usize,
+    ) -> Result<(), Diagnostic> {
+        let allocation = allocate_function(
+            function,
+            self.locals,
+            self.locals.len(),
+            self.data_words,
+            local_vector_regs,
+        )?;
         self.used.fill(false);
-        self.local_regs.fill(None);
+        self.scalar_used.fill(false);
+        self.local_storage = allocation.storage;
+        self.local_starts = allocation.starts;
+        self.local_ends = allocation.ends;
+        self.local_active.fill(false);
+        self.statement_points = allocation.statement_points;
+        self.allocation_end_point = allocation.end_point;
+        self.peak_vector_regs = 0;
+        self.allocation_scalar_homes = allocation.scalar_homes;
+        self.allocation_spills = allocation.spills;
+        self.allocation_vector_home_limit = allocation.vector_home_limit;
         self.controls.clear();
         self.switch_labels.clear();
         self.current_guard = None;
         self.mask_stack.clear();
         self.current_function = Some(function.id);
         self.current_return_type = function.return_type;
-        self.current_frame_words = function.frame_words;
+        self.current_frame_words = allocation.frame_words;
         self.line(&format!("{}:", self.function_labels[function.id]));
-        for reg in 0..function.params.len() {
-            self.used[reg] = true;
-        }
-        if function.frame_words != 0 {
-            self.instr(&format!(
-                "S_ADD_I {STACK_POINTER}, {STACK_POINTER}, -{}",
-                function.frame_words * 32
+        for local in 0..self.local_storage.len() {
+            if self.local_starts[local].is_none() {
+                continue;
+            }
+            let home = match self.local_storage[local].unwrap() {
+                LocalStorage::Vector(reg) => format!("r{reg}"),
+                LocalStorage::Scalar(reg) => format!("s{reg}"),
+                LocalStorage::Frame(offset) if self.locals[local].frame_offset.is_none() => {
+                    format!("spill[{offset}]")
+                }
+                LocalStorage::Frame(offset) => format!("frame[{offset}]"),
+            };
+            self.line(&format!(
+                "; local {}: {:?} -> {home}",
+                self.locals[local].name, self.locals[local].uniformity
             ));
         }
-        for (reg, &local) in function.params.iter().enumerate() {
-            if self.locals[local].frame_offset.is_some() {
+        for (abi_reg, &local) in function.params.iter().enumerate() {
+            self.used[abi_reg] = true;
+            if matches!(self.local_storage[local], Some(LocalStorage::Vector(_))) {
+                self.local_active[local] = true;
+            }
+        }
+        self.update_peak_vector_regs();
+        if self.current_frame_words != 0 {
+            self.instr(&format!(
+                "S_ADD_I {STACK_POINTER}, {STACK_POINTER}, -{}",
+                self.current_frame_words * 32
+            ));
+        }
+        for (abi_reg, &local) in function.params.iter().enumerate() {
+            if matches!(self.local_storage[local], Some(LocalStorage::Frame(_))) {
                 let address = self.local_address(local, function.span)?;
-                self.instr(&format!("STORE r{}, r{reg}", address.reg));
+                self.instr(&format!("STORE r{}, r{abi_reg}", address.reg));
                 self.release(address);
-                self.used[reg] = false;
-            } else {
-                self.local_regs[local] = Some(reg as u8);
+                self.free_reg(abi_reg as u8);
             }
         }
         self.block(&function.body)?;
@@ -137,11 +537,17 @@ impl<'a> Generator<'a> {
             }
             self.emit_return();
         }
-        for &local in function.params.iter().rev() {
-            if let Some(reg) = self.local_regs[local].take() {
-                self.free_reg(reg);
-            }
-        }
+        self.advance_allocation(self.allocation_end_point)?;
+        self.line(&format!(
+            "; allocation {}: vector_peak={}/{} vector_homes={} scalar_homes={} spills={} frame_words={}",
+            function.name,
+            self.peak_vector_regs,
+            ALLOCATABLE_REGS,
+            self.allocation_vector_home_limit,
+            self.allocation_scalar_homes,
+            self.allocation_spills,
+            self.current_frame_words
+        ));
         self.current_function = None;
         Ok(())
     }
@@ -150,15 +556,20 @@ impl<'a> Generator<'a> {
         for statement in &block.statements {
             self.statement(statement)?;
         }
-        for &local in block.local_ids.iter().rev() {
-            if let Some(reg) = self.local_regs[local].take() {
-                self.free_reg(reg);
-            }
-        }
         Ok(())
     }
 
     fn statement(&mut self, statement: &TypedStmt) -> Result<(), Diagnostic> {
+        let point = *self
+            .statement_points
+            .get(&(statement as *const TypedStmt as usize))
+            .ok_or_else(|| {
+                Diagnostic::new(
+                    statement_span(statement),
+                    "internal error: missing liveness point",
+                )
+            })?;
+        self.advance_allocation(point)?;
         match statement {
             TypedStmt::Decl { local, init, span } => {
                 self.declaration(*local, init.as_ref(), *span)?;
@@ -403,11 +814,7 @@ impl<'a> Generator<'a> {
         }
         self.instr(&format!("JMP {condition_label}"));
         self.line(&format!("{end}:"));
-        for &local in local_ids.iter().rev() {
-            if let Some(reg) = self.local_regs[local].take() {
-                self.free_reg(reg);
-            }
-        }
+        let _ = local_ids;
         Ok(())
     }
 
@@ -469,7 +876,7 @@ impl<'a> Generator<'a> {
         init: Option<&TypedInitializer>,
         span: Span,
     ) -> Result<(), Diagnostic> {
-        if self.locals[local].frame_offset.is_some() {
+        if matches!(self.local_storage[local], Some(LocalStorage::Frame(_))) {
             let size = type_size(self.locals[local].ty, self.structs);
             match init {
                 Some(TypedInitializer::Expr(init)) => {
@@ -504,13 +911,11 @@ impl<'a> Generator<'a> {
             return Ok(());
         }
 
-        let reg = self.alloc_reg(span)?;
-        self.local_regs[local] = Some(reg);
+        let storage = self.local_storage[local]
+            .ok_or_else(|| Diagnostic::new(span, "internal error: local has no allocation"))?;
         if let Some(TypedInitializer::Expr(init)) = init {
             let value = self.expr(init)?;
-            if value.reg != reg {
-                self.instr(&format!("MOV r{reg}, r{}", value.reg));
-            }
+            self.store_local(local, value.reg, span)?;
             self.release(value);
         } else if matches!(init, Some(TypedInitializer::Words(_))) {
             return Err(Diagnostic::new(
@@ -518,7 +923,11 @@ impl<'a> Generator<'a> {
                 "internal error: aggregate initializer assigned to register local",
             ));
         } else {
-            self.instr(&format!("MOV r{reg}, 0"));
+            match storage {
+                LocalStorage::Vector(reg) => self.instr(&format!("MOV r{reg}, 0")),
+                LocalStorage::Scalar(reg) => self.instr(&format!("S_MOV_I s{reg}, 0")),
+                LocalStorage::Frame(_) => unreachable!(),
+            }
         }
         Ok(())
     }
@@ -945,8 +1354,14 @@ impl<'a> Generator<'a> {
             .enumerate()
             .filter_map(|(reg, used)| used.then_some(reg as u8))
             .collect();
-        let return_slot = (return_type != Type::VOID).then_some(saved.len());
-        let frame_slots = saved.len() + usize::from(return_slot.is_some());
+        let saved_scalars: Vec<u8> = self
+            .scalar_used
+            .iter()
+            .enumerate()
+            .filter_map(|(reg, used)| used.then_some(reg as u8))
+            .collect();
+        let return_slot = (return_type != Type::VOID).then_some(saved.len() + saved_scalars.len());
+        let frame_slots = saved.len() + saved_scalars.len() + usize::from(return_slot.is_some());
         let frame_words = frame_slots * 32;
         if frame_words != 0 {
             self.instr(&format!(
@@ -956,6 +1371,11 @@ impl<'a> Generator<'a> {
         for (slot, &reg) in saved.iter().enumerate() {
             self.stack_address(slot);
             self.instr(&format!("STORE r{STACK_ADDR_REG}, r{reg}"));
+        }
+        for (index, &reg) in saved_scalars.iter().enumerate() {
+            self.stack_address(saved.len() + index);
+            self.instr(&format!("S_BCAST r15, s{reg}"));
+            self.instr(&format!("STORE r{STACK_ADDR_REG}, r15"));
         }
         for (arg_reg, value) in values.iter().enumerate() {
             let Some(slot) = saved.iter().position(|&reg| reg == value.reg) else {
@@ -976,6 +1396,11 @@ impl<'a> Generator<'a> {
         for (slot, &reg) in saved.iter().enumerate() {
             self.stack_address(slot);
             self.instr(&format!("LOAD r{reg}, r{STACK_ADDR_REG}"));
+        }
+        for (index, &reg) in saved_scalars.iter().enumerate() {
+            self.stack_address(saved.len() + index);
+            self.instr(&format!("LOAD r15, r{STACK_ADDR_REG}"));
+            self.instr(&format!("S_GET s{reg}, r15"));
         }
         for value in values {
             self.release(value);
@@ -1290,11 +1715,6 @@ impl<'a> Generator<'a> {
         Ok(out)
     }
 
-    fn local_reg(&self, local: LocalId, span: Span) -> Result<u8, Diagnostic> {
-        self.local_regs[local]
-            .ok_or_else(|| Diagnostic::new(span, "internal error: local has no allocated register"))
-    }
-
     fn emit_return(&mut self) {
         if self.current_frame_words != 0 {
             self.instr(&format!(
@@ -1319,10 +1739,15 @@ impl<'a> Generator<'a> {
         extra: usize,
         span: Span,
     ) -> Result<Value, Diagnostic> {
-        let offset = self.locals[local]
-            .frame_offset
-            .ok_or_else(|| Diagnostic::new(span, "cannot take address of register-only local"))?
-            + extra;
+        let offset = match self.local_storage[local] {
+            Some(LocalStorage::Frame(offset)) => offset + extra,
+            _ => {
+                return Err(Diagnostic::new(
+                    span,
+                    "cannot take address of register-only local",
+                ))
+            }
+        };
         let out = self.alloc_reg(span)?;
         self.instr(&format!("S_BCAST r{out}, {STACK_POINTER}"));
         if self.current_frame_words != 0 {
@@ -1394,11 +1819,25 @@ impl<'a> Generator<'a> {
 
     fn load_lvalue(&mut self, lvalue: &LValue, span: Span) -> Result<Value, Diagnostic> {
         if let LValue::Local(local) = lvalue {
-            if self.locals[*local].frame_offset.is_none() {
-                return Ok(Value {
-                    reg: self.local_reg(*local, span)?,
-                    owned: false,
-                });
+            match self.local_storage[*local] {
+                Some(LocalStorage::Vector(reg)) => {
+                    return Ok(Value { reg, owned: false });
+                }
+                Some(LocalStorage::Scalar(reg)) => {
+                    let out = self.alloc_reg(span)?;
+                    self.instr(&format!("S_BCAST r{out}, s{reg}"));
+                    return Ok(Value {
+                        reg: out,
+                        owned: true,
+                    });
+                }
+                Some(LocalStorage::Frame(_)) => {}
+                None => {
+                    return Err(Diagnostic::new(
+                        span,
+                        "internal error: local has no allocated storage",
+                    ));
+                }
             }
         }
         let address = self.lvalue_address(lvalue, span)?;
@@ -1413,12 +1852,8 @@ impl<'a> Generator<'a> {
 
     fn store_lvalue(&mut self, lvalue: &LValue, source: u8, span: Span) -> Result<(), Diagnostic> {
         if let LValue::Local(local) = lvalue {
-            if self.locals[*local].frame_offset.is_none() {
-                let target = self.local_reg(*local, span)?;
-                if target != source {
-                    self.instr(&format!("MOV r{target}, r{source}"));
-                }
-                return Ok(());
+            if !matches!(self.local_storage[*local], Some(LocalStorage::Frame(_))) {
+                return self.store_local(*local, source, span);
             }
         }
         let address = self.lvalue_address(lvalue, span)?;
@@ -1427,14 +1862,46 @@ impl<'a> Generator<'a> {
         Ok(())
     }
 
+    fn store_local(&mut self, local: LocalId, source: u8, span: Span) -> Result<(), Diagnostic> {
+        match self.local_storage[local] {
+            Some(LocalStorage::Vector(target)) => {
+                if target != source {
+                    self.instr(&format!("MOV r{target}, r{source}"));
+                }
+            }
+            Some(LocalStorage::Scalar(target)) => {
+                if self.current_guard.is_some() {
+                    return Err(Diagnostic::new(
+                        span,
+                        "internal error: divergent value allocated to scalar register",
+                    ));
+                }
+                self.instr(&format!("S_GET s{target}, r{source}"));
+            }
+            Some(LocalStorage::Frame(_)) => {
+                let address = self.local_address(local, span)?;
+                self.instr(&format!("STORE r{}, r{source}", address.reg));
+                self.release(address);
+            }
+            None => {
+                return Err(Diagnostic::new(
+                    span,
+                    "internal error: local has no allocated storage",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn alloc_reg(&mut self, span: Span) -> Result<u8, Diagnostic> {
         let Some(reg) = self.used.iter().position(|used| !*used) else {
             return Err(Diagnostic::new(
                 span,
-                "vector register exhaustion (simplify the expression)",
+                "temporary vector-register demand exceeds r0-r12 after liveness allocation and spilling",
             ));
         };
         self.used[reg] = true;
+        self.update_peak_vector_regs();
         Ok(reg as u8)
     }
 
@@ -1447,6 +1914,59 @@ impl<'a> Generator<'a> {
         if value.owned {
             self.free_reg(value.reg);
         }
+    }
+
+    fn update_peak_vector_regs(&mut self) {
+        self.peak_vector_regs = self
+            .peak_vector_regs
+            .max(self.used.iter().filter(|used| **used).count());
+    }
+
+    fn advance_allocation(&mut self, point: usize) -> Result<(), Diagnostic> {
+        for local in 0..self.local_active.len() {
+            if !self.local_active[local] || self.local_ends[local].unwrap_or(0) >= point {
+                continue;
+            }
+            match self.local_storage[local] {
+                Some(LocalStorage::Vector(reg)) => self.free_reg(reg),
+                Some(LocalStorage::Scalar(reg)) => self.scalar_used[reg as usize] = false,
+                _ => {}
+            }
+            self.local_active[local] = false;
+        }
+        for local in 0..self.local_active.len() {
+            if self.local_active[local]
+                || self.local_starts[local].is_none()
+                || self.local_starts[local].unwrap() > point
+                || self.local_ends[local].unwrap() < point
+            {
+                continue;
+            }
+            match self.local_storage[local] {
+                Some(LocalStorage::Vector(reg)) => {
+                    if self.used[reg as usize] {
+                        return Err(Diagnostic::new(
+                            self.locals[local].span,
+                            "internal error: overlapping vector-register allocation",
+                        ));
+                    }
+                    self.used[reg as usize] = true;
+                }
+                Some(LocalStorage::Scalar(reg)) => {
+                    if self.scalar_used[reg as usize] {
+                        return Err(Diagnostic::new(
+                            self.locals[local].span,
+                            "internal error: overlapping scalar-register allocation",
+                        ));
+                    }
+                    self.scalar_used[reg as usize] = true;
+                }
+                _ => {}
+            }
+            self.local_active[local] = true;
+        }
+        self.update_peak_vector_regs();
+        Ok(())
     }
 
     fn label(&mut self, stem: &str) -> String {
@@ -1486,6 +2006,25 @@ impl<'a> Generator<'a> {
     fn raw_instr(&mut self, text: &str) {
         self.assembly.push_str("    ");
         self.line(text);
+    }
+}
+
+fn statement_span(statement: &TypedStmt) -> Span {
+    match statement {
+        TypedStmt::Decl { span, .. }
+        | TypedStmt::If { span, .. }
+        | TypedStmt::While { span, .. }
+        | TypedStmt::DoWhile { span, .. }
+        | TypedStmt::For { span, .. }
+        | TypedStmt::Switch { span, .. }
+        | TypedStmt::Case { span, .. }
+        | TypedStmt::Default { span, .. }
+        | TypedStmt::Return(_, span)
+        | TypedStmt::Break(span)
+        | TypedStmt::Continue(span) => *span,
+        TypedStmt::Block(block) => block.span,
+        TypedStmt::Expr(Some(expr)) => expr.span,
+        TypedStmt::Expr(None) => Span::new(0, 1, 1),
     }
 }
 
@@ -1601,5 +2140,32 @@ mod tests {
         assert!(text.contains("VMID"));
         assert!(text.contains("JMP_IF_ANY"));
         assert!(!text.contains("BALLOT p3"));
+    }
+
+    #[test]
+    fn sequential_local_lifetimes_reuse_physical_homes() {
+        let mut source = String::from("int main(void) { int sum=0;");
+        for index in 0..24 {
+            source.push_str(&format!("int value{index}={index}; sum+=value{index};"));
+        }
+        source.push_str("return sum; }");
+        let text = assembly(&source);
+        let summary = text
+            .lines()
+            .find(|line| line.contains("; allocation main:"))
+            .unwrap();
+        assert!(summary.contains("spills=0"), "{summary}");
+        assert!(summary.contains("scalar_homes=2"), "{summary}");
+    }
+
+    #[test]
+    fn genuine_temporary_exhaustion_has_an_allocator_diagnostic() {
+        let source = "int main(void) { return 1+(2+(3+(4+(5+(6+(7+(8+(9+(10+(11+(12+(13+(14+15))))))))))))); }";
+        let tokens = lexer::lex(source).unwrap();
+        let ast = parser::parse(&tokens).unwrap();
+        let typed = sema::analyze(ast).unwrap();
+        let error = generate(&typed).err().unwrap();
+        assert!(error.message.contains("temporary vector-register demand"));
+        assert!(!error.message.contains("simplify the expression"));
     }
 }

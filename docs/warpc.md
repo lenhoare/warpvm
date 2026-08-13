@@ -162,6 +162,7 @@ Warp C's first calling convention is deliberately small:
 - `r0`–`r3` carry up to four vector arguments;
 - `r0` carries a non-void vector return value;
 - `r0`–`r12` hold C locals and temporaries and are caller-saved;
+- `s0`–`s6` hold liveness-allocated uniform C locals and are caller-saved;
 - `r13` permanently holds the lane ID;
 - `r14` is the compiler's stack-address temporary;
 - `r15` remains the assembler scratch register;
@@ -171,20 +172,38 @@ Warp C's first calling convention is deliberately small:
 
 Entry initializes `s7` to word address 16,384. The software stack grows down.
 Every saved vector value occupies 32 consecutive words: slot lane `i` belongs
-to lane `i`. A call frame stores live caller registers in ascending register
-order and, for non-void calls, one return-value slot after them. Arguments are
+to lane `i`. A call frame stores live caller vector and scalar registers in
+ascending register order and, for non-void calls, one return-value slot after them. Arguments are
 then loaded into `r0`–`r3`; after `RET`, the return is parked in its stack slot,
 caller registers are restored, and the result is reloaded into a free
 temporary. This layout is somewhat verbose but already preserves genuinely
 lane-varying values correctly.
 
-Ordinary scalar automatic locals remain in registers. Arrays, structures, and
-address-taken scalars use a function-local RAM frame below `s7`. A frame is
+Before assembly lowering, a small structured lifetime pass records every
+local's first and last required program point. Lifetimes are conservatively
+extended through loops and across both control-flow paths. Non-overlapping
+locals reuse the same home: uniform locals prefer `s0`–`s6`, while divergent
+locals use vector homes. Allocation begins with eight vector homes, leaving
+five transient registers, and retries a function with seven or six homes only
+when its actual expression lowering needs more transient capacity.
+
+When genuinely overlapping local pressure exceeds those homes, scalar locals
+spill into the existing lane-private function frame. Arrays, structures, and
+address-taken scalars use that frame unconditionally. A frame is
 lane-major: all words of lane 0's C objects are consecutive, followed by lane
 1's, and so on. Consequently an automatic `p + 1` is a physical address
 increment of one, while the same logical automatic object remains private to
-each lane. Function-local frames coexist with the older word-major caller-save
-spill frames; the latter are never exposed as C pointers.
+each lane. Function-local frames and allocator spill slots coexist with the
+older word-major caller-save spill frames; the latter are never exposed as C
+pointers.
+
+`--emit-asm` prints each local's uniformity and chosen home, leaves all reloads
+and stores visible, and appends an allocation summary to each function, for
+example:
+
+```text
+; allocation main: vector_peak=10/13 vector_homes=8 scalar_homes=2 spills=7 frame_words=7
+```
 
 Globals and literal strings grow upward from RAM word zero and are shared by
 the lanes of one VM. Generated entry code initializes nonzero data before

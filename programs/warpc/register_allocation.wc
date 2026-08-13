@@ -1,0 +1,92 @@
+#include <warp.h>
+
+/* Register-allocation acceptance test. It intentionally contains far more
+ * named scalar locals than the architectural vector file can hold, followed
+ * by a genuinely overlapping divergent working set that requires spills. */
+int main(void)
+{
+    int sequential = 0;
+    int a0 = 1;   sequential += a0;
+    int a1 = 2;   sequential += a1;
+    int a2 = 3;   sequential += a2;
+    int a3 = 4;   sequential += a3;
+    int a4 = 5;   sequential += a4;
+    int a5 = 6;   sequential += a5;
+    int a6 = 7;   sequential += a6;
+    int a7 = 8;   sequential += a7;
+    int a8 = 9;   sequential += a8;
+    int a9 = 10;  sequential += a9;
+    int a10 = 11; sequential += a10;
+    int a11 = 12; sequential += a11;
+    int a12 = 13; sequential += a12;
+    int a13 = 14; sequential += a13;
+    int a14 = 15; sequential += a14;
+    int a15 = 16; sequential += a15;
+    int a16 = 17; sequential += a16;
+    int a17 = 18; sequential += a17;
+    int a18 = 19; sequential += a18;
+    int a19 = 20; sequential += a19;
+    if (sequential != 210)
+        return 0;
+
+    /* All fourteen values remain live until the accumulation starts. */
+    int d0 = WARP + 1;
+    int d1 = WARP + 2;
+    int d2 = WARP + 3;
+    int d3 = WARP + 4;
+    int d4 = WARP + 5;
+    int d5 = WARP + 6;
+    int d6 = WARP + 7;
+    int d7 = WARP + 8;
+    int d8 = WARP + 9;
+    int d9 = WARP + 10;
+    int d10 = WARP + 11;
+    int d11 = WARP + 12;
+    int d12 = WARP + 13;
+    int d13 = WARP + 14;
+    int total = 0;
+    total += d0;
+    total += d1;
+    total += d2;
+    total += d3;
+    total += d4;
+    total += d5;
+    total += d6;
+    total += d7;
+    total += d8;
+    total += d9;
+    total += d10;
+    total += d11;
+    total += d12;
+    total += d13;
+    if (!warp_all(total == WARP * 14 + 105))
+        return 0;
+
+    /* A value needed on both divergent paths must survive reconvergence. */
+    int branch_seed = WARP * 3 + 1;
+    int branch_value;
+    if (WARP < 16)
+        branch_value = branch_seed + 5;
+    else
+        branch_value = branch_seed + 7;
+    if (!warp_all(branch_value == branch_seed + 5 + (WARP >= 16) * 2))
+        return 0;
+
+    /* `carried` and the uniform loop counter are live across the backedge. */
+    int carried = WARP;
+    for (int i = 0; i < 5; ++i)
+        carried += i;
+    if (!warp_all(carried == WARP + 10))
+        return 0;
+
+    int answer = 11;
+    if (sequential == 210)
+        answer += 10;
+    else
+        answer = 0;
+    if (sequential == 0)
+        answer = 0;
+    else
+        answer += 21;
+    return answer;
+}

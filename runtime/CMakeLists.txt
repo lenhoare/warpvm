@@ -49,6 +49,8 @@ add_test(NAME gfxb_flip COMMAND warpvm gfxb)
 add_test(NAME cpu_interpreter COMMAND warpvm cpu_tests)
 add_test(NAME v013_compiled_arithmetic_control_memory
   COMMAND warpvm compiled_tests)
+add_test(NAME compiled_resident_framebuffer
+  COMMAND warpvm compiled_fb_tests)
 add_test(NAME warpc_frontend_unit
   COMMAND ${CMAKE_COMMAND} -E env CARGO_TARGET_DIR=${WVM_CARGO_TARGET_DIR}
           cargo test --manifest-path ${WVM_TOOLS_DIR}/Cargo.toml -p warpc)
@@ -92,6 +94,11 @@ add_test(NAME warpc_divergent_if
           ${WVM_WARPC} $<TARGET_FILE:warpvm>
           ${CMAKE_SOURCE_DIR}/programs/warpc/divergent_if.wc
           ${CMAKE_BINARY_DIR}/warpc_divergent_if warpc_divergent_if)
+add_test(NAME warpc_register_allocation
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_acceptance.sh
+          ${WVM_WARPC} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/programs/warpc/register_allocation.wc
+          ${CMAKE_BINARY_DIR}/warpc_register_allocation warpc_register_allocation)
 add_test(NAME warpc_graphics
   COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_graphics.sh
           ${WVM_WARPC} $<TARGET_FILE:warpvm>
