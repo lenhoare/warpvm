@@ -64,9 +64,9 @@ int main(void)
             /* Colour: black inside the set, else a frame-cycled palette. The
              * dead loop registers are reused as the r/g/b channels. */
             escaped = count < 100;                            /* active flag */
-            a = ((count * 8 + g_frame) & 255u) * escaped;     /* r */
-            b = ((count * 5 + 40) & 255u) * escaped;          /* g */
-            ci = ((count * 13 + 90) & 255u) * escaped;        /* b (reuse ci) */
+            a = escaped ? ((count * 8 + g_frame) & 255u) : 0; /* r */
+            b = escaped ? ((count * 5 + 40) & 255u) : 0;      /* g */
+            ci = escaped ? ((count * 13 + 90) & 255u) : 0;    /* b (reuse ci) */
             count = warp_argb(255u, a, b, ci);                /* packed colour */
 
             warp_set_pixel((g_batch * 32u + WARP) & 127u,

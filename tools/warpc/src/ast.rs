@@ -150,6 +150,11 @@ pub enum ExprKind {
     },
     Unary(UnaryOp, Box<Expr>),
     Binary(BinaryOp, Box<Expr>, Box<Expr>),
+    Conditional {
+        condition: Box<Expr>,
+        then_expr: Box<Expr>,
+        else_expr: Box<Expr>,
+    },
     Assign(AssignOp, Box<Expr>, Box<Expr>),
     Index(Box<Expr>, Box<Expr>),
     Member {

@@ -429,7 +429,7 @@ impl<'a> Parser<'a> {
     }
 
     fn assignment(&mut self) -> Result<Expr, Diagnostic> {
-        let left = self.logical_or()?;
+        let left = self.conditional()?;
         let op = match self.peek().kind {
             TokenKind::Equal => AssignOp::Assign,
             TokenKind::PlusEqual => AssignOp::Add,
@@ -448,6 +448,28 @@ impl<'a> Parser<'a> {
         let right = self.assignment()?;
         Ok(Expr {
             kind: ExprKind::Assign(op, Box::new(left), Box::new(right)),
+            span,
+        })
+    }
+
+    // C places ?: between logical-or and assignment. The else arm recurses
+    // through conditional(), making `a ? b : c ? d : e` right-associative;
+    // the middle arm is a full expression as required by C.
+    fn conditional(&mut self) -> Result<Expr, Diagnostic> {
+        let condition = self.logical_or()?;
+        if !self.at(&TokenKind::Question) {
+            return Ok(condition);
+        }
+        let span = self.bump().span;
+        let then_expr = self.expression()?;
+        self.expect(TokenKind::Colon, "expected ':' in conditional expression")?;
+        let else_expr = self.conditional()?;
+        Ok(Expr {
+            kind: ExprKind::Conditional {
+                condition: Box::new(condition),
+                then_expr: Box::new(then_expr),
+                else_expr: Box::new(else_expr),
+            },
             span,
         })
     }
@@ -726,6 +748,30 @@ mod tests {
             panic!()
         };
         assert!(matches!(right.kind, ExprKind::Binary(BinaryOp::Mul, _, _)));
+    }
+
+    #[test]
+    fn conditional_has_c_precedence_and_is_right_associative() {
+        let p = source("int main(void) { int x = 1 + 2 ? 3 : 4 ? 5 : 6; return x; }");
+        let Stmt::Decl {
+            init: Some(init), ..
+        } = &p.functions[0].body.as_ref().unwrap().statements[0]
+        else {
+            panic!()
+        };
+        let ExprKind::Conditional {
+            condition,
+            else_expr,
+            ..
+        } = &init.kind
+        else {
+            panic!()
+        };
+        assert!(matches!(
+            condition.kind,
+            ExprKind::Binary(BinaryOp::Add, _, _)
+        ));
+        assert!(matches!(else_expr.kind, ExprKind::Conditional { .. }));
     }
 
     #[test]

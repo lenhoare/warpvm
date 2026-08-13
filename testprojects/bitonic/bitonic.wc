@@ -11,8 +11,8 @@
  * For a step at distance j, lane i exchanges with lane i^j. The subsequence is
  * sorted ascending when (i & k)==0, and lane i is the lower element of its
  * comparator when (i & j)==0. The lower element of an ascending pair keeps the
- * minimum; every other combination flips. So a lane keeps its own value when
- * `want_min == (mine < theirs)` and otherwise adopts the partner's value.
+ * minimum; every other combination keeps the maximum. The compare-exchange
+ * therefore maps directly to Warp C's conditional and min/max expressions.
  *
  * warp_shuffle takes a runtime, per-lane source lane, so the loops stay rolled
  * (warp_shuffle_xor would require a compile-time constant mask and full
@@ -35,8 +35,7 @@ int main(void)
         for (j = k >> 1; j > 0; j = j >> 1) {
             int other = warp_shuffle(val, WARP ^ j);
             int want_min = ((WARP & j) == 0) == ((WARP & k) == 0);
-            if (want_min != (val < other))
-                val = other;
+            val = want_min ? min(val, other) : max(val, other);
         }
     }
 

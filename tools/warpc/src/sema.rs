@@ -307,6 +307,10 @@ pub enum Intrinsic {
     ReduceAnd,
     ReduceOr,
     ReduceXor,
+    MinSigned,
+    MaxSigned,
+    MinUnsigned,
+    MaxUnsigned,
 }
 
 #[derive(Clone, Debug)]
@@ -341,6 +345,11 @@ pub enum TypedExprKind {
         left: Box<TypedExpr>,
         right: Box<TypedExpr>,
         operand_type: Type,
+    },
+    Conditional {
+        condition: Box<TypedExpr>,
+        then_expr: Box<TypedExpr>,
+        else_expr: Box<TypedExpr>,
     },
     PointerAdd {
         pointer: Box<TypedExpr>,
@@ -707,6 +716,8 @@ impl Analyzer {
                 | "warp_reduce_and"
                 | "warp_reduce_or"
                 | "warp_reduce_xor"
+                | "min"
+                | "max"
         ) {
             return Err(Diagnostic::new(
                 function.span,
@@ -1288,6 +1299,11 @@ impl Analyzer {
             ast::ExprKind::Call { callee, args } => self.call(callee, args, span),
             ast::ExprKind::Unary(op, operand) => self.unary(op, *operand, span),
             ast::ExprKind::Binary(op, left, right) => self.binary(op, *left, *right, span),
+            ast::ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => self.conditional(*condition, *then_expr, *else_expr, span),
             ast::ExprKind::Assign(op, left, right) => self.assignment(op, *left, *right, span),
             ast::ExprKind::Index(base, index) => self.index(*base, *index, span),
             ast::ExprKind::Member {
@@ -1327,6 +1343,9 @@ impl Analyzer {
         args: Vec<ast::Expr>,
         span: Span,
     ) -> Result<TypedExpr, Diagnostic> {
+        if matches!(callee.as_str(), "min" | "max") {
+            return self.min_max(callee == "max", args, span);
+        }
         let signature = match callee.as_str() {
             "warp_lane_id" => Some((Intrinsic::LaneId, 0, Type::I32, Uniformity::Divergent)),
             "warp_vm_id" => Some((Intrinsic::VmId, 0, Type::U32, Uniformity::Uniform)),
@@ -1537,6 +1556,132 @@ impl Analyzer {
                 args: typed_args,
             },
             ty: symbol.return_type,
+            uniformity,
+            span,
+        })
+    }
+
+    fn min_max(
+        &mut self,
+        maximum: bool,
+        args: Vec<ast::Expr>,
+        span: Span,
+    ) -> Result<TypedExpr, Diagnostic> {
+        let name = if maximum { "max" } else { "min" };
+        if args.len() != 2 {
+            return Err(Diagnostic::new(
+                span,
+                format!(
+                    "intrinsic '{name}' expects 2 arguments but received {}",
+                    args.len()
+                ),
+            ));
+        }
+        let mut args = args.into_iter();
+        let left = self.expr(args.next().unwrap())?;
+        let right = self.expr(args.next().unwrap())?;
+        require_integer(&left, "min/max argument")?;
+        require_integer(&right, "min/max argument")?;
+        let ty = usual_type(value_type(left.ty), value_type(right.ty));
+        let uniformity = left.uniformity.join(right.uniformity);
+
+        // Folding both literal arguments is deliberately small and safe: it
+        // never removes evaluation of an expression that could have effects.
+        if let (TypedExprKind::Literal(a), TypedExprKind::Literal(b)) = (&left.kind, &right.kind) {
+            let value = if ty == Type::I32 {
+                if maximum {
+                    (*a as i32).max(*b as i32) as u32
+                } else {
+                    (*a as i32).min(*b as i32) as u32
+                }
+            } else if maximum {
+                (*a).max(*b)
+            } else {
+                (*a).min(*b)
+            };
+            return Ok(TypedExpr {
+                kind: TypedExprKind::Literal(value),
+                ty,
+                uniformity: Uniformity::Uniform,
+                span,
+            });
+        }
+
+        let intrinsic = match (maximum, ty == Type::I32) {
+            (false, true) => Intrinsic::MinSigned,
+            (true, true) => Intrinsic::MaxSigned,
+            (false, false) => Intrinsic::MinUnsigned,
+            (true, false) => Intrinsic::MaxUnsigned,
+        };
+        Ok(TypedExpr {
+            kind: TypedExprKind::Intrinsic {
+                intrinsic,
+                args: vec![left, right],
+            },
+            ty,
+            uniformity,
+            span,
+        })
+    }
+
+    fn conditional(
+        &mut self,
+        condition: ast::Expr,
+        then_expr: ast::Expr,
+        else_expr: ast::Expr,
+        span: Span,
+    ) -> Result<TypedExpr, Diagnostic> {
+        let condition = self.condition(condition, "conditional condition")?;
+        let masked = condition.uniformity == Uniformity::Divergent || self.divergent_depth != 0;
+        if masked && self.divergent_depth >= 2 {
+            return Err(Diagnostic::new(
+                span,
+                "divergent conditional nesting exceeds the two predicate masks available in Slice E",
+            ));
+        }
+        if masked {
+            self.divergent_depth += 1;
+        }
+        let then_expr = self.expr(then_expr);
+        let else_expr = self.expr(else_expr);
+        if masked {
+            self.divergent_depth -= 1;
+        }
+        let then_expr = then_expr?;
+        let else_expr = else_expr?;
+        let then_ty = value_type(then_expr.ty);
+        let else_ty = value_type(else_expr.ty);
+        let ty = if then_ty == Type::VOID && else_ty == Type::VOID {
+            Type::VOID
+        } else if then_ty.is_integer() && else_ty.is_integer() {
+            usual_type(then_ty, else_ty)
+        } else if compatible_pointers(then_ty, else_ty) {
+            if then_ty.pointee() == Some(Type::VOID) {
+                then_ty
+            } else {
+                else_ty
+            }
+        } else if then_ty.is_pointer() && is_zero_literal(&else_expr) {
+            then_ty
+        } else if else_ty.is_pointer() && is_zero_literal(&then_expr) {
+            else_ty
+        } else {
+            return Err(Diagnostic::new(
+                span,
+                "conditional arms must have compatible scalar types",
+            ));
+        };
+        let uniformity = condition
+            .uniformity
+            .join(then_expr.uniformity)
+            .join(else_expr.uniformity);
+        Ok(TypedExpr {
+            kind: TypedExprKind::Conditional {
+                condition: Box::new(condition),
+                then_expr: Box::new(then_expr),
+                else_expr: Box::new(else_expr),
+            },
+            ty,
             uniformity,
             span,
         })
@@ -2090,6 +2235,15 @@ fn scan_expr_divergence(
             scan_expr_divergence(left, function_ids, direct, edges);
             scan_expr_divergence(right, function_ids, direct, edges);
         }
+        ast::ExprKind::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            scan_expr_divergence(condition, function_ids, direct, edges);
+            scan_expr_divergence(then_expr, function_ids, direct, edges);
+            scan_expr_divergence(else_expr, function_ids, direct, edges);
+        }
         ast::ExprKind::Member { base, .. } => {
             scan_expr_divergence(base, function_ids, direct, edges);
         }
@@ -2284,6 +2438,17 @@ fn constant_ast(expr: &ast::Expr) -> Result<u32, Diagnostic> {
                 }
             })
         }
+        ast::ExprKind::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            if constant_ast(condition)? != 0 {
+                constant_ast(then_expr)
+            } else {
+                constant_ast(else_expr)
+            }
+        }
         _ => Err(Diagnostic::new(
             expr.span,
             "not a constant integer expression",
@@ -2361,6 +2526,17 @@ fn constant_u32(expr: &TypedExpr) -> Result<u32, Diagnostic> {
                     ))
                 }
             })
+        }
+        TypedExprKind::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            if constant_u32(condition)? != 0 {
+                constant_u32(then_expr)
+            } else {
+                constant_u32(else_expr)
+            }
         }
         _ => Err(Diagnostic::new(
             expr.span,
@@ -2490,6 +2666,44 @@ mod tests {
         assert_eq!(p.locals[1].uniformity, Uniformity::Divergent);
         assert_eq!(p.locals[2].uniformity, Uniformity::Divergent);
         assert_eq!(p.locals[3].uniformity, Uniformity::Divergent);
+    }
+
+    #[test]
+    fn conditional_and_min_max_infer_types_and_uniformity() {
+        let p = source(
+            "int main(void) { int a=1?2:3; unsigned b=min(9u,4); int c=WARP<16?a:max(WARP,7); return a+b+c; }",
+        )
+        .unwrap();
+        assert_eq!(p.locals[0].ty, Type::I32);
+        assert_eq!(p.locals[0].uniformity, Uniformity::Uniform);
+        assert_eq!(p.locals[1].ty, Type::U32);
+        assert_eq!(p.locals[1].uniformity, Uniformity::Uniform);
+        assert_eq!(p.locals[2].ty, Type::I32);
+        assert_eq!(p.locals[2].uniformity, Uniformity::Divergent);
+    }
+
+    #[test]
+    fn trivial_min_max_calls_fold_without_erasing_effects() {
+        let p = source("int main(void) { int x=min(-2,7); unsigned y=max(1u,9u); return x+y; }")
+            .unwrap();
+        let main = p.functions.iter().find(|f| f.id == p.main).unwrap();
+        let TypedStmt::Decl {
+            init: Some(TypedInitializer::Expr(first)),
+            ..
+        } = &main.body.statements[0]
+        else {
+            panic!()
+        };
+        // -2 is a unary expression, so it intentionally remains runtime code.
+        assert!(matches!(first.kind, TypedExprKind::Intrinsic { .. }));
+        let TypedStmt::Decl {
+            init: Some(TypedInitializer::Expr(second)),
+            ..
+        } = &main.body.statements[1]
+        else {
+            panic!()
+        };
+        assert!(matches!(second.kind, TypedExprKind::Literal(9)));
     }
 
     #[test]

@@ -40,8 +40,10 @@ Implemented types and memory objects:
 Implemented expressions include decimal and hexadecimal integer literals,
 `u` suffixes, character and string literals and escapes, unary `+ - ! ~`,
 arithmetic, bitwise and logical operators, comparisons, shifts, comma, simple
-and compound assignment, and pre/post increment and decrement. Normal C
-precedence and associativity apply. `&&` and `||` short-circuit. Memory
+and compound assignment, pre/post increment and decrement, and the
+right-associative conditional operator `condition ? a : b`. Normal C
+precedence and associativity apply. `&&`, `||`, and `?:` evaluate only the
+selected expression. Memory
 expressions include `&`, `*`, pointer arithmetic, subscripting, `.`, `->`, and
 `sizeof` on both types and expressions. Pointer arithmetic scales by the
 pointed-to object's word size; `char *` and `int *` therefore advance by one
@@ -69,8 +71,8 @@ Slice E relaxes that restriction specifically for structured `if` / `else`.
 
 The deliberately small declarator subset currently supports one array suffix,
 ordinary pointer stars, and top-level named structure definitions. Brace
-initializers, structure assignment/return, casts, conditional expressions,
-and variadic functions are not yet accepted. Character
+initializers, structure assignment/return, casts, and variadic functions are
+not yet accepted. Character
 arrays may be initialized directly from strings; scalar globals require
 constant integer or string-pointer initializers.
 
@@ -113,6 +115,12 @@ No implicit clipping or bounds check is added to `warp_set_pixel`; invalid
 coordinates retain the architecture's normal memory-fault behaviour.
 `warp_flip()` is rejected inside divergent control because publication is one
 VM-wide event, while framebuffer stores may be lane-predicated normally.
+
+Warp C also provides type-generic integer `min(a, b)` and `max(a, b)`
+builtins. Mixed arguments use the usual integer conversions. Unsigned values
+lower directly to the existing `MIN`/`MAX` instructions; signed values use a
+sign-bit bias around those same instructions. No additional VM opcodes are
+required.
 
 ## Warp-wide collectives and cooperative memory
 

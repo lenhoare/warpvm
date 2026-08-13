@@ -31,6 +31,7 @@ pub enum TokenKind {
     RBracket,
     Semicolon,
     Comma,
+    Question,
     Colon,
     Dot,
     Arrow,
@@ -336,6 +337,7 @@ impl<'a> Lexer<'a> {
             (b']', _, _) => RBracket,
             (b';', _, _) => Semicolon,
             (b',', _, _) => Comma,
+            (b'?', _, _) => Question,
             (b':', _, _) => Colon,
             (b'.', _, _) => Dot,
             (b'+', _, _) => Plus,
@@ -390,9 +392,10 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_control_flow_keywords_and_colon() {
+    fn recognizes_control_flow_keywords_and_conditional_punctuation() {
         let tokens =
-            lex("if else while do for break continue switch case 1: default: return").unwrap();
+            lex("if else while do for break continue switch case 1: default: return 1 ? 2 : 3")
+                .unwrap();
         for kind in [
             TokenKind::If,
             TokenKind::Else,
@@ -404,6 +407,7 @@ mod tests {
             TokenKind::Switch,
             TokenKind::Case,
             TokenKind::Default,
+            TokenKind::Question,
             TokenKind::Colon,
         ] {
             assert!(tokens.iter().any(|token| token.kind == kind));

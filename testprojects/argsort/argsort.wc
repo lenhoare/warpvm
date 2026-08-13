@@ -47,12 +47,11 @@ int main(void)
             /* Adopt the partner only on a STRICT comparison, so equal keys
              * keep their own payload instead of both copying one side. A
              * want-min lane takes a strictly smaller partner; a want-max lane
-             * takes a strictly larger one. Branchless to avoid nested masks. */
+             * takes a strictly larger one. Conditional selection applies the
+             * same lane mask to the key and its payload. */
             int take = (want_min & (ok < key)) | ((1 - want_min) & (ok > key));
-            if (take) {
-                key = ok;
-                pay = op;
-            }
+            key = take ? ok : key;
+            pay = take ? op : pay;
         }
     }
 

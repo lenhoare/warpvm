@@ -99,6 +99,29 @@ add_test(NAME warpc_register_allocation
           ${WVM_WARPC} $<TARGET_FILE:warpvm>
           ${CMAKE_SOURCE_DIR}/programs/warpc/register_allocation.wc
           ${CMAKE_BINARY_DIR}/warpc_register_allocation warpc_register_allocation)
+add_test(NAME warpc_conditional_minmax
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_acceptance.sh
+          ${WVM_WARPC} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/programs/warpc/conditional_minmax.wc
+          ${CMAKE_BINARY_DIR}/warpc_conditional_minmax warpc_conditional_minmax)
+add_test(NAME warpc_bitonic_conditional_minmax
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_acceptance.sh
+          ${WVM_WARPC} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/testprojects/bitonic/bitonic.wc
+          ${CMAKE_BINARY_DIR}/warpc_bitonic_conditional_minmax
+          warpc_bitonic_conditional_minmax)
+add_test(NAME warpc_bitonic_general_conditional_minmax
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_acceptance.sh
+          ${WVM_WARPC} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/testprojects/bitonic/bitonic_general.wc
+          ${CMAKE_BINARY_DIR}/warpc_bitonic_general_conditional_minmax
+          warpc_bitonic_general_conditional_minmax)
+add_test(NAME warpc_argsort_conditional
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_acceptance.sh
+          ${WVM_WARPC} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/testprojects/argsort/argsort.wc
+          ${CMAKE_BINARY_DIR}/warpc_argsort_conditional
+          warpc_argsort_conditional)
 add_test(NAME warpc_graphics
   COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_graphics.sh
           ${WVM_WARPC} $<TARGET_FILE:warpvm>

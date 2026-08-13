@@ -32,8 +32,7 @@ int main(void)
         for (j = k >> 1; j > 0; j = j >> 1) {
             unsigned other = warp_shuffle(val, WARP ^ j);
             int want_min = ((WARP & j) == 0) == ((WARP & k) == 0);
-            if (want_min != (val < other))
-                val = other;
+            val = want_min ? min(val, other) : max(val, other);
         }
     }
 

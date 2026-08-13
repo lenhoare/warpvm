@@ -89,6 +89,15 @@ impl LifetimeCollector {
                 self.expr(left, point, touched);
                 self.expr(right, point, touched);
             }
+            TypedExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.expr(condition, point, touched);
+                self.expr(then_expr, point, touched);
+                self.expr(else_expr, point, touched);
+            }
             TypedExprKind::PointerAdd { pointer, index, .. } => {
                 self.expr(pointer, point, touched);
                 self.expr(index, point, touched);
@@ -986,6 +995,11 @@ impl<'a> Generator<'a> {
                 right,
                 operand_type,
             } => self.binary(*op, left, right, *operand_type, expr),
+            TypedExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => self.conditional(condition, then_expr, else_expr, expr),
             TypedExprKind::PointerAdd {
                 pointer,
                 index,
@@ -1333,7 +1347,156 @@ impl<'a> Generator<'a> {
                     owned: true,
                 })
             }
+            Intrinsic::MinUnsigned
+            | Intrinsic::MaxUnsigned
+            | Intrinsic::MinSigned
+            | Intrinsic::MaxSigned => {
+                let left = self.expr(&args[0])?;
+                let right = self.expr(&args[1])?;
+                let signed = matches!(intrinsic, Intrinsic::MinSigned | Intrinsic::MaxSigned);
+                let maximum = matches!(intrinsic, Intrinsic::MaxSigned | Intrinsic::MaxUnsigned);
+                let (left, right) = if signed {
+                    let biased_left = self.alloc_reg(span)?;
+                    self.instr(&format!("XOR r{biased_left}, r{}, {SIGN_BIT}", left.reg));
+                    self.release(left);
+                    let biased_right = self.alloc_reg(span)?;
+                    self.instr(&format!("XOR r{biased_right}, r{}, {SIGN_BIT}", right.reg));
+                    self.release(right);
+                    (
+                        Value {
+                            reg: biased_left,
+                            owned: true,
+                        },
+                        Value {
+                            reg: biased_right,
+                            owned: true,
+                        },
+                    )
+                } else {
+                    (left, right)
+                };
+                let out = self.alloc_reg(span)?;
+                let mnemonic = if maximum { "MAX" } else { "MIN" };
+                self.instr(&format!("{mnemonic} r{out}, r{}, r{}", left.reg, right.reg));
+                self.release(left);
+                self.release(right);
+                if signed {
+                    self.instr(&format!("XOR r{out}, r{out}, {SIGN_BIT}"));
+                }
+                Ok(Value {
+                    reg: out,
+                    owned: true,
+                })
+            }
         }
+    }
+
+    fn conditional(
+        &mut self,
+        condition: &TypedExpr,
+        then_expr: &TypedExpr,
+        else_expr: &TypedExpr,
+        expr: &TypedExpr,
+    ) -> Result<Value, Diagnostic> {
+        if condition.uniformity == Uniformity::Divergent || self.current_guard.is_some() {
+            return self.masked_conditional(condition, then_expr, else_expr, expr.span);
+        }
+
+        let otherwise = self.label("conditional_else");
+        let end = self.label("conditional_end");
+        self.jump_if_zero(condition, &otherwise)?;
+        if expr.ty == Type::VOID {
+            let then_value = self.expr(then_expr)?;
+            self.release(then_value);
+            self.instr(&format!("JMP {end}"));
+            self.line(&format!("{otherwise}:"));
+            let else_value = self.expr(else_expr)?;
+            self.release(else_value);
+            self.line(&format!("{end}:"));
+            return Ok(Value {
+                reg: 0,
+                owned: false,
+            });
+        }
+        let out = self.alloc_reg(expr.span)?;
+        let then_value = self.expr(then_expr)?;
+        self.instr(&format!("MOV r{out}, r{}", then_value.reg));
+        self.release(then_value);
+        self.instr(&format!("JMP {end}"));
+        self.line(&format!("{otherwise}:"));
+        let else_value = self.expr(else_expr)?;
+        self.instr(&format!("MOV r{out}, r{}", else_value.reg));
+        self.release(else_value);
+        self.line(&format!("{end}:"));
+        Ok(Value {
+            reg: out,
+            owned: true,
+        })
+    }
+
+    fn masked_conditional(
+        &mut self,
+        condition: &TypedExpr,
+        then_expr: &TypedExpr,
+        else_expr: &TypedExpr,
+        span: Span,
+    ) -> Result<Value, Diagnostic> {
+        let mask = match self.mask_stack.len() {
+            0 => 3,
+            1 => 2,
+            _ => {
+                return Err(Diagnostic::new(
+                    span,
+                    "divergent conditional nesting exhausted predicate masks",
+                ))
+            }
+        };
+        let parent = self.current_guard;
+        let condition_value = self.expr(condition)?;
+        if let Some(parent) = parent {
+            self.raw_instr(&format!("BALLOT p0, r{}", condition_value.reg));
+            self.raw_instr(&format!("ANDMASK p{mask}, p{parent}, p0"));
+        } else {
+            self.raw_instr(&format!("BALLOT p{mask}, r{}", condition_value.reg));
+        }
+        self.release(condition_value);
+
+        let out = if then_expr.ty == Type::VOID {
+            None
+        } else {
+            let out = self.alloc_reg(span)?;
+            self.instr(&format!("MOV r{out}, 0"));
+            Some(out)
+        };
+        self.mask_stack.push(mask);
+        self.current_guard = Some(mask);
+        let then_value = self.expr(then_expr)?;
+        if let Some(out) = out {
+            self.instr(&format!("MOV r{out}, r{}", then_value.reg));
+        }
+        self.release(then_value);
+
+        if let Some(parent) = parent {
+            self.raw_instr(&format!("NOTMASK p0, p{mask}"));
+            self.raw_instr(&format!("ANDMASK p{mask}, p{parent}, p0"));
+        } else {
+            self.raw_instr(&format!("NOTMASK p{mask}, p{mask}"));
+        }
+        let else_value = self.expr(else_expr)?;
+        if let Some(out) = out {
+            self.instr(&format!("MOV r{out}, r{}", else_value.reg));
+        }
+        self.release(else_value);
+
+        self.mask_stack.pop();
+        self.current_guard = parent;
+        Ok(out.map_or(
+            Value {
+                reg: 0,
+                owned: false,
+            },
+            |reg| Value { reg, owned: true },
+        ))
     }
 
     fn call(
@@ -2140,6 +2303,37 @@ mod tests {
         assert!(text.contains("VMID"));
         assert!(text.contains("JMP_IF_ANY"));
         assert!(!text.contains("BALLOT p3"));
+    }
+
+    #[test]
+    fn conditionals_select_with_branches_or_execution_masks() {
+        let uniform =
+            assembly("int main(void) { int side=0; return warp_vm_id() ? ++side : (side += 42); }");
+        assert!(uniform.contains("conditional_else"));
+        assert!(uniform.contains("JMP_IF_ANY"));
+        assert!(!uniform.contains("BALLOT p3"));
+
+        let divergent = assembly(
+            "int main(void) { int a=1; int b=2; return WARP < 16 ? (a += 3) : (b += 4); }",
+        );
+        assert!(divergent.contains("BALLOT p3"));
+        assert!(divergent.contains("@p3"));
+        assert!(divergent.contains("NOTMASK p3, p3"));
+
+        let void_arms =
+            assembly("int main(void) { warp_vm_id() ? warp_flip() : warp_flip(); return 42; }");
+        assert_eq!(void_arms.matches("FLIP").count(), 2);
+        assert!(void_arms.contains("conditional_else"));
+    }
+
+    #[test]
+    fn min_max_use_existing_unsigned_isa_with_signed_bias() {
+        let text = assembly(
+            "int main(void) { unsigned u=WARP; int s=WARP-20; return min(s, 7) + max(u, 9u); }",
+        );
+        assert!(text.contains("MIN r"));
+        assert!(text.contains("MAX r"));
+        assert!(text.contains(&SIGN_BIT.to_string()));
     }
 
     #[test]

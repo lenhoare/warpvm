@@ -40,6 +40,11 @@ unsigned warp_reduce_and(unsigned value);
 unsigned warp_reduce_or(unsigned value);
 unsigned warp_reduce_xor(unsigned value);
 
+/* Type-generic integer compiler builtins. The result follows the usual
+ * signed/unsigned arithmetic conversions of the two arguments. */
+int min(int a, int b);
+int max(int a, int b);
+
 /* Compiler-provided Warp C source routines. Sizes and addresses are words. */
 void warp_memcpy(unsigned *dst, unsigned *src, unsigned words);
 void warp_memset(unsigned *dst, unsigned value, unsigned words);
