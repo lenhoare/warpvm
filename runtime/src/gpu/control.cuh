@@ -27,6 +27,7 @@ enum VmCmd : uint32_t {
   kCmdReset = 3,   // reinitialise VM state (pc=0, registers zeroed)
   kCmdExit = 4,    // this VM's warp leaves the kernel
   kCmdStep = 5,    // paused VM: retire exactly one instruction, re-pause
+  kCmdDeactivate = 6,  // retire binding but keep its resident warp alive
 };
 
 // Why a VM's execution loop stopped.

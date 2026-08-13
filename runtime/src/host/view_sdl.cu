@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "gpu/warpvm.cuh"
@@ -56,42 +57,9 @@ SDL_Rect FitToWindow(SDL_Renderer* renderer, const ViewerLayout& layout) {
                   width, height};
 }
 
-int RunViewer(const char* path, uint32_t resident_vms, uint32_t first_vm,
-              const ViewerLayout& layout, bool compiled) {
-  WvmFile file;
-  std::string err;
-  if (!LoadWvm(path, file, err)) {
-    std::fprintf(stderr, "error: %s: %s\n", path, err.c_str());
-    return 2;
-  }
-
-  std::vector<VmImage> images(resident_vms);
-  for (VmImage& image : images) {
-    image.code = file.code;
-    image.literals = file.literals;
-    image.mem_size_words = kRamSizeWords;
-  }
-  PersistentRuntime rt;
-  PtxResidentProgram resident_program;
-  bool launched = rt.Init(images, err);
-  if (launched && compiled) {
-    launched = rt.EnsureStream(err) && resident_program.Compile(file, err) &&
-               resident_program.Launch(
-                   reinterpret_cast<CUdeviceptr>(rt.DeviceStates()),
-                   resident_vms,
-                   reinterpret_cast<CUdeviceptr>(rt.DeviceDescs()),
-                   reinterpret_cast<CUdeviceptr>(rt.DeviceControl()),
-                   reinterpret_cast<CUdeviceptr>(rt.DeviceMailboxes()),
-                   reinterpret_cast<CUstream>(rt.Stream()), err);
-  } else if (launched) {
-    launched = rt.Launch(err);
-  }
-  if (!launched) {
-    std::fprintf(stderr, "error: %s\n", err.c_str());
-    return 1;
-  }
-  rt.BootAll();
-
+int PresentRuntime(PersistentRuntime& rt, const std::string& source,
+                   uint32_t first_vm, const ViewerLayout& layout,
+                   const char* mode) {
   if (SDL_Init(SDL_INIT_VIDEO) != 0) {
     std::fprintf(stderr, "error: SDL_Init: %s\n", SDL_GetError());
     rt.ShutdownAll();
@@ -183,11 +151,11 @@ int RunViewer(const char* path, uint32_t resident_vms, uint32_t first_vm,
   if (grid) {
     std::printf("view%s: %u VMs from %s in a %ux%u grid "
                 "(close window or Esc to exit)\n",
-                compiled ? " (compiled resident)" : "",
-                layout.displayed_vms, path, layout.columns, layout.rows);
+                mode, layout.displayed_vms, source.c_str(), layout.columns,
+                layout.rows);
   } else {
     std::printf("view%s: VM %u from %s (close window or Esc to exit)\n",
-                compiled ? " (compiled resident)" : "", first_vm, path);
+                mode, first_vm, source.c_str());
   }
 
   std::vector<uint32_t> framebuffers;
@@ -259,6 +227,55 @@ int RunViewer(const char* path, uint32_t resident_vms, uint32_t first_vm,
   return 0;
 }
 
+int RunViewer(const char* path, uint32_t resident_vms, uint32_t first_vm,
+              const ViewerLayout& layout, bool compiled) {
+  WvmFile file;
+  std::string err;
+  if (!LoadWvm(path, file, err)) {
+    std::fprintf(stderr, "error: %s: %s\n", path, err.c_str());
+    return 2;
+  }
+
+  std::vector<VmImage> images(resident_vms);
+  for (VmImage& image : images) {
+    image.code = file.code;
+    image.literals = file.literals;
+    image.mem_size_words = kRamSizeWords;
+  }
+  PersistentRuntime rt;
+  PtxResidentProgram resident_program;
+  bool launched = rt.Init(images, err);
+  if (launched && compiled) {
+    launched = rt.EnsureStream(err) && resident_program.Compile(file, err) &&
+               resident_program.Launch(
+                   reinterpret_cast<CUdeviceptr>(rt.DeviceStates()),
+                   resident_vms,
+                   reinterpret_cast<CUdeviceptr>(rt.DeviceDescs()),
+                   reinterpret_cast<CUdeviceptr>(rt.DeviceControl()),
+                   reinterpret_cast<CUdeviceptr>(rt.DeviceMailboxes()),
+                   reinterpret_cast<CUstream>(rt.Stream()), err);
+  } else if (launched) {
+    launched = rt.Launch(err);
+  }
+  if (!launched) {
+    std::fprintf(stderr, "error: %s\n", err.c_str());
+    return 1;
+  }
+  rt.BootAll();
+  return PresentRuntime(rt, path, first_vm, layout,
+                        compiled ? " (compiled resident)" : "");
+}
+
+std::string ProgramName(const std::string& path, size_t ordinal) {
+  const size_t slash = path.find_last_of("/\\");
+  std::string name =
+      slash == std::string::npos ? path : path.substr(slash + 1);
+  const size_t dot = name.rfind('.');
+  if (dot != std::string::npos) name.resize(dot);
+  if (name.empty()) name = "program";
+  return name + "-" + std::to_string(ordinal);
+}
+
 }  // namespace
 
 int ViewSingleVm(const char* path, uint32_t vm_index, bool compiled) {
@@ -268,6 +285,59 @@ int ViewSingleVm(const char* path, uint32_t vm_index, bool compiled) {
 
 int ViewVmGrid(const char* path, uint32_t n_vms, bool compiled) {
   return RunViewer(path, n_vms, 0, MakeGridLayout(n_vms), compiled);
+}
+
+int ViewHeterogeneousGrid(const std::vector<std::string>& paths) {
+  if (paths.empty() || paths.size() > kMaxVms) {
+    std::fprintf(stderr, "error: hetero_view requires 1..%u programs\n",
+                 kMaxVms);
+    return 2;
+  }
+
+  ProgramRegistry registry;
+  VmDirectory directory(static_cast<uint32_t>(paths.size()));
+  std::unordered_map<std::string, LoadedProgramId> loaded_paths;
+  std::vector<VmBinding> bindings(paths.size());
+  std::string err;
+  for (VmSlot slot = 0; slot < paths.size(); ++slot) {
+    LoadedProgramId program_id;
+    const auto loaded = loaded_paths.find(paths[slot]);
+    if (loaded != loaded_paths.end()) {
+      program_id = loaded->second;
+    } else {
+      if (!registry.Load(paths[slot], ProgramName(paths[slot], slot),
+                         program_id, err)) {
+        std::fprintf(stderr, "error: %s: %s\n", paths[slot].c_str(),
+                     err.c_str());
+        return 2;
+      }
+      loaded_paths.emplace(paths[slot], program_id);
+    }
+    LogicalVmId vm_id;
+    if (!directory.Create(ResidentSlotId{slot}, vm_id, err) ||
+        !registry.Retain(program_id, err)) {
+      std::fprintf(stderr, "error: %s\n", err.c_str());
+      return 1;
+    }
+    bindings[slot].vm_id = vm_id;
+    bindings[slot].program_id = program_id;
+  }
+
+  PersistentRuntime rt;
+  if (!rt.Init(registry, bindings, err) || !rt.Launch(err)) {
+    std::fprintf(stderr, "error: %s\n", err.c_str());
+    return 1;
+  }
+  rt.BootAll();
+  std::printf("heterogeneous population: %zu VMs, %zu shared program "
+              "image(s)\n",
+              paths.size(), rt.device_program_count());
+  for (VmSlot slot = 0; slot < paths.size(); ++slot)
+    std::printf("  VM %u -> slot %u -> %s\n", rt.VmIdAtSlot(slot), slot,
+                rt.ProgramNameAtSlot(slot).c_str());
+  return PresentRuntime(rt, "heterogeneous registry", 0,
+                        MakeGridLayout(static_cast<uint32_t>(paths.size())),
+                        " (heterogeneous interpreted)");
 }
 
 }  // namespace wvm

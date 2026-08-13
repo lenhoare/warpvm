@@ -63,6 +63,12 @@ struct MailboxSlot {
 // consumes. head reserves positions, tail is the owner's next position, and
 // per-slot sequences provide capacity control plus publication ordering.
 struct Mailbox {
+  // Logical owner and producer count make slot retirement safe. A sender
+  // pins the mailbox before validating its owner; the supervisor withdraws
+  // the route and owner, then waits for all pinned sends to leave before the
+  // resident slot may be recycled for a different logical VM.
+  volatile uint32_t owner_vm_id;
+  volatile uint32_t in_flight_sends;
   volatile uint32_t head;
   volatile uint32_t tail;
   MailboxSlot slots[kMailboxSlots];
@@ -71,8 +77,15 @@ struct Mailbox {
 #ifdef __CUDACC__
 // Non-blocking MPSC enqueue. The sequence CAS prevents over-reservation when
 // multiple producers encounter the final free slot concurrently.
-__device__ inline bool MailboxTrySend(Mailbox& mailbox,
+__device__ inline bool MailboxTrySend(Mailbox& mailbox, VmId expected_owner,
                                       const Message& message) {
+  atomicAdd(const_cast<uint32_t*>(&mailbox.in_flight_sends), 1u);
+  const VmId owner =
+      atomicAdd(const_cast<uint32_t*>(&mailbox.owner_vm_id), 0u);
+  if (owner != expected_owner) {
+    atomicSub(const_cast<uint32_t*>(&mailbox.in_flight_sends), 1u);
+    return false;
+  }
   for (;;) {
     const uint32_t position =
         atomicAdd(const_cast<uint32_t*>(&mailbox.head), 0u);
@@ -81,7 +94,10 @@ __device__ inline bool MailboxTrySend(Mailbox& mailbox,
         atomicAdd(const_cast<uint32_t*>(&slot.sequence), 0u);
     const int32_t difference =
         static_cast<int32_t>(sequence - position);
-    if (difference < 0) return false;  // ring is full
+    if (difference < 0) {
+      atomicSub(const_cast<uint32_t*>(&mailbox.in_flight_sends), 1u);
+      return false;  // ring is full
+    }
     if (difference > 0) continue;      // another producer moved head
     if (atomicCAS(const_cast<uint32_t*>(&mailbox.head), position,
                   position + 1u) != position)
@@ -90,6 +106,7 @@ __device__ inline bool MailboxTrySend(Mailbox& mailbox,
     slot.message = message;
     __threadfence();
     atomicExch(const_cast<uint32_t*>(&slot.sequence), position + 1u);
+    atomicSub(const_cast<uint32_t*>(&mailbox.in_flight_sends), 1u);
     return true;
   }
 }

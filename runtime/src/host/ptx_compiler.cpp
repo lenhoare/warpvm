@@ -455,6 +455,8 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err,
         break;
       case kSend: {
         const std::string retry = "L_send_retry_" + std::to_string(pc);
+        const std::string release_full =
+            "L_send_release_full_" + std::to_string(pc);
         const std::string full = "L_send_full_" + std::to_string(pc);
         const std::string done = "L_send_done_" + std::to_string(pc);
         body << "    mov.u32 %t10, 0;\n"
@@ -474,6 +476,12 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err,
              << "    mul.wide.u32 %rd15, %t15, "
              << sizeof(Mailbox) << ";\n"
              << "    add.u64 %rd15, %rd14, %rd15;\n"
+             << "    atom.global.add.u32 %t11, [%rd15+"
+             << offsetof(Mailbox, in_flight_sends) << "], 1;\n"
+             << "    atom.global.add.u32 %t11, [%rd15+"
+             << offsetof(Mailbox, owner_vm_id) << "], 0;\n"
+             << "    setp.ne.u32 %p4, %t11, " << VReg(rd) << ";\n"
+             << "    @%p4 bra " << release_full << ";\n"
              << retry << ":\n"
              << "    atom.global.add.u32 %t11, [%rd15+"
              << offsetof(Mailbox, head) << "], 0;\n"
@@ -487,7 +495,7 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err,
              << offsetof(MailboxSlot, sequence) << "], 0;\n"
              << "    sub.s32 %t14, %t13, %t11;\n"
              << "    setp.lt.s32 %p4, %t14, 0;\n"
-             << "    @%p4 bra " << full << ";\n"
+             << "    @%p4 bra " << release_full << ";\n"
              << "    setp.gt.s32 %p4, %t14, 0;\n"
              << "    @%p4 bra " << retry << ";\n"
              << "    add.u32 %t13, %t11, 1;\n"
@@ -515,7 +523,12 @@ bool EmitPtx(const WvmFile& file, std::string& ptx, std::string& err,
              << "    add.u32 %t13, %t11, 1;\n"
              << "    atom.global.exch.b32 %t12, [%rd16+"
              << offsetof(MailboxSlot, sequence) << "], %t13;\n"
+             << "    atom.global.add.u32 %t12, [%rd15+"
+             << offsetof(Mailbox, in_flight_sends) << "], -1;\n"
              << "    bra " << done << ";\n"
+             << release_full << ":\n"
+             << "    atom.global.add.u32 %t12, [%rd15+"
+             << offsetof(Mailbox, in_flight_sends) << "], -1;\n"
              << full << ":\n"
              << "    mov.u32 %t10, 1;\n"
              << done << ":\n"
@@ -1343,8 +1356,10 @@ bool PtxCompiledProgram::LaunchCheckpoints(
       return fail("compiled-frame-counter upload failed", result);
   }
   std::vector<Mailbox> mailboxes(states.size());
-  for (Mailbox& mailbox : mailboxes) {
+  for (VmSlot owner_slot = 0; owner_slot < states.size(); ++owner_slot) {
+    Mailbox& mailbox = mailboxes[owner_slot];
     std::memset(&mailbox, 0, sizeof(mailbox));
+    mailbox.owner_vm_id = states[owner_slot].vm_id;
     for (uint32_t slot = 0; slot < kMailboxSlots; ++slot)
       mailbox.slots[slot].sequence = slot;
   }

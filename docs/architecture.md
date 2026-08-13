@@ -37,7 +37,7 @@ The persistent kernel never exits until the host asks. Communication uses
 **pinned, mapped host memory** (`cudaHostAllocMapped`):
 
 ```text
-host → GPU : per-VM command word (run/pause/resume/halt/reset/step/exit),
+host → GPU : per-VM command word (run/pause/resume/reset/step/deactivate/exit),
              global shutdown flag, program reload descriptors
 GPU → host : per-VM status word, fault code, pc, instruction counter,
              log ring
@@ -101,6 +101,58 @@ without terminating the kernel.
 - VM state blocks: structure-of-arrays layout preferred where it improves
   coalescing (spill/reload, status scans).
 
+## Program registry and heterogeneous populations
+
+The CPU-side `ProgramRegistry` assigns stable, non-reused program IDs to
+immutable WVM code/literal images. Loading a program and creating a VM are
+separate operations. Registry reference counts reject unload while VM
+definitions still reference an image.
+
+When a resident population is initialized, each referenced registry program is
+uploaded to the GPU exactly once. Multiple resident `VmDesc` entries may point
+to that shared code/literal allocation, while RAM, architectural state,
+framebuffer and mailbox remain private to each resident slot. Consequently two
+VMs may share a program without sharing machine state, and two VMs at the same
+PC may fetch unrelated instructions from different programs.
+
+Legacy homogeneous commands use the same path: identical code/literal images
+are interned into one program allocation and slots receive logical IDs `0..N-1`
+for compatibility. Static heterogeneous bindings are interpreted in this
+slice; compiled program selection remains a later population-kernel feature.
+
+The host list view exposes logical VM ID, resident slot and program name as
+separate columns. `hetero_view` loads a list of WVM paths into one registry and
+shows their private framebuffers in one tiled viewer.
+
+## Supervisor lifecycle and resident capacity
+
+The CPU `Supervisor` launches a configured number of resident slots once. Each
+slot's RAM, framebuffer, state, mailbox and control storage is allocated before
+the persistent kernel starts; an empty slot's warp remains idle and consumes no
+program identity. CUDA cannot grow this population in place, so exceeding the
+configured capacity is an explicit resource error and later capacity growth
+will use a controlled quiesce/relaunch.
+
+The lifecycle is `EMPTY -> READY -> RUNNING`, with cooperative
+`RUNNING -> STOPPED -> RUNNING`, autonomous `HALTED`/`FAULTED`, reset back to
+`READY`, and deletion back to `EMPTY`. Stop/resume preserves the complete
+machine. Reset restores registers, control state, initial RAM, framebuffer and
+mailbox. Cold program replacement uses the same safe transition, starts at PC
+zero with cleared machine state, and preserves the logical VM ID.
+
+Deletion does not terminate a resident CUDA warp. A `DEACTIVATE` command makes
+the target warp withdraw its logical route, drain in-flight mailbox producers,
+clear the mailbox, acknowledge through the control sequence, and return to its
+idle command loop. The host can then rebind the descriptor to a new program and
+logical ID; the next cold `RUN` reloads both rather than using stale values
+cached when the kernel launched. Other VMs continue running during the entire
+transition.
+
+Programs used by this initial resident epoch are loaded before launch and their
+device code allocations remain until shutdown. Program unload is still allowed
+after its last VM reference disappears; adding new device program images while
+the kernel is resident is deferred to the controlled population-epoch work.
+
 ## Messaging
 
 Fixed 16-byte messages. The header packs `src_vm` (low 16 bits) and
@@ -114,6 +166,15 @@ This prevents both over-reservation and observing a slot before its message is
 complete. v0.1: mailbox full ⇒ `FAULT_MSG` (no blocking). `TRY_RECV` is
 non-blocking and returns a
 got-message predicate.
+
+Each mailbox also carries its logical owner and an in-flight producer count.
+`SEND` pins the mailbox and verifies that the owner still equals its requested
+logical destination before reserving a ring entry. Slot retirement invalidates
+the route and owner and waits for this count to reach zero before clearing the
+ring. A sender that raced with route withdrawal therefore either completes for
+the old owner before recycling or detects the owner mismatch and faults; it can
+never publish into the replacement VM's mailbox. The interpreted and generated
+PTX implementations use the same protocol.
 
 Message destinations and `src_vm` are stable logical VM IDs, not resident
 mailbox-array indices. `SEND` resolves the destination through the supervisor's

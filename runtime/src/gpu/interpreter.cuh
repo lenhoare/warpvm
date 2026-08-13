@@ -668,7 +668,8 @@ __device__ StopReason VmRun(VmCtx& ctx, Control* ctrl = nullptr,
                 m.payload[0] = vregs.Get(rs2);
                 m.payload[1] = 0;
                 m.payload[2] = 0;
-                if (!MailboxTrySend(ctx.mailboxes[dest_slot], m)) err = 1;
+                if (!MailboxTrySend(ctx.mailboxes[dest_slot], dest, m))
+                  err = 1;
               }
             }
           }

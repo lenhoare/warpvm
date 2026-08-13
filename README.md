@@ -86,6 +86,42 @@ build/runtime/warpvm serve heartbeat.wvm --vms 12 --for 5
 control plane (host↔GPU commands + status + log) is documented in
 [docs/architecture.md](docs/architecture.md).
 
+## Heterogeneous resident programs
+
+Different resident VMs can execute different interpreted WVM images. Program
+code and literals are immutable registry objects uploaded once and shared by
+every VM bound to that program; VM state, RAM, framebuffer and mailbox remain
+private.
+
+The four-program demonstration compiles plasma, Mandelbrot, wave and sandpile
+and displays them together:
+
+```sh
+programs/heterogeneous_demo.sh
+```
+
+An arbitrary static population can also be launched directly:
+
+```sh
+build/runtime/warpvm hetero_view a.wvm b.wvm c.wvm d.wvm
+build/runtime/warpvm hetero_smoke a.wvm b.wvm c.wvm d.wvm
+```
+
+`hetero_smoke` is the headless validation path: it waits for every program to
+publish a frame, stops one VM, proves another continues, then resumes and shuts
+down the population cleanly.
+
+The CPU `Supervisor` now owns a fixed resident capacity and explicit VM
+lifecycle (`EMPTY`, `READY`, `RUNNING`, `STOPPED`, `HALTED`, `FAULTED`). It can
+create and delete logical machines without ending the persistent kernel,
+preserve state across stop/resume, restore initial state on reset, and cold-bind
+a different program while retaining the VM's stable logical address. Run the
+GPU lifecycle regression with:
+
+```sh
+build/runtime/warpvm supervisor_tests
+```
+
 ## Attach and single-step (slice 6)
 
 `attach` boots resident VMs and drops into an interactive console to inspect
@@ -211,6 +247,8 @@ control-poll, and memory breakdown is in
 | v0.1.4-F | built-in `warp.h`, ARGB/framebuffer helpers, and `FLIP` | done |
 | v0.1.5 | `WARP`, collectives, cooperative memory, warp-native graphics/capstone, benchmark | done |
 | v0.1.6 | publication-safe mailboxes and continuously resident compiled messaging/control/viewer | done |
+| v0.1.7-A/B | stable logical VM IDs, shared program registry, heterogeneous interpreted population | done |
+| v0.1.7-C/D | fixed-capacity supervisor lifecycle, safe slot recycling and cold program rebind | done |
 
 ## v0.1 milestone
 

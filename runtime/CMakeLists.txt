@@ -44,6 +44,12 @@ add_test(NAME slice3_multi_vm COMMAND warpvm slice3)
 add_test(NAME slice4_warp_control COMMAND warpvm slice4)
 add_test(NAME slice5_control_plane COMMAND warpvm slice5)
 add_test(NAME slice7_messaging COMMAND warpvm slice7)
+add_test(NAME heterogeneous_program_registry COMMAND warpvm hetero_tests)
+add_test(NAME supervisor_vm_lifecycle COMMAND warpvm supervisor_tests)
+add_test(NAME heterogeneous_real_programs
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/heterogeneous_programs.sh
+          ${WVM_WARPC} $<TARGET_FILE:warpvm> ${CMAKE_SOURCE_DIR}
+          ${CMAKE_BINARY_DIR}/heterogeneous_programs)
 add_test(NAME gfxa_framebuffer COMMAND warpvm gfxa)
 add_test(NAME gfxb_flip COMMAND warpvm gfxb)
 add_test(NAME cpu_interpreter COMMAND warpvm cpu_tests)

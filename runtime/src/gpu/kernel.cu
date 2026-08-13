@@ -72,6 +72,47 @@ __global__ void VmArrayKernel(const VmDesc* descs, VmState* states) {
 // Persistent kernel
 // ---------------------------------------------------------------------------
 
+// Withdraw a logical address and drain its mailbox before the host recycles
+// this resident slot. The owner check in SEND means a producer which observed
+// the old route but arrives late cannot publish into a replacement VM's ring.
+__device__ static void DeactivateVm(const VmDesc& d, VmState* state,
+                                    Control* ctrl, VmSlot slot_id,
+                                    uint32_t lane, Mailbox* mailboxes) {
+  const VmId vm_id = state->vm_id;
+  Mailbox& mailbox = mailboxes[slot_id];
+  if (lane == 0) {
+    if (d.vm_routes != nullptr && vm_id < kVmIdCount) {
+      atomicCAS(const_cast<VmSlot*>(&d.vm_routes[vm_id]), slot_id,
+                kInvalidVmSlot);
+    }
+    atomicExch(const_cast<uint32_t*>(&mailbox.owner_vm_id), kInvalidVmId);
+    while (atomicAdd(const_cast<uint32_t*>(&mailbox.in_flight_sends), 0u) !=
+           0u)
+      __nanosleep(1000);
+    mailbox.head = 0;
+    mailbox.tail = 0;
+  }
+  __syncwarp();
+  for (uint32_t entry = lane; entry < kMailboxSlots; entry += kLanes) {
+    mailbox.slots[entry].message = Message{};
+    mailbox.slots[entry].sequence = entry;
+  }
+  __syncwarp();
+  if (lane == 0) {
+    state->vm_id = kInvalidVmId;
+    state->status = kIdle;
+    state->fault_code = kFaultOk;
+    state->pc = 0;
+    state->instruction_counter = 0;
+    WriteOnce(&ctrl->fault[slot_id], kFaultOk);
+    WriteOnce(&ctrl->pc[slot_id], 0);
+    WriteOnce64(&ctrl->instrs[slot_id], 0);
+    WriteOnce(&ctrl->status[slot_id], kIdle);
+    __threadfence_system();
+    WriteOnce(&ctrl->seq[slot_id], ReadOnce(&ctrl->seq[slot_id]) + 1u);
+  }
+}
+
 // Run a VM through any number of pause/resume/step cycles until it halts,
 // faults, is reset, or the kernel must exit. Returns false when the warp
 // should leave the kernel (global shutdown or EXIT).
@@ -155,6 +196,10 @@ __device__ static bool RunVmUntilStop(VmCtx& ctx, const VmDesc& d,
         PublishStatus(ctrl, slot_id, lane, kIdle, 0, 0, 0);
         return true;
       }
+      if (next == kCmdDeactivate) {
+        DeactivateVm(d, state, ctrl, slot_id, lane, mailboxes);
+        return true;
+      }
       if (next == kCmdExit) return false;
       __nanosleep(1000);  // kCmdNone (or stray command): keep waiting
     }
@@ -181,10 +226,7 @@ __device__ void PersistentKernelBody(const VmDesc* descs, VmState* states,
           ? block_shared_vregs + threadIdx.x
           : nullptr;
 
-  const VmDesc d = descs[slot_id];
-  const VmId vm_id = states[slot_id].vm_id;
   VmCtx ctx{};
-  InitVmCtx(ctx, d, vm_id, slot_id, lane, mailboxes, num_vms);
   PublishStatus(ctrl, slot_id, lane, kIdle, 0, 0, 0);
 
   bool alive = true;
@@ -192,7 +234,15 @@ __device__ void PersistentKernelBody(const VmDesc* descs, VmState* states,
     if (ReadOnce(&ctrl->shutdown)) break;
     const uint32_t cmd = ConsumeCmd(ctrl, slot_id, lane);
     switch (cmd) {
-      case kCmdRun:
+      case kCmdRun: {
+        // A slot can be rebound while this warp remains resident. Reload its
+        // descriptor and logical identity at each cold start.
+        const VmDesc d = descs[slot_id];
+        const VmId vm_id = states[slot_id].vm_id;
+        if (d.code == nullptr || d.code_len == 0 || vm_id >= kVmIdCount) {
+          PublishStatus(ctrl, slot_id, lane, kIdle, 0, 0, 0);
+          break;
+        }
         InitVmCtx(ctx, d, vm_id, slot_id, lane, mailboxes,
                   num_vms);  // RUN = reset+run
         alive = RunVmUntilStop<kResolveFaultVotes, kPollBackwardControl,
@@ -202,9 +252,17 @@ __device__ void PersistentKernelBody(const VmDesc* descs, VmState* states,
             ctx, d, ctrl, slot_id, lane, &states[slot_id], mailboxes, num_vms,
             shared_vregs);
         break;
-      case kCmdReset:
+      }
+      case kCmdReset: {
+        const VmDesc d = descs[slot_id];
+        const VmId vm_id = states[slot_id].vm_id;
         InitVmCtx(ctx, d, vm_id, slot_id, lane, mailboxes, num_vms);
         PublishStatus(ctrl, slot_id, lane, kIdle, 0, 0, 0);
+        break;
+      }
+      case kCmdDeactivate:
+        DeactivateVm(descs[slot_id], &states[slot_id], ctrl, slot_id, lane,
+                     mailboxes);
         break;
       case kCmdExit:
         alive = false;

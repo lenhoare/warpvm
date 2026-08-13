@@ -6,17 +6,20 @@
 // Include this from a CUDA translation unit (it launches the kernel).
 #pragma once
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <cuda_runtime.h>
 
 #include "gpu/control.cuh"
 #include "gpu/vm_state.cuh"
+#include "host/program_registry.h"
 #include "host/vm_identity.h"
 #include "host/vm_image.h"
 
@@ -97,31 +100,64 @@ class PersistentRuntime {
   // and slot placement differ.
   bool Init(const std::vector<VmImage>& images,
             const std::vector<LogicalVmId>& vm_ids, std::string& err) {
-    num_vms_ = static_cast<uint32_t>(images.size());
-    if (num_vms_ == 0 || num_vms_ > kMaxVms) {
-      err = "vm count must be 1.." + std::to_string(kMaxVms);
-      return false;
-    }
     if (vm_ids.size() != images.size()) {
       err = "logical VM ID count must match resident slot count";
       return false;
     }
-    h_vm_ids_.resize(num_vms_);
-    h_vm_routes_.assign(kVmIdCount, kInvalidVmSlot);
-    for (VmSlot slot = 0; slot < num_vms_; ++slot) {
-      const VmId id = vm_ids[slot].value;
-      if (id >= kVmIdCount) {
-        err = "logical VM ID must fit the 16-bit message address space";
-        return false;
+    ProgramRegistry registry;
+    std::vector<VmBinding> bindings(images.size());
+    for (VmSlot slot = 0; slot < images.size(); ++slot) {
+      LoadedProgramId program_id;
+      const WvmFile candidate{images[slot].code, images[slot].literals};
+      bool found = false;
+      for (const ProgramInfo& program : registry.programs()) {
+        if (program.image.code == candidate.code &&
+            program.image.literals == candidate.literals) {
+          program_id = program.id;
+          found = true;
+          break;
+        }
       }
-      if (h_vm_routes_[id] != kInvalidVmSlot) {
-        err = "logical VM IDs must be unique";
+      if (!found &&
+          !registry.Add("legacy-program-" + std::to_string(registry.size()),
+                        "", candidate, program_id, err))
         return false;
-      }
-      h_vm_ids_[slot] = id;
-      h_vm_routes_[id] = slot;
+      bindings[slot].vm_id = vm_ids[slot];
+      bindings[slot].program_id = program_id;
+      bindings[slot].mem_size_words = images[slot].mem_size_words;
+      bindings[slot].mem_init = images[slot].mem_init;
     }
-    h_images_ = images;  // retained for inspection / disassembly
+    return Init(registry, bindings, err);
+  }
+
+  // Static heterogeneous population. This is a convenience wrapper over the
+  // fixed-capacity runtime used by the supervisor.
+  bool Init(const ProgramRegistry& registry,
+            const std::vector<VmBinding>& bindings, std::string& err) {
+    if (!InitCapacity(registry, static_cast<uint32_t>(bindings.size()), err))
+      return false;
+    for (VmSlot slot = 0; slot < bindings.size(); ++slot) {
+      if (!BindSlot(registry, slot, bindings[slot], err)) return false;
+    }
+    return true;
+  }
+
+  // Allocate a resident population with no VM instances bound. RAM,
+  // framebuffer, descriptor, state, mailbox, and control storage all exist
+  // for every slot before launch, so later create/delete operations do not
+  // need to grow the CUDA kernel or allocate memory behind a resident kernel.
+  bool InitCapacity(const ProgramRegistry& registry, uint32_t capacity,
+                    std::string& err) {
+    num_vms_ = capacity;
+    if (num_vms_ == 0 || num_vms_ > kMaxVms) {
+      err = "vm count must be 1.." + std::to_string(kMaxVms);
+      return false;
+    }
+    h_vm_ids_.assign(num_vms_, kInvalidVmId);
+    h_vm_routes_.assign(kVmIdCount, kInvalidVmSlot);
+    h_images_.resize(num_vms_);
+    h_program_ids_.assign(num_vms_, kInvalidVmId);
+    h_program_names_.resize(num_vms_);
 
     if (cudaHostAlloc(&h_ctrl_, sizeof(Control), cudaHostAllocMapped) !=
         cudaSuccess) {
@@ -135,8 +171,6 @@ class PersistentRuntime {
       return false;
     }
 
-    d_code_.assign(num_vms_, nullptr);
-    d_lit_.assign(num_vms_, nullptr);
     d_mem_.assign(num_vms_, nullptr);
     if (cudaMalloc(reinterpret_cast<void**>(&d_vm_routes_),
                    kVmIdCount * sizeof(VmSlot)) != cudaSuccess) {
@@ -156,44 +190,68 @@ class PersistentRuntime {
       err = "cudaMalloc framebuffers failed";
       return false;
     }
-    cudaMemset(d_framebuffers_, 0,
-               static_cast<size_t>(num_vms_) * kVideoWords * sizeof(uint32_t));
-    std::vector<VmDesc> descs(num_vms_);
-
-    for (uint32_t i = 0; i < num_vms_; ++i) {
-      const VmImage& img = images[i];
-      if (cudaMalloc(&d_code_[i], img.code.size() * sizeof(uint32_t)) !=
-          cudaSuccess) {
-        err = "cudaMalloc code failed";
-        return false;
-      }
-      cudaMemcpy(d_code_[i], img.code.data(),
-                 img.code.size() * sizeof(uint32_t), cudaMemcpyHostToDevice);
-      if (!img.literals.empty()) {
-        cudaMalloc(&d_lit_[i], img.literals.size() * sizeof(uint32_t));
-        cudaMemcpy(d_lit_[i], img.literals.data(),
-                   img.literals.size() * sizeof(uint32_t),
-                   cudaMemcpyHostToDevice);
-      }
-      if (img.mem_size_words > 0) {
-        cudaMalloc(&d_mem_[i], img.mem_size_words * sizeof(uint32_t));
-        cudaMemset(d_mem_[i], 0, img.mem_size_words * sizeof(uint32_t));
-        const size_t seed =
-            std::min<size_t>(img.mem_init.size(), img.mem_size_words);
-        if (seed > 0)
-          cudaMemcpy(d_mem_[i], img.mem_init.data(), seed * sizeof(uint32_t),
-                     cudaMemcpyHostToDevice);
-      }
-      descs[i] = VmDesc{d_code_[i],
-                        static_cast<uint32_t>(img.code.size()),
-                        d_lit_[i],
-                        static_cast<uint32_t>(img.literals.size()),
-                        d_mem_[i],
-                        img.mem_size_words,
-                        d_framebuffers_ + static_cast<size_t>(i) * kVideoWords,
-                        d_vm_routes_};
+    if (cudaMemset(d_framebuffers_, 0,
+                   static_cast<size_t>(num_vms_) * kVideoWords *
+                       sizeof(uint32_t)) != cudaSuccess) {
+      err = "framebuffer initialization failed";
+      return false;
     }
 
+    for (const ProgramInfo& program : registry.programs()) {
+      DeviceProgram device_program;
+      device_program.id = program.id.value;
+      device_program.code_len = static_cast<uint32_t>(program.image.code.size());
+      device_program.literals_len =
+          static_cast<uint32_t>(program.image.literals.size());
+      if (cudaMalloc(&device_program.code,
+                     program.image.code.size() * sizeof(uint32_t)) !=
+          cudaSuccess) {
+        err = "cudaMalloc shared program code failed";
+        return false;
+      }
+      if (cudaMemcpy(device_program.code, program.image.code.data(),
+                     program.image.code.size() * sizeof(uint32_t),
+                     cudaMemcpyHostToDevice) != cudaSuccess) {
+        err = "shared program code upload failed";
+        return false;
+      }
+      if (!program.image.literals.empty()) {
+        if (cudaMalloc(&device_program.literals,
+                       program.image.literals.size() * sizeof(uint32_t)) !=
+            cudaSuccess) {
+          err = "cudaMalloc shared program literals failed";
+          return false;
+        }
+        if (cudaMemcpy(device_program.literals,
+                       program.image.literals.data(),
+                       program.image.literals.size() * sizeof(uint32_t),
+                       cudaMemcpyHostToDevice) != cudaSuccess) {
+          err = "shared program literal upload failed";
+          return false;
+        }
+      }
+      d_programs_.push_back(device_program);
+    }
+
+    for (VmSlot slot = 0; slot < num_vms_; ++slot) {
+      if (cudaMalloc(&d_mem_[slot], kRamSizeWords * sizeof(uint32_t)) !=
+          cudaSuccess) {
+        err = "cudaMalloc resident RAM slot failed";
+        return false;
+      }
+      if (cudaMemset(d_mem_[slot], 0,
+                     kRamSizeWords * sizeof(uint32_t)) != cudaSuccess) {
+        err = "resident RAM initialization failed";
+        return false;
+      }
+    }
+
+    std::vector<VmDesc> descs(num_vms_);
+    for (VmSlot slot = 0; slot < num_vms_; ++slot)
+      descs[slot] = VmDesc{nullptr, 0, nullptr, 0, d_mem_[slot], 0,
+                           d_framebuffers_ +
+                               static_cast<size_t>(slot) * kVideoWords,
+                           d_vm_routes_};
     if (cudaMalloc(reinterpret_cast<void**>(&d_descs_),
                    num_vms_ * sizeof(VmDesc)) != cudaSuccess) {
       err = "cudaMalloc descs failed";
@@ -208,10 +266,8 @@ class PersistentRuntime {
     }
     std::vector<VmState> states(num_vms_);
     for (VmSlot slot = 0; slot < num_vms_; ++slot) {
-      states[slot].vm_id = h_vm_ids_[slot];
+      states[slot].vm_id = kInvalidVmId;
       states[slot].status = kIdle;
-      states[slot].rng_state =
-          h_vm_ids_[slot] * 0x9E3779B9u + 0x1234567u;
     }
     if (cudaMemcpy(d_states_, states.data(), num_vms_ * sizeof(VmState),
                    cudaMemcpyHostToDevice) != cudaSuccess) {
@@ -224,8 +280,10 @@ class PersistentRuntime {
       return false;
     }
     std::vector<Mailbox> mailboxes(num_vms_);
-    for (Mailbox& mailbox : mailboxes) {
+    for (VmSlot owner_slot = 0; owner_slot < num_vms_; ++owner_slot) {
+      Mailbox& mailbox = mailboxes[owner_slot];
       std::memset(&mailbox, 0, sizeof(mailbox));
+      mailbox.owner_vm_id = kInvalidVmId;
       for (uint32_t slot = 0; slot < kMailboxSlots; ++slot)
         mailbox.slots[slot].sequence = slot;
     }
@@ -235,6 +293,124 @@ class PersistentRuntime {
       err = "mailbox initialization upload failed";
       return false;
     }
+    return true;
+  }
+
+  // Bind one EMPTY slot. Program storage must already be present in the
+  // registry supplied to InitCapacity; route publication occurs last.
+  bool BindSlot(const ProgramRegistry& registry, VmSlot slot,
+                const VmBinding& binding, std::string& err) {
+    if (slot >= num_vms_) {
+      err = "resident slot is outside configured capacity";
+      return false;
+    }
+    if (h_vm_ids_[slot] != kInvalidVmId) {
+      err = "resident slot is already occupied";
+      return false;
+    }
+    if (binding.engine != ExecutionEngine::kInterpreted) {
+      err = "resident lifecycle currently supports interpreted VMs only";
+      return false;
+    }
+    const ProgramInfo* program = registry.Find(binding.program_id);
+    const DeviceProgram* device_program = FindDeviceProgram(binding.program_id);
+    if (program == nullptr || device_program == nullptr) {
+      err = "resident slot references a program not loaded at launch";
+      return false;
+    }
+    const VmId vm_id = binding.vm_id.value;
+    if (vm_id >= kVmIdCount) {
+      err = "logical VM ID must fit the 16-bit message address space";
+      return false;
+    }
+    if (h_vm_routes_[vm_id] != kInvalidVmSlot) {
+      err = "logical VM ID is already resident";
+      return false;
+    }
+    if (binding.mem_size_words > kRamSizeWords) {
+      err = "VM RAM request exceeds fixed resident-slot capacity";
+      return false;
+    }
+
+    if (cudaMemset(d_mem_[slot], 0,
+                   kRamSizeWords * sizeof(uint32_t)) != cudaSuccess) {
+      err = "VM RAM reset failed";
+      return false;
+    }
+    const size_t seed =
+        std::min<size_t>(binding.mem_init.size(), binding.mem_size_words);
+    if (seed != 0 &&
+        cudaMemcpy(d_mem_[slot], binding.mem_init.data(),
+                   seed * sizeof(uint32_t), cudaMemcpyHostToDevice) !=
+            cudaSuccess) {
+      err = "VM initial RAM upload failed";
+      return false;
+    }
+    std::vector<uint32_t> black(kVideoWords, kVideoResetColor);
+    if (cudaMemcpy(d_framebuffers_ + static_cast<size_t>(slot) * kVideoWords,
+                   black.data(), kVideoWords * sizeof(uint32_t),
+                   cudaMemcpyHostToDevice) != cudaSuccess) {
+      err = "VM framebuffer reset failed";
+      return false;
+    }
+
+    const VmDesc desc{device_program->code,
+                      device_program->code_len,
+                      device_program->literals,
+                      device_program->literals_len,
+                      d_mem_[slot],
+                      binding.mem_size_words,
+                      d_framebuffers_ + static_cast<size_t>(slot) * kVideoWords,
+                      d_vm_routes_};
+    VmState state{};
+    state.vm_id = vm_id;
+    state.status = kIdle;
+    state.rng_state = vm_id * 0x9E3779B9u + 0x1234567u;
+    if (cudaMemcpy(&d_descs_[slot], &desc, sizeof(desc),
+                   cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(&d_states_[slot], &state, sizeof(state),
+                   cudaMemcpyHostToDevice) != cudaSuccess) {
+      err = "VM descriptor/state binding failed";
+      return false;
+    }
+    if (!launched_) {
+      Mailbox mailbox{};
+      mailbox.owner_vm_id = vm_id;
+      for (uint32_t entry = 0; entry < kMailboxSlots; ++entry)
+        mailbox.slots[entry].sequence = entry;
+      if (cudaMemcpy(&d_mailboxes_[slot], &mailbox, sizeof(mailbox),
+                     cudaMemcpyHostToDevice) != cudaSuccess) {
+        err = "VM mailbox binding failed";
+        return false;
+      }
+    } else if (cudaMemcpy(
+                   const_cast<uint32_t*>(&d_mailboxes_[slot].owner_vm_id),
+                   &vm_id, sizeof(vm_id), cudaMemcpyHostToDevice) !=
+               cudaSuccess) {
+      err = "VM mailbox owner publication failed";
+      return false;
+    }
+
+    h_vm_ids_[slot] = vm_id;
+    h_program_ids_[slot] = binding.program_id.value;
+    h_program_names_[slot] = program->name;
+    h_images_[slot].code = program->image.code;
+    h_images_[slot].literals = program->image.literals;
+    h_images_[slot].mem_size_words = binding.mem_size_words;
+    h_images_[slot].mem_init = binding.mem_init;
+    h_vm_routes_[vm_id] = slot;
+    if (cudaMemcpy(&d_vm_routes_[vm_id], &slot, sizeof(slot),
+                   cudaMemcpyHostToDevice) != cudaSuccess) {
+      h_vm_routes_[vm_id] = kInvalidVmSlot;
+      err = "VM route publication failed";
+      return false;
+    }
+    h_ctrl_->cmd[slot] = kCmdNone;
+    h_ctrl_->status[slot] = kIdle;
+    h_ctrl_->fault[slot] = kFaultOk;
+    h_ctrl_->pc[slot] = 0;
+    h_ctrl_->instrs[slot] = 0;
+    h_ctrl_->frame_seq[slot] = 0;
     return true;
   }
 
@@ -345,9 +521,122 @@ class PersistentRuntime {
     return h_ctrl_->profile_frame_cycles[vm];
   }
   void BootAll() {
-    for (uint32_t i = 0; i < num_vms_; ++i) SendCmd(i, kCmdRun);
+    for (uint32_t i = 0; i < num_vms_; ++i)
+      if (h_vm_ids_[i] != kInvalidVmId) SendCmd(i, kCmdRun);
   }
   void ShutdownAll() { h_ctrl_->shutdown = 1u; }
+
+  bool StartSlot(VmSlot slot, std::string& err) {
+    if (!RequireOccupied(slot, err)) return false;
+    if (Status(slot) != kIdle) {
+      err = "VM start requires READY state";
+      return false;
+    }
+    SendCmd(slot, kCmdRun);
+    return true;
+  }
+
+  bool StopSlot(VmSlot slot, int timeout_ms, std::string& err) {
+    if (!RequireOccupied(slot, err)) return false;
+    if (Status(slot) == kPaused) return true;
+    if (Status(slot) != kRunning) {
+      err = "VM stop requires RUNNING state";
+      return false;
+    }
+    if (!Pause(slot, timeout_ms)) {
+      err = "timed out waiting for VM to stop";
+      return false;
+    }
+    return true;
+  }
+
+  bool ResumeSlot(VmSlot slot, std::string& err) {
+    if (!RequireOccupied(slot, err)) return false;
+    if (Status(slot) != kPaused) {
+      err = "VM resume requires STOPPED state";
+      return false;
+    }
+    SendCmd(slot, kCmdRun);
+    return true;
+  }
+
+  // Remove a binding while keeping the resident CUDA warp available for a
+  // future VM. The target warp withdraws its route and drains pinned SENDs;
+  // other resident VMs continue executing throughout.
+  bool UnbindSlot(VmSlot slot, int timeout_ms, std::string& err) {
+    if (!RequireOccupied(slot, err)) return false;
+    const VmId old_vm_id = h_vm_ids_[slot];
+    if (launched_) {
+      if (Status(slot) == kRunning && !StopSlot(slot, timeout_ms, err))
+        return false;
+      const uint32_t seq0 = h_ctrl_->seq[slot];
+      SendCmd(slot, kCmdDeactivate);
+      if (!WaitSeq(slot, seq0, timeout_ms)) {
+        err = "timed out draining VM mailbox during deletion";
+        return false;
+      }
+    } else {
+      h_vm_routes_[old_vm_id] = kInvalidVmSlot;
+      if (cudaMemcpy(&d_vm_routes_[old_vm_id],
+                     &h_vm_routes_[old_vm_id], sizeof(VmSlot),
+                     cudaMemcpyHostToDevice) != cudaSuccess) {
+        err = "VM route withdrawal failed";
+        return false;
+      }
+      Mailbox mailbox{};
+      mailbox.owner_vm_id = kInvalidVmId;
+      for (uint32_t entry = 0; entry < kMailboxSlots; ++entry)
+        mailbox.slots[entry].sequence = entry;
+      if (cudaMemcpy(&d_mailboxes_[slot], &mailbox, sizeof(mailbox),
+                     cudaMemcpyHostToDevice) != cudaSuccess) {
+        err = "VM mailbox retirement failed";
+        return false;
+      }
+    }
+    h_vm_routes_[old_vm_id] = kInvalidVmSlot;
+
+    const VmDesc empty_desc{
+        nullptr, 0, nullptr, 0, d_mem_[slot], 0,
+        d_framebuffers_ + static_cast<size_t>(slot) * kVideoWords,
+        d_vm_routes_};
+    VmState empty_state{};
+    empty_state.vm_id = kInvalidVmId;
+    empty_state.status = kIdle;
+    if (cudaMemcpy(&d_descs_[slot], &empty_desc, sizeof(empty_desc),
+                   cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(&d_states_[slot], &empty_state, sizeof(empty_state),
+                   cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemset(d_mem_[slot], 0,
+                   kRamSizeWords * sizeof(uint32_t)) != cudaSuccess ||
+        cudaMemset(d_framebuffers_ + static_cast<size_t>(slot) * kVideoWords,
+                   0, kVideoWords * sizeof(uint32_t)) != cudaSuccess) {
+      err = "resident slot cleanup failed";
+      return false;
+    }
+    h_vm_ids_[slot] = kInvalidVmId;
+    h_program_ids_[slot] = kInvalidVmId;
+    h_program_names_[slot].clear();
+    h_images_[slot] = VmImage{};
+    h_ctrl_->cmd[slot] = kCmdNone;
+    h_ctrl_->status[slot] = kIdle;
+    h_ctrl_->fault[slot] = kFaultOk;
+    h_ctrl_->pc[slot] = 0;
+    h_ctrl_->instrs[slot] = 0;
+    h_ctrl_->frame_seq[slot] = 0;
+    return true;
+  }
+
+  bool ResetSlot(const ProgramRegistry& registry, VmSlot slot,
+                 int timeout_ms, std::string& err) {
+    if (!RequireOccupied(slot, err)) return false;
+    VmBinding binding;
+    binding.vm_id = LogicalVmId{h_vm_ids_[slot]};
+    binding.program_id = LoadedProgramId{h_program_ids_[slot]};
+    binding.mem_size_words = h_images_[slot].mem_size_words;
+    binding.mem_init = h_images_[slot].mem_init;
+    return UnbindSlot(slot, timeout_ms, err) &&
+           BindSlot(registry, slot, binding, err);
+  }
 
   // Pause a VM and wait for it to reach the control point.
   bool Pause(uint32_t vm, int timeout_ms = 2000) {
@@ -373,6 +662,13 @@ class PersistentRuntime {
   bool ReadState(uint32_t vm, VmState& out) const {
     if (vm >= num_vms_) return false;
     return cudaMemcpy(&out, &d_states_[vm], sizeof(VmState),
+                      cudaMemcpyDeviceToHost) == cudaSuccess;
+  }
+  // Diagnostic snapshot used to audit shared program allocations. Device
+  // pointers are opaque on the host but may be compared for identity.
+  bool ReadDescriptor(VmSlot slot, VmDesc& out) const {
+    if (slot >= num_vms_) return false;
+    return cudaMemcpy(&out, &d_descs_[slot], sizeof(VmDesc),
                       cudaMemcpyDeviceToHost) == cudaSuccess;
   }
   // Copy `count` words of a VM's RAM starting at `addr`.
@@ -433,6 +729,15 @@ class PersistentRuntime {
   VmSlot SlotForVmId(VmId id) const {
     return id < h_vm_routes_.size() ? h_vm_routes_[id] : kInvalidVmSlot;
   }
+  ProgramId ProgramIdAtSlot(VmSlot slot) const {
+    return slot < h_program_ids_.size() ? h_program_ids_[slot]
+                                        : static_cast<ProgramId>(-1);
+  }
+  const std::string& ProgramNameAtSlot(VmSlot slot) const {
+    static const std::string empty;
+    return slot < h_program_names_.size() ? h_program_names_[slot] : empty;
+  }
+  size_t device_program_count() const { return d_programs_.size(); }
   uint32_t Status(uint32_t vm) const { return h_ctrl_->status[vm]; }
   uint32_t Fault(uint32_t vm) const { return h_ctrl_->fault[vm]; }
   uint32_t Pc(uint32_t vm) const { return h_ctrl_->pc[vm]; }
@@ -445,6 +750,14 @@ class PersistentRuntime {
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     return Status(vm) == want;
+  }
+
+  bool WaitSeq(uint32_t vm, uint32_t previous, int timeout_ms) {
+    for (int waited = 0; waited < timeout_ms; waited += 1) {
+      if (h_ctrl_->seq[vm] != previous) return true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return h_ctrl_->seq[vm] != previous;
   }
 
   LogSnapshot ReadLog() {
@@ -470,20 +783,51 @@ class PersistentRuntime {
     if (d_mailboxes_) cudaFree(d_mailboxes_), d_mailboxes_ = nullptr;
     if (d_vm_routes_) cudaFree(d_vm_routes_), d_vm_routes_ = nullptr;
     if (d_framebuffers_) cudaFree(d_framebuffers_), d_framebuffers_ = nullptr;
-    for (auto p : d_code_) cudaFree(p);
-    for (auto p : d_lit_) cudaFree(p);
+    for (const DeviceProgram& program : d_programs_) {
+      if (program.code) cudaFree(program.code);
+      if (program.literals) cudaFree(program.literals);
+    }
     for (auto p : d_mem_) cudaFree(p);
-    d_code_.clear();
-    d_lit_.clear();
+    d_programs_.clear();
     d_mem_.clear();
     h_vm_ids_.clear();
     h_vm_routes_.clear();
+    h_program_ids_.clear();
+    h_program_names_.clear();
     if (h_ctrl_) cudaFreeHost(h_ctrl_), h_ctrl_ = nullptr;
     d_ctrl_ = nullptr;
     if (stream_) cudaStreamDestroy(stream_), stream_ = nullptr;
+    num_vms_ = 0;
+    launched_ = false;
   }
 
  private:
+  struct DeviceProgram {
+    ProgramId id = 0;
+    uint32_t* code = nullptr;
+    uint32_t* literals = nullptr;
+    uint32_t code_len = 0;
+    uint32_t literals_len = 0;
+  };
+
+  const DeviceProgram* FindDeviceProgram(LoadedProgramId id) const {
+    for (const DeviceProgram& program : d_programs_)
+      if (program.id == id.value) return &program;
+    return nullptr;
+  }
+
+  bool RequireOccupied(VmSlot slot, std::string& err) const {
+    if (slot >= num_vms_) {
+      err = "resident slot is outside configured capacity";
+      return false;
+    }
+    if (h_vm_ids_[slot] == kInvalidVmId) {
+      err = "resident slot is EMPTY";
+      return false;
+    }
+    return true;
+  }
+
   Control* h_ctrl_ = nullptr;
   Control* d_ctrl_ = nullptr;
   VmDesc* d_descs_ = nullptr;
@@ -491,10 +835,13 @@ class PersistentRuntime {
   Mailbox* d_mailboxes_ = nullptr;
   VmSlot* d_vm_routes_ = nullptr;
   uint32_t* d_framebuffers_ = nullptr;  // flat pool: num_vms_ * kVideoWords
-  std::vector<uint32_t*> d_code_, d_lit_, d_mem_;
+  std::vector<DeviceProgram> d_programs_;
+  std::vector<uint32_t*> d_mem_;
   std::vector<VmImage> h_images_;
   std::vector<VmId> h_vm_ids_;
   std::vector<VmSlot> h_vm_routes_;
+  std::vector<ProgramId> h_program_ids_;
+  std::vector<std::string> h_program_names_;
   cudaStream_t stream_ = nullptr;
   uint32_t num_vms_ = 0;
   bool launched_ = false;

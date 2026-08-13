@@ -26,6 +26,7 @@
 #include "host/cpu_interpreter.h"
 #include "host/persistent.h"
 #include "host/ptx_compiler.h"
+#include "host/supervisor.h"
 #include "host/vm_image.h"
 #include "host/wvm_file.h"
 
@@ -36,6 +37,8 @@ int ViewSingleVm(const char* path, uint32_t vm_index,
                  bool compiled);  // host/view_sdl.cu
 int ViewVmGrid(const char* path, uint32_t n_vms,
                bool compiled);  // host/view_sdl.cu
+int ViewHeterogeneousGrid(
+    const std::vector<std::string>& paths);  // host/view_sdl.cu
 int RunLifeBenchmark(const char* path,
                      const std::vector<uint32_t>& vm_counts,
                      int duration_ms,
@@ -2097,6 +2100,106 @@ int CmdServe(const char* path, uint32_t n_vms, int seconds, bool compiled) {
   return e == cudaSuccess ? 0 : 1;
 }
 
+int CmdHeterogeneousSmoke(const std::vector<std::string>& paths) {
+  if (paths.empty() || paths.size() > wvm::kMaxVms) {
+    std::fprintf(stderr, "error: hetero_smoke requires 1..%u programs\n",
+                 wvm::kMaxVms);
+    return 2;
+  }
+
+  wvm::ProgramRegistry registry;
+  wvm::VmDirectory directory(static_cast<uint32_t>(paths.size()));
+  std::vector<wvm::VmBinding> bindings(paths.size());
+  std::vector<std::pair<std::string, wvm::LoadedProgramId>> loaded;
+  std::string err;
+  for (wvm::VmSlot slot = 0; slot < paths.size(); ++slot) {
+    wvm::LoadedProgramId program_id;
+    bool found = false;
+    for (const auto& item : loaded) {
+      if (item.first == paths[slot]) {
+        program_id = item.second;
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      const std::string name = "program-" + std::to_string(loaded.size());
+      if (!registry.Load(paths[slot], name, program_id, err)) {
+        std::fprintf(stderr, "error: %s: %s\n", paths[slot].c_str(),
+                     err.c_str());
+        return 2;
+      }
+      loaded.emplace_back(paths[slot], program_id);
+    }
+    wvm::LogicalVmId vm_id;
+    if (!directory.Create(wvm::ResidentSlotId{slot}, vm_id, err) ||
+        !registry.Retain(program_id, err)) {
+      std::fprintf(stderr, "error: %s\n", err.c_str());
+      return 1;
+    }
+    bindings[slot].vm_id = vm_id;
+    bindings[slot].program_id = program_id;
+  }
+
+  wvm::PersistentRuntime rt;
+  if (!rt.Init(registry, bindings, err) || !rt.Launch(err)) {
+    std::fprintf(stderr, "hetero_smoke: %s\n", err.c_str());
+    return 1;
+  }
+  rt.BootAll();
+
+  bool published = false;
+  for (int waited = 0; waited < 15000 && !published; ++waited) {
+    published = true;
+    for (wvm::VmSlot slot = 0; slot < paths.size(); ++slot) {
+      if (rt.Status(slot) == wvm::kFaulted) break;
+      published &= rt.FrameSeq(slot) > 0;
+    }
+    if (!published)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  bool healthy = published;
+  for (wvm::VmSlot slot = 0; slot < paths.size(); ++slot)
+    healthy &= rt.Status(slot) == wvm::kRunning;
+
+  // Stop one machine and prove another continues publishing. This exercises
+  // heterogeneous lifecycle isolation without changing reset/delete policy.
+  bool isolated_stop = true;
+  if (paths.size() > 1 && healthy) {
+    isolated_stop = rt.Pause(1, 5000);
+    const uint32_t stopped_frame = rt.FrameSeq(1);
+    std::vector<uint32_t> other_frames(paths.size());
+    for (wvm::VmSlot slot = 0; slot < paths.size(); ++slot)
+      other_frames[slot] = rt.FrameSeq(slot);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    bool other_progress = false;
+    for (wvm::VmSlot slot = 0; slot < paths.size(); ++slot) {
+      if (slot != 1 && rt.FrameSeq(slot) > other_frames[slot])
+        other_progress = true;
+    }
+    isolated_stop &= rt.Status(1) == wvm::kPaused &&
+                     rt.FrameSeq(1) == stopped_frame && other_progress;
+    rt.SendCmd(1, wvm::kCmdRun);
+    isolated_stop &= rt.WaitStatus(1, wvm::kRunning, 5000);
+  }
+
+  std::printf("heterogeneous smoke: %zu VMs, %zu registry programs, %zu "
+              "device uploads\n",
+              paths.size(), registry.size(), rt.device_program_count());
+  PrintVmTable(rt);
+  std::printf("  all_publish_frames: %s\n", healthy ? "PASS" : "FAIL");
+  std::printf("  isolated_stop:      %s\n",
+              isolated_stop ? "PASS" : "FAIL");
+
+  rt.ShutdownAll();
+  const bool shutdown = rt.Sync() == cudaSuccess;
+  const bool pass = healthy && isolated_stop && shutdown;
+  std::printf(pass ? "heterogeneous smoke: PASS\n"
+                   : "heterogeneous smoke: FAIL\n");
+  return pass ? 0 : 1;
+}
+
 void PrintVectorRegs(const wvm::VmState& st) {
   for (int r = 0; r < wvm::kVectorRegs; ++r) {
     const uint32_t* v = &st.vregs[r * wvm::kLanes];
@@ -2648,11 +2751,13 @@ int RunSlice4() {
 }
 
 void PrintVmTable(const wvm::PersistentRuntime& rt) {
-  std::printf("  %-6s %-4s %-9s %-8s %-6s %s\n", "vm_id", "slot",
-              "status", "fault", "pc", "instrs");
+  std::printf("  %-6s %-4s %-16s %-9s %-8s %-6s %s\n", "vm_id", "slot",
+              "program", "status", "fault", "pc", "instrs");
   for (wvm::VmSlot slot = 0; slot < rt.num_vms(); ++slot) {
-    std::printf("  %-6u %-4u %-9s %-8s %-6u %llu\n",
-                rt.VmIdAtSlot(slot), slot, wvm::StatusName(rt.Status(slot)),
+    std::printf("  %-6u %-4u %-16.16s %-9s %-8s %-6u %llu\n",
+                rt.VmIdAtSlot(slot), slot,
+                rt.ProgramNameAtSlot(slot).c_str(),
+                wvm::StatusName(rt.Status(slot)),
                 wvm::FaultName(rt.Fault(slot)), rt.Pc(slot),
                 (unsigned long long)rt.Instrs(slot));
   }
@@ -2755,6 +2860,393 @@ int RunSlice5() {
   report("clean_shutdown", sync_err == cudaSuccess);
 
   std::printf(ok ? "slice5: PASS\n" : "slice5: FAIL\n");
+  return ok ? 0 : 1;
+}
+
+int RunHeterogeneousProgramTests() {
+  using wvm::enc_i;
+  using wvm::enc_r;
+  bool ok = true;
+  auto report = [&ok](const char* name, bool pass) {
+    std::printf("  %-28s %s\n", name, pass ? "PASS" : "FAIL");
+    ok &= pass;
+  };
+
+  auto make_program = [&](uint32_t sentinel, uint32_t colour,
+                          uint32_t extra_nops) {
+    wvm::WvmFile file;
+    file.literals = {sentinel, wvm::kVideoBaseWord, colour};
+    file.code = {
+        enc_i(wvm::kLdw, 0, 0, 0, 0),
+        enc_i(wvm::kMovI, 0, 1, 0, 0),
+        enc_r(wvm::kStore, 0, 1, 0, 0),
+        enc_r(wvm::kVmid, 0, 2, 0, 0),
+        enc_i(wvm::kMovI, 0, 3, 0, 1),
+        enc_r(wvm::kStore, 0, 3, 2, 0),
+        enc_i(wvm::kLdw, 0, 4, 0, 1),
+        enc_i(wvm::kLdw, 0, 5, 0, 2),
+        enc_r(wvm::kStore, 0, 4, 5, 0),
+        enc_r(wvm::kFlip, 0, 0, 0, 0),
+    };
+    for (uint32_t i = 0; i < extra_nops; ++i)
+      file.code.push_back(enc_r(wvm::kNop, 0, 0, 0, 0));
+    file.code.push_back(enc_r(wvm::kHalt, 0, 0, 0, 0));
+    return file;
+  };
+
+  wvm::ProgramRegistry registry;
+  wvm::LoadedProgramId red, green, blue;
+  std::string err;
+  const bool loaded =
+      registry.Add("red", "red.wvm",
+                   make_program(101, 0xFFFF2020u, 0), red, err) &&
+      registry.Add("green", "green.wvm",
+                   make_program(202, 0xFF20FF20u, 1), green, err) &&
+      registry.Add("blue", "blue.wvm",
+                   make_program(303, 0xFF2020FFu, 2), blue, err);
+  report("registry_loads_three", loaded && registry.size() == 3 &&
+                                     registry.Find("green") != nullptr);
+  if (!loaded) return 1;
+
+  const bool retained = registry.Retain(red, err) &&
+                        registry.Retain(green, err) &&
+                        registry.Retain(red, err) &&
+                        registry.Retain(blue, err);
+  const bool unload_rejected = retained && !registry.Unload(red, err) &&
+                               registry.Find(red) != nullptr;
+  report("referenced_unload_rejected", unload_rejected);
+
+  const std::vector<wvm::VmBinding> bindings = {
+      {wvm::LogicalVmId{10}, red},
+      {wvm::LogicalVmId{21}, green},
+      {wvm::LogicalVmId{35}, red},
+      {wvm::LogicalVmId{48}, blue},
+  };
+  wvm::PersistentRuntime rt;
+  if (!rt.Init(registry, bindings, err) || !rt.Launch(err)) {
+    std::fprintf(stderr, "heterogeneous programs: setup failed: %s\n",
+                 err.c_str());
+    return 1;
+  }
+  report("three_device_program_uploads", rt.device_program_count() == 3);
+  report("per_slot_program_identity",
+         rt.ProgramIdAtSlot(0) == red.value &&
+             rt.ProgramIdAtSlot(1) == green.value &&
+             rt.ProgramIdAtSlot(2) == red.value &&
+             rt.ProgramIdAtSlot(3) == blue.value &&
+             rt.ProgramNameAtSlot(2) == "red");
+
+  wvm::VmDesc desc0{}, desc1{}, desc2{};
+  const bool shared_upload = rt.ReadDescriptor(0, desc0) &&
+                             rt.ReadDescriptor(1, desc1) &&
+                             rt.ReadDescriptor(2, desc2) &&
+                             desc0.code == desc2.code &&
+                             desc0.literals == desc2.literals &&
+                             desc0.code != desc1.code;
+  report("shared_immutable_device_image", shared_upload);
+
+  rt.BootAll();
+  bool halted = true;
+  for (wvm::VmSlot slot = 0; slot < bindings.size(); ++slot)
+    halted &= rt.WaitStatus(slot, wvm::kHalted, 2000);
+  report("heterogeneous_concurrent_halt", halted);
+
+  const uint32_t expected_sentinels[] = {101, 202, 101, 303};
+  const uint32_t expected_colours[] = {0xFFFF2020u, 0xFF20FF20u,
+                                       0xFFFF2020u, 0xFF2020FFu};
+  bool isolated = true;
+  for (wvm::VmSlot slot = 0; slot < bindings.size(); ++slot) {
+    std::vector<uint32_t> memory;
+    std::vector<uint32_t> framebuffer;
+    isolated &= rt.ReadMem(slot, 0, 2, memory) && memory.size() == 2 &&
+                memory[0] == expected_sentinels[slot] &&
+                memory[1] == bindings[slot].vm_id.value &&
+                rt.ReadFramebuffer(slot, framebuffer) &&
+                framebuffer[0] == expected_colours[slot] &&
+                rt.FrameSeq(slot) == 1;
+  }
+  report("private_state_and_framebuffers", isolated);
+
+  wvm::VmState state0{}, state1{}, state3{};
+  const bool independent_fetch =
+      rt.ReadState(0, state0) && rt.ReadState(1, state1) &&
+      rt.ReadState(3, state3) && state0.pc != state1.pc &&
+      state1.pc != state3.pc;
+  report("independent_program_fetch_pc", independent_fetch);
+
+  rt.ShutdownAll();
+  report("heterogeneous_clean_shutdown", rt.Sync() == cudaSuccess);
+
+  bool released = registry.Release(red, err) && registry.Release(green, err) &&
+                  registry.Release(red, err) && registry.Release(blue, err);
+  const wvm::ProgramId retired_red = red.value;
+  released &= registry.Unload(red, err) && registry.Find(red) == nullptr;
+  wvm::LoadedProgramId replacement;
+  released &= registry.Add("replacement", "replacement.wvm",
+                           make_program(404, 0xFFFFFFFFu, 0), replacement,
+                           err) &&
+              replacement.value != retired_red;
+  report("program_release_unload_nonreuse", released);
+
+  std::printf(ok ? "heterogeneous programs: PASS\n"
+                 : "heterogeneous programs: FAIL\n");
+  return ok ? 0 : 1;
+}
+
+int RunSupervisorLifecycleTests() {
+  using wvm::enc_i;
+  using wvm::enc_r;
+  bool ok = true;
+  auto report = [&](const char* name, bool pass) {
+    std::printf("  %-30s %s\n", name, pass ? "PASS" : "FAIL");
+    ok &= pass;
+  };
+  auto image = [](std::initializer_list<uint32_t> code,
+                  std::initializer_list<uint32_t> literals = {}) {
+    wvm::WvmFile result;
+    result.code.assign(code);
+    result.literals.assign(literals);
+    return result;
+  };
+
+  // Increments RAM[0], yields, and repeats. The backward jump is also a
+  // control point, so stop/delete acknowledgement is prompt.
+  const wvm::WvmFile counter = image({
+      enc_i(wvm::kMovI, 0, 0, 0, 0),
+      enc_r(wvm::kLoad, 0, 1, 0, 0),
+      enc_i(wvm::kAddI, 0, 1, 1, 1),
+      enc_r(wvm::kStore, 0, 0, 1, 0),
+      enc_r(wvm::kYield, 0, 0, 0, 0),
+      enc_i(wvm::kJmp, 0, 0, 0, 1),
+  });
+  const wvm::WvmFile halter = image({
+      enc_r(wvm::kVmid, 0, 0, 0, 0),
+      enc_i(wvm::kMovI, 0, 1, 0, 0),
+      enc_r(wvm::kStore, 0, 1, 0, 0),
+      enc_r(wvm::kHalt, 0, 0, 0, 0),
+  });
+  const wvm::WvmFile faulter = image({
+      enc_r(wvm::kRet, 0, 0, 0, 0),
+  });
+  // A replacement VM probes its fresh mailbox once and records whether it
+  // inherited a message intended for the prior logical owner of its slot.
+  const wvm::WvmFile receiver = image({
+      enc_i(wvm::kMovI, 0, 0, 0, 0),
+      enc_r(wvm::kTryRecv, 0, 0, 1, 2),
+      enc_i(wvm::kJmpIfAny, 1, 0, 0, 6),
+      enc_i(wvm::kMovI, 0, 3, 0, 0),
+      enc_r(wvm::kStore, 0, 0, 3, 0),
+      enc_r(wvm::kHalt, 0, 0, 0, 0),
+      enc_i(wvm::kMovI, 0, 3, 0, 1),
+      enc_r(wvm::kStore, 0, 0, 3, 0),
+      enc_r(wvm::kHalt, 0, 0, 0, 0),
+  });
+  // Logical destination 1 will have been retired when this program runs.
+  const wvm::WvmFile stale_sender = image({
+      enc_i(wvm::kMovI, 0, 0, 0, 1),
+      enc_i(wvm::kMovI, 0, 1, 0, 7),
+      enc_i(wvm::kMovI, 0, 2, 0, 999),
+      enc_r(wvm::kSend, 0, 0, 1, 2),
+      enc_r(wvm::kHalt, 0, 0, 0, 0),
+  });
+  const wvm::WvmFile race_sender = image({
+      enc_r(wvm::kVmid, 0, 0, 0, 0),
+      enc_i(wvm::kAddI, 0, 0, 0, 1),  // destination is next-created VM
+      enc_i(wvm::kMovI, 0, 1, 0, 12),
+      enc_i(wvm::kMovI, 0, 2, 0, 777),
+      enc_r(wvm::kSend, 0, 0, 1, 2),
+      enc_i(wvm::kMovI, 0, 3, 0, 0),
+      enc_i(wvm::kAddI, 0, 3, 3, 1),
+      enc_i(wvm::kCmpLtI, 0, 0, 3, 4000),
+      enc_i(wvm::kJmpIfAny, 1, 0, 0, 6),
+      enc_r(wvm::kYield, 0, 0, 0, 0),
+      enc_i(wvm::kJmp, 0, 0, 0, 4),
+  });
+  const wvm::WvmFile drain_receiver = image({
+      enc_r(wvm::kTryRecv, 0, 0, 0, 1),
+      enc_r(wvm::kYield, 0, 0, 0, 0),
+      enc_i(wvm::kJmp, 0, 0, 0, 0),
+  });
+
+  wvm::Supervisor supervisor;
+  wvm::LoadedProgramId counter_id, halt_id, fault_id, receiver_id, sender_id,
+      race_sender_id, drain_id;
+  std::string err;
+  const bool programs_loaded =
+      supervisor.ProgramAdd("counter", counter, counter_id, err) &&
+      supervisor.ProgramAdd("halter", halter, halt_id, err) &&
+      supervisor.ProgramAdd("faulter", faulter, fault_id, err) &&
+      supervisor.ProgramAdd("receiver", receiver, receiver_id, err) &&
+      supervisor.ProgramAdd("stale-sender", stale_sender, sender_id, err) &&
+      supervisor.ProgramAdd("race-sender", race_sender, race_sender_id, err) &&
+      supervisor.ProgramAdd("drain-receiver", drain_receiver, drain_id, err);
+  report("program_registry_before_launch", programs_loaded);
+  if (!programs_loaded || !supervisor.Launch(3, err)) {
+    std::fprintf(stderr, "supervisor lifecycle setup failed: %s\n",
+                 err.c_str());
+    return 1;
+  }
+
+  wvm::LogicalVmId counter_vm, halt_vm, fault_vm;
+  const bool created =
+      supervisor.VmCreate(counter_id, counter_vm, err, 16, {41}) &&
+      supervisor.VmCreate(halt_id, halt_vm, err, 16) &&
+      supervisor.VmCreate(fault_id, fault_vm, err, 16);
+  report("empty_create_ready", created && counter_vm.value == 0 &&
+                                      halt_vm.value == 1 &&
+                                      fault_vm.value == 2 &&
+                                      supervisor.Find(counter_vm)->lifecycle ==
+                                          wvm::VmLifecycle::kReady);
+  wvm::LogicalVmId over_capacity;
+  report("fixed_capacity_enforced",
+         !supervisor.VmCreate(halt_id, over_capacity, err));
+  report("referenced_program_not_unloaded",
+         !supervisor.ProgramUnload(counter_id, err));
+
+  bool counter_cycle = supervisor.VmStart(counter_vm, err);
+  counter_cycle &= supervisor.runtime().WaitStatus(0, wvm::kRunning, 2000);
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  counter_cycle &= supervisor.VmStop(counter_vm, err);
+  std::vector<uint32_t> before_pause, during_pause, after_resume;
+  counter_cycle &= supervisor.runtime().ReadMem(0, 0, 1, before_pause);
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  counter_cycle &= supervisor.runtime().ReadMem(0, 0, 1, during_pause);
+  counter_cycle &= supervisor.VmResume(counter_vm, err);
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  counter_cycle &= supervisor.VmStop(counter_vm, err);
+  counter_cycle &= supervisor.runtime().ReadMem(0, 0, 1, after_resume);
+  report("stop_preserves_resume_continues",
+         counter_cycle && before_pause[0] > 41 &&
+             during_pause[0] == before_pause[0] &&
+             after_resume[0] > during_pause[0]);
+
+  bool reset_ok = supervisor.VmReset(counter_vm, err);
+  std::vector<uint32_t> reset_memory;
+  reset_ok &= supervisor.runtime().ReadMem(0, 0, 1, reset_memory);
+  report("reset_restores_initial_state",
+         reset_ok && reset_memory[0] == 41 &&
+             supervisor.Find(counter_vm)->lifecycle ==
+                 wvm::VmLifecycle::kReady);
+
+  bool terminal_states = supervisor.VmStart(halt_vm, err) &&
+                         supervisor.runtime().WaitStatus(1, wvm::kHalted,
+                                                         2000) &&
+                         supervisor.Find(halt_vm)->lifecycle ==
+                             wvm::VmLifecycle::kHalted &&
+                         supervisor.VmStart(fault_vm, err) &&
+                         supervisor.runtime().WaitStatus(2, wvm::kFaulted,
+                                                         2000) &&
+                         supervisor.Find(fault_vm)->lifecycle ==
+                             wvm::VmLifecycle::kFaulted;
+  report("halted_and_faulted_states", terminal_states);
+
+  bool neighbour_isolation = supervisor.VmStart(counter_vm, err);
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  const uint64_t peer_before = supervisor.runtime().Instrs(0);
+  neighbour_isolation &= supervisor.VmDelete(halt_vm, err);
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  const uint64_t peer_after = supervisor.runtime().Instrs(0);
+  report("delete_does_not_stop_neighbour",
+         neighbour_isolation && peer_after > peer_before &&
+             supervisor.runtime().SlotForVmId(halt_vm.value) ==
+                 wvm::kInvalidVmSlot);
+
+  wvm::LogicalVmId replacement_vm;
+  bool recycled = supervisor.VmCreate(receiver_id, replacement_vm, err, 16);
+  recycled &= replacement_vm.value > fault_vm.value &&
+              supervisor.Find(replacement_vm)->slot.value == 1 &&
+              supervisor.runtime().SlotForVmId(halt_vm.value) ==
+                  wvm::kInvalidVmSlot;
+  report("slot_reuse_gets_fresh_identity", recycled);
+
+  bool stale_safe = supervisor.VmDelete(fault_vm, err);
+  wvm::LogicalVmId sender_vm;
+  stale_safe &= supervisor.VmCreate(sender_id, sender_vm, err, 16);
+  stale_safe &= supervisor.VmStart(sender_vm, err);
+  stale_safe &= supervisor.runtime().WaitStatus(2, wvm::kFaulted, 2000);
+  stale_safe &= supervisor.runtime().Fault(2) == wvm::kFaultMsg;
+  stale_safe &= supervisor.VmStart(replacement_vm, err);
+  stale_safe &= supervisor.runtime().WaitStatus(1, wvm::kHalted, 2000);
+  std::vector<uint32_t> replacement_memory;
+  stale_safe &= supervisor.runtime().ReadMem(1, 0, 1, replacement_memory);
+  report("retired_messages_not_retargeted",
+         stale_safe && replacement_memory[0] == 0);
+
+  const wvm::VmId preserved_id = replacement_vm.value;
+  bool rebound = supervisor.VmSetProgram(replacement_vm, halt_id, err);
+  rebound &= supervisor.Find(replacement_vm)->vm_id.value == preserved_id &&
+             supervisor.Find(replacement_vm)->program_id.value ==
+                 halt_id.value &&
+             supervisor.Find(replacement_vm)->lifecycle ==
+                 wvm::VmLifecycle::kReady;
+  rebound &= supervisor.VmStart(replacement_vm, err) &&
+             supervisor.runtime().WaitStatus(1, wvm::kHalted, 2000);
+  std::vector<uint32_t> rebound_memory;
+  rebound &= supervisor.runtime().ReadMem(1, 0, 1, rebound_memory);
+  report("cold_rebind_preserves_identity",
+         rebound && rebound_memory[0] == preserved_id);
+
+  bool cleared_population = supervisor.VmDelete(replacement_vm, err) &&
+                            supervisor.VmDelete(sender_vm, err) &&
+                            supervisor.VmDelete(counter_vm, err);
+  wvm::LogicalVmId race_sender_vm, drain_vm;
+  const bool race_created =
+      cleared_population &&
+      supervisor.VmCreate(race_sender_id, race_sender_vm, err, 16) &&
+      supervisor.VmCreate(drain_id, drain_vm, err, 16) &&
+      drain_vm.value == race_sender_vm.value + 1;
+  const bool receiver_running =
+      race_created && supervisor.VmStart(drain_vm, err) &&
+      supervisor.runtime().WaitStatus(1, wvm::kRunning, 2000);
+  const bool race_setup = receiver_running &&
+                          supervisor.VmStart(race_sender_vm, err);
+  const bool both_running =
+      race_setup && supervisor.runtime().WaitStatus(0, wvm::kRunning, 2000);
+  const bool race_delete = both_running && supervisor.VmDelete(drain_vm, err);
+  const bool sender_rejected =
+      race_delete && supervisor.runtime().WaitStatus(0, wvm::kFaulted, 2000) &&
+      supervisor.runtime().Fault(0) == wvm::kFaultMsg;
+  wvm::LogicalVmId race_replacement;
+  const bool replacement_created =
+      sender_rejected &&
+      supervisor.VmCreate(receiver_id, race_replacement, err, 16) &&
+      supervisor.Find(race_replacement)->slot.value == 1 &&
+      supervisor.VmStart(race_replacement, err) &&
+      supervisor.runtime().WaitStatus(1, wvm::kHalted, 2000);
+  std::vector<uint32_t> race_replacement_memory;
+  const bool replacement_read = replacement_created &&
+      supervisor.runtime().ReadMem(1, 0, 1, race_replacement_memory);
+  const bool racing_retirement =
+      replacement_read && race_replacement_memory[0] == 0;
+  if (!racing_retirement || race_replacement_memory.empty() ||
+      race_replacement_memory[0] != 0) {
+    std::printf("    race detail: setup=%u running=%u delete=%u reject=%u "
+                "create=%u read=%u sender_status=%s fault=%s replacement=%u "
+                "error=%s\n",
+                race_setup, both_running, race_delete, sender_rejected,
+                replacement_created, replacement_read,
+                wvm::StatusName(supervisor.runtime().Status(0)),
+                wvm::FaultName(supervisor.runtime().Fault(0)),
+                race_replacement_memory.empty() ? 0xFFFFFFFFu
+                                                : race_replacement_memory[0],
+                err.c_str());
+  }
+  report("concurrent_retire_send_is_safe",
+         racing_retirement && race_replacement_memory[0] == 0);
+
+  bool cleanup = supervisor.VmDelete(race_replacement, err) &&
+                 supervisor.VmDelete(race_sender_vm, err) &&
+                 supervisor.ProgramUnload(sender_id, err) &&
+                 supervisor.ProgramUnload(counter_id, err) &&
+                 supervisor.ProgramUnload(halt_id, err) &&
+                 supervisor.ProgramUnload(fault_id, err) &&
+                 supervisor.ProgramUnload(receiver_id, err) &&
+                 supervisor.ProgramUnload(race_sender_id, err) &&
+                 supervisor.ProgramUnload(drain_id, err);
+  report("delete_releases_program_refs", cleanup);
+  supervisor.Shutdown();
+  std::printf(ok ? "supervisor lifecycle: PASS\n"
+                 : "supervisor lifecycle: FAIL\n");
   return ok ? 0 : 1;
 }
 
@@ -3690,12 +4182,18 @@ void Usage(const char* argv0) {
   std::printf("  demo <file.wvm> [--vms N]\n");
   std::printf("                  v0.1 capstone: N VMs compute + ring-message + stay live\n");
   std::printf("  slice1..slice5,slice7  self-test suites\n");
+  std::printf("  hetero_tests           shared-program heterogeneous VM tests\n");
+  std::printf("  supervisor_tests       dynamic VM lifecycle/recycling tests\n");
   std::printf("  gfxa | gfxb            v0.1.1 graphics slices A/B self-tests\n");
   std::printf("  gfxsmoke <file.wvm>    headless framebuffer-copy smoke test\n");
   std::printf("  gfx_cap <file.wvm> [--vms N]\n");
   std::printf("                  v0.1.1 capstone: N VMs render distinct images\n");
   std::printf("  view <file.wvm> [--vm N | --vms N] [--compiled]\n");
   std::printf("                  show one VM or a tiled grid of N resident VMs\n");
+  std::printf("  hetero_view <a.wvm> <b.wvm> [...]\n");
+  std::printf("                  run different interpreted programs in one grid\n");
+  std::printf("  hetero_smoke <a.wvm> <b.wvm> [...]\n");
+  std::printf("                  headless heterogeneous graphics/lifecycle check\n");
   std::printf("  life_test <file.wvm> Program 01 packed-Life correctness test\n");
   std::printf("  life_bench <file.wvm> [--vms N] [--ms N] [--workers N]\n");
   std::printf("                  compare GPU/CPU WarpVM and native GPU/CPU\n");
@@ -3854,6 +4352,10 @@ int main(int argc, char** argv) {
   if (std::strcmp(cmd, "slice4") == 0) return RunSlice4();
   if (std::strcmp(cmd, "slice5") == 0) return RunSlice5();
   if (std::strcmp(cmd, "slice7") == 0) return RunSlice7();
+  if (std::strcmp(cmd, "hetero_tests") == 0)
+    return RunHeterogeneousProgramTests();
+  if (std::strcmp(cmd, "supervisor_tests") == 0)
+    return RunSupervisorLifecycleTests();
   if (std::strcmp(cmd, "gfxa") == 0) return RunSliceGfxA();
   if (std::strcmp(cmd, "gfxb") == 0) return RunSliceGfxB();
   if (std::strcmp(cmd, "gfxsmoke") == 0) {
@@ -3924,6 +4426,28 @@ int main(int argc, char** argv) {
     }
     if (select_grid) return wvm::ViewVmGrid(argv[2], n_vms, compiled);
     return wvm::ViewSingleVm(argv[2], vm_index, compiled);
+  }
+  if (std::strcmp(cmd, "hetero_view") == 0) {
+    if (argc < 3) {
+      std::fprintf(stderr,
+                   "error: hetero_view requires at least one .wvm file\n");
+      return 2;
+    }
+    std::vector<std::string> paths;
+    paths.reserve(static_cast<size_t>(argc - 2));
+    for (int i = 2; i < argc; ++i) paths.emplace_back(argv[i]);
+    return wvm::ViewHeterogeneousGrid(paths);
+  }
+  if (std::strcmp(cmd, "hetero_smoke") == 0) {
+    if (argc < 3) {
+      std::fprintf(stderr,
+                   "error: hetero_smoke requires at least one .wvm file\n");
+      return 2;
+    }
+    std::vector<std::string> paths;
+    paths.reserve(static_cast<size_t>(argc - 2));
+    for (int i = 2; i < argc; ++i) paths.emplace_back(argv[i]);
+    return CmdHeterogeneousSmoke(paths);
   }
   if (std::strcmp(cmd, "life_test") == 0) {
     if (argc < 3) {
