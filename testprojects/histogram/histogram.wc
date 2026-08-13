@@ -1,0 +1,117 @@
+#include <warp.h>
+
+/*
+ * 32-bin histogram.
+ *
+ * Each lane owns one bin (the bin whose index is WARP) and one sample of the
+ * current 32-word chunk. The histogram is the transpose of a sequential
+ * increment: shuffle every sample across the warp, and the matching bin-lane
+ * adds one. No atomics, no per-bin reduction loop, no divergent control in
+ * the inner pass — just add the predicate.
+ *
+ * A tail shorter than 32 is a validity mask shuffled the same way, so partial
+ * chunks do not invent samples.
+ */
+
+unsigned g_data[128];
+unsigned g_hist[32];
+unsigned g_fail;
+
+int count_chunk(int sample, int valid)
+{
+    int hits = 0;
+    unsigned src;
+    for (src = 0u; src < 32u; src = src + 1u) {
+        int value = warp_shuffle(sample, src);
+        int live = warp_shuffle(valid, src);
+        hits = hits + (live & (value == WARP));
+    }
+    return hits;
+}
+
+int expect_quads(void)
+{
+    return (WARP < 8) ? 4 : 0;
+}
+
+int expect_constant_seven(void)
+{
+    return (WARP == 7) ? 32 : 0;
+}
+
+int expect_tail(void)
+{
+    /* 100 samples of (i & 31): three full cycles plus 0,1,2,3. */
+    return (WARP < 4) ? 4 : 3;
+}
+
+int main(void)
+{
+    int hits;
+    int sample;
+    unsigned base;
+    unsigned index;
+    int live;
+    int expected;
+    int bin7_shuffle;
+    int bin7_reduce;
+
+    g_fail = 0;
+
+    /* Passing WARP directly into a non-inlined call currently trips a compiler
+     * internal error (r13 is live but not in the caller-save set). Bind it. */
+    sample = WARP;
+
+    /* Identity: one of each bin. */
+    hits = count_chunk(sample, 1);
+    g_hist[WARP] = hits;
+    if (!warp_all(hits == 1))
+        g_fail = 1;
+
+    /* Every sample in one bin. */
+    hits = count_chunk(7, 1);
+    g_hist[WARP] = hits;
+    expected = expect_constant_seven();
+    if (!warp_all(hits == expected))
+        g_fail = 2;
+
+    /* Four samples in each of bins 0..7. Cross-check bin 7 two ways:
+     * the lane-owned shuffle count, and a direct reduction of the predicate. */
+    sample = sample >> 2;
+    hits = count_chunk(sample, 1);
+    g_hist[WARP] = hits;
+    expected = expect_quads();
+    if (!warp_all(hits == expected))
+        g_fail = 3;
+
+    bin7_shuffle = warp_broadcast(hits, 7);
+    bin7_reduce = warp_reduce_add(sample == 7);
+    if (bin7_shuffle != 4 || bin7_reduce != 4)
+        g_fail = 4;
+
+    /* 100-word tail: not a multiple of 32. */
+    for (base = 0u; base < 100u; base = base + 32u) {
+        index = base + WARP;
+        live = index < 100u;
+        if (live)
+            g_data[index] = index & 31;
+    }
+
+    hits = 0;
+    for (base = 0u; base < 100u; base = base + 32u) {
+        index = base + WARP;
+        live = index < 100u;
+        sample = 0;
+        if (live)
+            sample = g_data[index];
+        hits = hits + count_chunk(sample, live);
+    }
+    g_hist[WARP] = hits;
+    expected = expect_tail();
+    if (!warp_all(hits == expected))
+        g_fail = 5;
+
+    if (g_fail)
+        return 0;
+    return 42;
+}
