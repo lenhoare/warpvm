@@ -13,10 +13,10 @@ int g_x[32];
 int g_y[32];
 int g_fail;
 
-void matvec(int *A, int *x_in, int *y)
+void matvec(uniform int *A, uniform int *x_in, uniform int *y)
 {
     int x = x_in[WARP];
-    int row;
+    uniform int row;
     for (row = 0; row < 32; row = row + 1) {
         int acc = warp_reduce_add(A[row * 32 + WARP] * x);
         if (WARP == 0)
@@ -26,7 +26,7 @@ void matvec(int *A, int *x_in, int *y)
 
 int main(void)
 {
-    int row;
+    uniform int row;
     int expected;
     int total;
     int sumsq;

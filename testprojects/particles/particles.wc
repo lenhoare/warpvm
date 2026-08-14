@@ -10,17 +10,17 @@
 
 int main(void)
 {
-    int vm;
+    uniform int vm;
     int x;
     int y;
     int vx;
     int vy;
-    int k;
+    uniform int k;
     int ox;
     int oy;
     int hit;
-    int base;
-    int py;
+    uniform int base;
+    uniform int py;
     int colour;
 
     vm = warp_vm_id();

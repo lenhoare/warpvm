@@ -1,8 +1,8 @@
 /* Warp C v0.1.4 Slice B: switch dispatch, fall-through and default. */
 int main(void)
 {
-    int sum = 0;
-    int value = 2;
+    uniform int sum = 0;
+    uniform int value = 2;
 
     switch (value) {
     case 0:
@@ -47,8 +47,8 @@ int main(void)
     }
 
     /* break exits only the switch; continue still targets the for loop. */
-    int nested = 0;
-    for (int i = 0; i < 4; ++i) {
+    uniform int nested = 0;
+    for (uniform int i = 0; i < 4; ++i) {
         switch (i) {
         case 0:
             continue;

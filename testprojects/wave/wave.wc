@@ -3,7 +3,7 @@
 /*
  * 64x64 toroidal 2D wave, drawn 2x2 onto the 128x128 framebuffer.
  *
- * Full 128x128 double-buffering is 32,768 words; VM RAM is 16,384. This
+ * Full 128x128 double-buffering is 32,768 words. This
  * lattice is 3 x 4,096 = 12,288 words: u^t, u^{t-1}, and the next field,
  * rotated by pointer each step so the stencil does not copy the grid.
  *
@@ -15,10 +15,10 @@ int g_a[4096];
 int g_b[4096];
 int g_c[4096];
 
-void wave_step(int *u, int *prev, int *out)
+void wave_step(uniform int *u, uniform int *prev, uniform int *out)
 {
-    int y;
-    int base;
+    uniform int y;
+    uniform int base;
     int x;
     int i;
     int c;
@@ -54,15 +54,15 @@ int wave_colour(int h)
 
 int main(void)
 {
-    int *u;
-    int *prev;
-    int *nxt;
-    int *tmp;
-    int vm;
-    int drop;
-    int frame;
-    int y;
-    int base;
+    uniform int *u;
+    uniform int *prev;
+    uniform int *nxt;
+    uniform int *tmp;
+    uniform int vm;
+    uniform int drop;
+    uniform int frame;
+    uniform int y;
+    uniform int base;
     int x;
     int h;
     int sx;

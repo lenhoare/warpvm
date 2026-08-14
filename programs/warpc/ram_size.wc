@@ -7,7 +7,8 @@ int main(void)
 {
     unsigned address = 19968u + WARP;
     expanded[address] = WARP * 7u + 3u;
-    if (WARP_RAM_SIZE_WORDS != 65536u)
+    if ((WARP_RAM_WORDS != 65536u) |
+        (WARP_RAM_SIZE_WORDS != WARP_RAM_WORDS))
         return 0;
     return warp_all(expanded[address] == WARP * 7u + 3u) ? 42 : 0;
 }

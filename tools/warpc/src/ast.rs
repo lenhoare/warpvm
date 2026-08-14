@@ -19,6 +19,7 @@ pub struct Declarator {
 
 #[derive(Clone, Debug)]
 pub struct DeclType {
+    pub uniform: bool,
     pub base: TypeName,
     pub declarator: Declarator,
 }

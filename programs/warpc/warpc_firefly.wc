@@ -25,7 +25,7 @@ unsigned pulse_outer_squared;
 
 int main(void)
 {
-    unsigned vm = warp_vm_id();
+    uniform unsigned vm = warp_vm_id();
 
     /* Relatively-prime multipliers give the 64 VMs distinct starting points. */
     firefly_x = 8 + (vm * 29) % 112;
@@ -78,17 +78,17 @@ int main(void)
          * lockstep. Each pulse travels to both neighbours among exactly 64
          * resident VMs. */
         if ((frame_number + vm * 37) % 120 == 0) {
-            unsigned left = (vm + 63) % 64;
-            unsigned right = (vm + 1) % 64;
-            unsigned energy = 32 + (vm & 15);
+            uniform unsigned left = (vm + 63) % 64;
+            uniform unsigned right = (vm + 1) % 64;
+            uniform unsigned energy = 32 + (vm & 15);
             warp_send(left, 1, energy);
             warp_send(right, 1, energy);
             pulse_age = 1;
         }
 
         if (pulse_age != 0) {
-            unsigned inner = pulse_age - 1;
-            unsigned outer = pulse_age + 1;
+            uniform unsigned inner = pulse_age - 1;
+            uniform unsigned outer = pulse_age + 1;
             pulse_inner_squared = inner * inner;
             pulse_outer_squared = outer * outer;
         }
@@ -106,7 +106,7 @@ int main(void)
         }
 
         /* 512 iterations x 32 lanes = one complete 128x128 framebuffer. */
-        for (unsigned batch = 0; batch < 512; ++batch) {
+        for (uniform unsigned batch = 0; batch < 512; ++batch) {
             unsigned index = batch * 32 + WARP;
             unsigned pixel_x = index & 127;
             unsigned pixel_y = index >> 7;

@@ -13,14 +13,14 @@ int g_next[128];
 
 int main(void)
 {
-    int vm;
-    int seed;
-    int base;
+    uniform int vm;
+    uniform int seed;
+    uniform int base;
     int i;
     int left;
     int centre;
     int right;
-    int y;
+    uniform int y;
     int colour;
 
     vm = warp_vm_id();

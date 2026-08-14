@@ -3,28 +3,28 @@
 /* The control flow deliberately keeps these helpers on the real CALL/RET ABI. */
 int take_one(int a)
 {
-    if (a == -999)
-        return 0;
+    for (uniform int once = 0; once < 1; ++once)
+        a = a;
     return a;
 }
 
 int take_two(int a, int b)
 {
-    if (a == -999)
-        return 0;
+    for (uniform int once = 0; once < 1; ++once)
+        a = a;
     return a + b;
 }
 
 int take_four(int a, int b, int c, int d)
 {
-    if (d == -999)
-        return 0;
+    for (uniform int once = 0; once < 1; ++once)
+        d = d;
     return a + b + c + d;
 }
 
 int main(void)
 {
-    int failures = 0;
+    uniform int failures = 0;
     int value;
 
     value = take_one(WARP);
@@ -43,7 +43,7 @@ int main(void)
     if (!warp_all(value == WARP * 3 + 7))
         failures = 4;
 
-    int side = 0;
+    uniform int side = 0;
     value = take_two(WARP, ++side);
     if (!warp_all(value == WARP + 1) || side != 1)
         failures = 5;
@@ -52,7 +52,7 @@ int main(void)
     if (!warp_all(value == WARP * 4 + 2))
         failures = 6;
 
-    unsigned vm = warp_vm_id();
+    uniform unsigned vm = warp_vm_id();
     int local = WARP + 9;
     value = take_four(local, warp_lane_id(), vm, 3);
     if (!warp_all(value == WARP * 2 + 12 + vm))

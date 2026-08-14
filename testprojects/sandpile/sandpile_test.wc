@@ -4,11 +4,11 @@ int g_cur[4096];
 int g_nxt[4096];
 int g_fail;
 
-int topple(int *cur, int *nxt)
+uniform int topple(uniform int *cur, uniform int *nxt)
 {
     int seen;
-    int y;
-    int base;
+    uniform int y;
+    uniform int base;
     int x;
     int i;
     int h;
@@ -38,20 +38,20 @@ int topple(int *cur, int *nxt)
     return warp_any(seen);
 }
 
-void copy_grid(int *dst, int *src)
+void copy_grid(uniform int *dst, uniform int *src)
 {
-    int base;
+    uniform int base;
     for (base = 0; base < 4096; base = base + 32)
         dst[base + WARP] = src[base + WARP];
 }
 
 int main(void)
 {
-    int y;
-    int base;
-    int busy;
-    int guard;
-    int total;
+    uniform int y;
+    uniform int base;
+    uniform int busy;
+    uniform int guard;
+    uniform int total;
 
     g_fail = 0;
 

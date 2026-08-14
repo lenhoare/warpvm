@@ -1,13 +1,13 @@
 /* Warp C v0.1.4 Slice A: signed/unsigned integer semantics. */
 int main(void)
 {
-    int dividend = -21;
-    int divisor = 4;
-    unsigned high = 0xffffffffu;
-    char letter = 'A';
-    int short_circuit = 0;
-    int compound = 5;
-    int checks = 0;
+    uniform int dividend = -21;
+    uniform int divisor = 4;
+    uniform unsigned high = 0xffffffffu;
+    uniform char letter = 'A';
+    uniform int short_circuit = 0;
+    uniform int compound = 5;
+    uniform int checks = 0;
 
     /* Signed arithmetic, bitwise operations, shifts and comparisons. */
     checks += dividend + divisor == -17;

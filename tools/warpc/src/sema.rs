@@ -125,6 +125,25 @@ pub enum Uniformity {
     Divergent,
 }
 
+// A declaration's value-shape contract is distinct from a temporary
+// expression's proven uniformity. Ordinary Warp C declarations are warp
+// values even when initialized from an expression that happens to be equal in
+// every lane; only an explicit `uniform` declaration owns scalar storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ValueShape {
+    Warp,
+    Uniform,
+}
+
+impl ValueShape {
+    fn expression_uniformity(self) -> Uniformity {
+        match self {
+            Self::Warp => Uniformity::Divergent,
+            Self::Uniform => Uniformity::Uniform,
+        }
+    }
+}
+
 impl Uniformity {
     pub fn join(self, other: Self) -> Self {
         if self == Self::Divergent || other == Self::Divergent {
@@ -163,6 +182,8 @@ pub struct GlobalInfo {
 pub struct TypedProgram {
     pub functions: Vec<TypedFunction>,
     pub function_names: Vec<String>,
+    pub function_param_shapes: Vec<Vec<ValueShape>>,
+    pub function_return_shapes: Vec<ValueShape>,
     pub main: FunctionId,
     pub locals: Vec<LocalInfo>,
     pub globals: Vec<GlobalInfo>,
@@ -175,6 +196,7 @@ pub struct TypedFunction {
     pub id: FunctionId,
     pub name: String,
     pub return_type: Type,
+    pub return_shape: ValueShape,
     pub params: Vec<LocalId>,
     pub body: TypedBlock,
     pub frame_words: usize,
@@ -187,6 +209,7 @@ pub struct LocalInfo {
     pub ty: Type,
     pub span: Span,
     pub uniformity: Uniformity,
+    pub shape: ValueShape,
     pub address_taken: bool,
     pub frame_offset: Option<usize>,
 }
@@ -315,6 +338,17 @@ pub enum Intrinsic {
 }
 
 impl Intrinsic {
+    fn requires_uniform_argument(self, index: usize) -> bool {
+        match self {
+            // These are one VM-wide operation, so their operands must denote
+            // one destination/message or one pair of output addresses.
+            Intrinsic::Send | Intrinsic::TryRecv => true,
+            // Broadcast selects one source lane for the whole warp.
+            Intrinsic::Broadcast => index == 1,
+            _ => false,
+        }
+    }
+
     fn result_uniformity(self, args: &[TypedExpr], operand_uniformity: Uniformity) -> Uniformity {
         match self {
             // These operations produce one warp-wide result by definition.
@@ -422,9 +456,12 @@ struct FunctionSymbol {
     name: String,
     return_type: Type,
     params: Vec<Type>,
+    param_shapes: Vec<ValueShape>,
+    param_names: Vec<Option<String>>,
+    param_spans: Vec<Span>,
+    return_shape: ValueShape,
     defined: bool,
     span: Span,
-    divergent_result: bool,
 }
 
 #[derive(Clone)]
@@ -448,6 +485,7 @@ struct Analyzer {
     struct_ids: HashMap<String, StructId>,
     data_words: Vec<u32>,
     return_type: Type,
+    return_shape: ValueShape,
     functions: Vec<FunctionSymbol>,
     function_ids: HashMap<String, FunctionId>,
     inline_candidates: HashMap<FunctionId, InlineCandidate>,
@@ -470,6 +508,7 @@ impl Analyzer {
             struct_ids: HashMap::new(),
             data_words: Vec::new(),
             return_type: Type::VOID,
+            return_shape: ValueShape::Warp,
             functions: Vec::new(),
             function_ids: HashMap::new(),
             inline_candidates: HashMap::new(),
@@ -491,7 +530,6 @@ impl Analyzer {
         for function in &program.functions {
             self.register_function(function)?;
         }
-        self.summarize_function_divergence(&program.functions);
         self.inline_candidates = collect_inline_candidates(&program.functions, &self.function_ids);
         self.call_edges.resize(self.functions.len(), Vec::new());
         let Some(&main) = self.function_ids.get("main") else {
@@ -518,6 +556,7 @@ impl Analyzer {
             self.current_function = Some(id);
             self.divergent_depth = 0;
             self.return_type = self.functions[id].return_type;
+            self.return_shape = self.functions[id].return_shape;
             let local_start = self.locals.len();
             let mut bindings = HashMap::new();
             let mut params = Vec::new();
@@ -536,11 +575,13 @@ impl Analyzer {
                     ));
                 }
                 let local = self.locals.len();
+                let shape = self.functions[id].param_shapes[index];
                 self.locals.push(LocalInfo {
                     name: name.clone(),
                     ty: self.functions[id].params[index],
                     span: parameter.span,
-                    uniformity: Uniformity::Uniform,
+                    uniformity: shape.expression_uniformity(),
+                    shape,
                     address_taken: false,
                     frame_offset: None,
                 });
@@ -565,6 +606,7 @@ impl Analyzer {
                 id,
                 name: function.name,
                 return_type: self.return_type,
+                return_shape: self.return_shape,
                 params,
                 body,
                 frame_words,
@@ -584,9 +626,17 @@ impl Analyzer {
                 || normally_called.contains(&function.id)
         });
         let function_names = self.functions.iter().map(|f| f.name.clone()).collect();
+        let function_param_shapes = self
+            .functions
+            .iter()
+            .map(|f| f.param_shapes.clone())
+            .collect();
+        let function_return_shapes = self.functions.iter().map(|f| f.return_shape).collect();
         Ok(TypedProgram {
             functions: typed_functions,
             function_names,
+            function_param_shapes,
+            function_return_shapes,
             main,
             locals: self.locals,
             globals: self.globals,
@@ -622,6 +672,12 @@ impl Analyzer {
             let mut names = HashMap::new();
             let mut offset = 0;
             for field in &decl.fields {
+                if field.ty.uniform {
+                    return Err(Diagnostic::new(
+                        field.span,
+                        "'uniform' is a value qualifier and is not supported on structure fields",
+                    ));
+                }
                 let name = field.ty.declarator.name.clone().unwrap();
                 if names.insert(name.clone(), ()).is_some() {
                     return Err(Diagnostic::new(
@@ -664,6 +720,12 @@ impl Analyzer {
     }
 
     fn register_global(&mut self, global: ast::Global) -> Result<(), Diagnostic> {
+        if global.ty.uniform {
+            return Err(Diagnostic::new(
+                global.span,
+                "'uniform' is currently supported on automatic values and function signatures, not globals",
+            ));
+        }
         let name = global.ty.declarator.name.clone().unwrap();
         reject_warp_declaration(&name, global.span)?;
         if self.global_ids.contains_key(&name) {
@@ -789,6 +851,17 @@ impl Analyzer {
             ));
         }
         let return_type = self.lower_decl_type(&function.return_type, None)?;
+        let return_shape = if function.return_type.uniform {
+            ValueShape::Uniform
+        } else {
+            ValueShape::Warp
+        };
+        if return_shape == ValueShape::Uniform && return_type.is_void() {
+            return Err(Diagnostic::new(
+                function.span,
+                "'uniform' cannot qualify a void return type",
+            ));
+        }
         if return_type.is_array() || return_type.is_struct() {
             return Err(Diagnostic::new(
                 function.span,
@@ -796,6 +869,9 @@ impl Analyzer {
             ));
         }
         let mut params = Vec::new();
+        let mut param_shapes = Vec::new();
+        let mut param_names = Vec::new();
+        let mut param_spans = Vec::new();
         for parameter in &function.params {
             if let Some(name) = &parameter.ty.declarator.name {
                 reject_warp_declaration(name, parameter.span)?;
@@ -811,6 +887,13 @@ impl Analyzer {
                 ));
             }
             params.push(ty);
+            param_shapes.push(if parameter.ty.uniform {
+                ValueShape::Uniform
+            } else {
+                ValueShape::Warp
+            });
+            param_names.push(parameter.ty.declarator.name.clone());
+            param_spans.push(parameter.span);
         }
         if params.len() > 4 {
             return Err(Diagnostic::new(
@@ -820,7 +903,11 @@ impl Analyzer {
         }
         if let Some(&id) = self.function_ids.get(&function.name) {
             let symbol = &mut self.functions[id];
-            if symbol.return_type != return_type || symbol.params != params {
+            if symbol.return_type != return_type
+                || symbol.return_shape != return_shape
+                || symbol.params != params
+                || symbol.param_shapes != param_shapes
+            {
                 return Err(Diagnostic::new(
                     function.span,
                     format!("conflicting declaration of function '{}'", function.name),
@@ -844,38 +931,14 @@ impl Analyzer {
             name: function.name.clone(),
             return_type,
             params,
+            param_shapes,
+            param_names,
+            param_spans,
+            return_shape,
             defined: function.body.is_some(),
             span: function.span,
-            divergent_result: false,
         });
         Ok(())
-    }
-
-    fn summarize_function_divergence(&mut self, functions: &[ast::Function]) {
-        let mut direct = vec![false; self.functions.len()];
-        let mut edges = vec![Vec::new(); self.functions.len()];
-        for function in functions {
-            let Some(body) = &function.body else { continue };
-            let id = self.function_ids[&function.name];
-            scan_block_divergence(body, &self.function_ids, &mut direct[id], &mut edges[id]);
-        }
-        let mut divergent = direct;
-        loop {
-            let mut changed = false;
-            for id in 0..divergent.len() {
-                let value = divergent[id] || edges[id].iter().any(|callee| divergent[*callee]);
-                if value != divergent[id] {
-                    divergent[id] = value;
-                    changed = true;
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
-        for (symbol, divergent) in self.functions.iter_mut().zip(divergent) {
-            symbol.divergent_result = divergent;
-        }
     }
 
     fn lower_decl_type(
@@ -981,6 +1044,14 @@ impl Analyzer {
                         ));
                     };
                     self.require_assignable(self.return_type, result, "return value")?;
+                    if self.return_shape == ValueShape::Uniform
+                        && result.uniformity != Uniformity::Uniform
+                    {
+                        return Err(Diagnostic::new(
+                            result.span,
+                            "varying expression cannot be returned from a uniform function",
+                        ));
+                    }
                 }
                 Ok(TypedStmt::Return(value, span))
             }
@@ -1160,6 +1231,17 @@ impl Analyzer {
         if ty.is_void() {
             return Err(Diagnostic::new(span, "variable cannot have type void"));
         }
+        let shape = if decl.uniform {
+            ValueShape::Uniform
+        } else {
+            ValueShape::Warp
+        };
+        if shape == ValueShape::Uniform && (ty.is_array() || ty.is_struct()) {
+            return Err(Diagnostic::new(
+                span,
+                "'uniform' currently supports scalar and pointer locals, not aggregates",
+            ));
+        }
         let typed_init = match init {
             Some(ast::Expr {
                 kind: ast::ExprKind::String(words),
@@ -1186,19 +1268,24 @@ impl Analyzer {
             }
             None => None,
         };
-        let mut uniformity = match &typed_init {
-            Some(TypedInitializer::Expr(v)) => v.uniformity,
-            _ => Uniformity::Uniform,
-        };
-        if self.divergent_depth != 0 {
-            uniformity = Uniformity::Divergent;
+        if shape == ValueShape::Uniform {
+            if let Some(TypedInitializer::Expr(value)) = &typed_init {
+                if value.uniformity != Uniformity::Uniform {
+                    return Err(Diagnostic::new(
+                        value.span,
+                        format!("varying expression cannot initialize uniform local '{name}'"),
+                    ));
+                }
+            }
         }
+        let uniformity = shape.expression_uniformity();
         let id = self.locals.len();
         self.locals.push(LocalInfo {
             name: name.clone(),
             ty,
             span,
             uniformity,
+            shape,
             address_taken: false,
             frame_offset: None,
         });
@@ -1224,9 +1311,17 @@ impl Analyzer {
     fn uniform_condition(&mut self, expr: ast::Expr, role: &str) -> Result<TypedExpr, Diagnostic> {
         let expr = self.condition(expr, role)?;
         if expr.uniformity != Uniformity::Uniform {
+            let source = varying_source(&expr, &self.locals)
+                .map(|source| format!(" because it uses {source}"))
+                .unwrap_or_default();
+            let suggestion = if role.contains("condition") {
+                "; use a separately named 'uniform' control variable"
+            } else {
+                ""
+            };
             return Err(Diagnostic::new(
                 expr.span,
-                format!("{role} must be uniform in Slice E"),
+                format!("{role} is varying{source}{suggestion}"),
             ));
         }
         Ok(expr)
@@ -1530,12 +1625,20 @@ impl Analyzer {
                 typed_args[1].kind = TypedExprKind::Literal(mask);
                 typed_args[1].uniformity = Uniformity::Uniform;
             }
-            if intrinsic == Intrinsic::Broadcast && typed_args[1].uniformity != Uniformity::Uniform
-            {
-                return Err(Diagnostic::new(
-                    typed_args[1].span,
-                    "warp_broadcast lane must be uniform",
-                ));
+            for (index, argument) in typed_args.iter().enumerate() {
+                if intrinsic.requires_uniform_argument(index)
+                    && argument.uniformity != Uniformity::Uniform
+                {
+                    let role = if intrinsic == Intrinsic::Broadcast {
+                        "lane"
+                    } else {
+                        "argument"
+                    };
+                    return Err(Diagnostic::new(
+                        argument.span,
+                        format!("{callee} {role} must be uniform"),
+                    ));
+                }
             }
             uniformity = intrinsic.result_uniformity(&typed_args, uniformity);
             return Ok(TypedExpr {
@@ -1578,15 +1681,22 @@ impl Analyzer {
             ));
         }
         let mut typed_args = Vec::new();
-        let mut uniformity = if symbol.divergent_result {
-            Uniformity::Divergent
-        } else {
-            Uniformity::Uniform
-        };
-        for (arg, param) in args.into_iter().zip(&symbol.params) {
+        for (index, (arg, param)) in args.into_iter().zip(&symbol.params).enumerate() {
             let arg = self.expr(arg)?;
             self.require_assignable(*param, &arg, "function argument")?;
-            uniformity = uniformity.join(arg.uniformity);
+            if symbol.param_shapes[index] == ValueShape::Uniform
+                && arg.uniformity != Uniformity::Uniform
+            {
+                let name = symbol.param_names[index].as_deref().unwrap_or("<unnamed>");
+                let declared = symbol.param_spans[index];
+                return Err(Diagnostic::new(
+                    arg.span,
+                    format!(
+                        "varying argument passed to uniform parameter '{name}' of function '{callee}' (declared at {}:{})",
+                        declared.line, declared.column
+                    ),
+                ));
+            }
             typed_args.push(arg);
         }
         let caller = self.current_function.unwrap();
@@ -1599,7 +1709,7 @@ impl Analyzer {
                 args: typed_args,
             },
             ty: symbol.return_type,
-            uniformity,
+            uniformity: symbol.return_shape.expression_uniformity(),
             span,
         })
     }
@@ -1612,33 +1722,45 @@ impl Analyzer {
         span: Span,
     ) -> Result<TypedExpr, Diagnostic> {
         let mut typed_args = Vec::with_capacity(args.len());
-        for (arg, param) in args.into_iter().zip(&symbol.params) {
+        for (index, (arg, param)) in args.into_iter().zip(&symbol.params).enumerate() {
             let arg = self.expr(arg)?;
             self.require_assignable(*param, &arg, "function argument")?;
+            if symbol.param_shapes[index] == ValueShape::Uniform
+                && arg.uniformity != Uniformity::Uniform
+            {
+                let name = symbol.param_names[index].as_deref().unwrap_or("<unnamed>");
+                let declared = symbol.param_spans[index];
+                return Err(Diagnostic::new(
+                    arg.span,
+                    format!(
+                        "varying argument passed to uniform parameter '{name}' of function '{}' (declared at {}:{})",
+                        symbol.name, declared.line, declared.column
+                    ),
+                ));
+            }
             typed_args.push(arg);
         }
 
         self.scopes.push(HashMap::new());
         let result = (|| {
             let mut statements = Vec::new();
-            for ((parameter, ty), init) in candidate
+            for (index, ((parameter, ty), init)) in candidate
                 .params
                 .into_iter()
                 .zip(&symbol.params)
                 .zip(typed_args)
+                .enumerate()
             {
                 let name = parameter.ty.declarator.name.unwrap();
                 let local = self.locals.len();
-                let uniformity = if self.divergent_depth != 0 {
-                    Uniformity::Divergent
-                } else {
-                    init.uniformity
-                };
+                let shape = symbol.param_shapes[index];
+                let uniformity = shape.expression_uniformity();
                 self.locals.push(LocalInfo {
                     name: format!("{name} [inlined {}]", symbol.name),
                     ty: *ty,
                     span: parameter.span,
                     uniformity,
+                    shape,
                     // Inlined bindings live in fixed caller-frame slots. This
                     // prevents a helper expanded inside a deep expression
                     // from consuming the caller's scarce vector registers.
@@ -1661,9 +1783,17 @@ impl Analyzer {
             }
             let result = self.expr(candidate.result)?;
             self.require_assignable(symbol.return_type, &result, "return value")?;
+            if symbol.return_shape == ValueShape::Uniform
+                && result.uniformity != Uniformity::Uniform
+            {
+                return Err(Diagnostic::new(
+                    result.span,
+                    "varying expression cannot be returned from a uniform function",
+                ));
+            }
             Ok(TypedExpr {
                 ty: symbol.return_type,
-                uniformity: result.uniformity,
+                uniformity: symbol.return_shape.expression_uniformity(),
                 kind: TypedExprKind::Inline {
                     statements,
                     result: Box::new(result),
@@ -1810,6 +1940,13 @@ impl Analyzer {
         if op == ast::UnaryOp::AddressOf {
             let operand = self.expr(operand)?;
             let lvalue = take_lvalue(operand.kind, operand.span, "address-of operand")?;
+            if matches!(&lvalue, LValue::Local(local) if self.locals[*local].shape == ValueShape::Uniform)
+            {
+                return Err(Diagnostic::new(
+                    span,
+                    "taking the address of a uniform local is not supported",
+                ));
+            }
             self.mark_address_taken(&lvalue);
             let ty = if operand.ty.is_array() {
                 operand.ty.decay()
@@ -1855,14 +1992,13 @@ impl Analyzer {
                 ));
             }
             let target = take_lvalue(operand.kind, operand.span, "increment target")?;
-            let uniformity = if self.divergent_depth != 0 {
+            let uniformity = if let LValue::Local(local) = &target {
+                self.locals[*local].shape.expression_uniformity()
+            } else if self.divergent_depth != 0 {
                 Uniformity::Divergent
             } else {
                 operand.uniformity
             };
-            if let LValue::Local(local) = &target {
-                self.locals[*local].uniformity = self.locals[*local].uniformity.join(uniformity);
-            }
             let scale = if ty.is_pointer() {
                 type_size(ty.pointee().unwrap(), &self.structs)
             } else {
@@ -1996,7 +2132,7 @@ impl Analyzer {
         {
             return Err(Diagnostic::new(
                 span,
-                "divergent short-circuit expressions are not supported in Slice E",
+                "varying short-circuit control is not supported; use lane-wise '&' or '|' for predicate composition",
             ));
         }
         if matches!(op, ast::BinaryOp::Add | ast::BinaryOp::Sub) {
@@ -2134,16 +2270,25 @@ impl Analyzer {
         } else {
             1
         };
-        let uniformity = if self.divergent_depth != 0 {
+        let uniformity = if let LValue::Local(local) = &target {
+            let local_info = &self.locals[*local];
+            if local_info.shape == ValueShape::Uniform && right.uniformity != Uniformity::Uniform {
+                return Err(Diagnostic::new(
+                    right.span,
+                    format!(
+                        "varying expression cannot be assigned to uniform local '{}'",
+                        local_info.name
+                    ),
+                ));
+            }
+            local_info.shape.expression_uniformity()
+        } else if self.divergent_depth != 0 {
             Uniformity::Divergent
         } else if op == ast::AssignOp::Assign {
             right.uniformity
         } else {
             left_uniformity.join(right.uniformity)
         };
-        if let LValue::Local(local) = &target {
-            self.locals[*local].uniformity = self.locals[*local].uniformity.join(uniformity);
-        }
         Ok(TypedExpr {
             kind: TypedExprKind::Assign {
                 target,
@@ -2220,153 +2365,6 @@ impl Analyzer {
             }
         }
         Ok(())
-    }
-}
-
-fn scan_block_divergence(
-    block: &ast::Block,
-    function_ids: &HashMap<String, FunctionId>,
-    direct: &mut bool,
-    edges: &mut Vec<FunctionId>,
-) {
-    for statement in &block.statements {
-        scan_statement_divergence(statement, function_ids, direct, edges);
-    }
-}
-
-fn scan_statement_divergence(
-    statement: &ast::Stmt,
-    function_ids: &HashMap<String, FunctionId>,
-    direct: &mut bool,
-    edges: &mut Vec<FunctionId>,
-) {
-    match statement {
-        ast::Stmt::Decl { init, .. } => {
-            if let Some(expr) = init {
-                scan_expr_divergence(expr, function_ids, direct, edges);
-            }
-        }
-        ast::Stmt::Expr(expr, _) | ast::Stmt::Return(expr, _) => {
-            if let Some(expr) = expr {
-                scan_expr_divergence(expr, function_ids, direct, edges);
-            }
-        }
-        ast::Stmt::Block(block) => scan_block_divergence(block, function_ids, direct, edges),
-        ast::Stmt::If {
-            condition,
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            scan_expr_divergence(condition, function_ids, direct, edges);
-            scan_statement_divergence(then_branch, function_ids, direct, edges);
-            if let Some(branch) = else_branch {
-                scan_statement_divergence(branch, function_ids, direct, edges);
-            }
-        }
-        ast::Stmt::While {
-            condition, body, ..
-        } => {
-            scan_expr_divergence(condition, function_ids, direct, edges);
-            scan_statement_divergence(body, function_ids, direct, edges);
-        }
-        ast::Stmt::DoWhile {
-            body, condition, ..
-        } => {
-            scan_statement_divergence(body, function_ids, direct, edges);
-            scan_expr_divergence(condition, function_ids, direct, edges);
-        }
-        ast::Stmt::For {
-            init,
-            condition,
-            step,
-            body,
-            ..
-        } => {
-            if let Some(init) = init {
-                match init {
-                    ast::ForInit::Decl { init, .. } => {
-                        if let Some(expr) = init {
-                            scan_expr_divergence(expr, function_ids, direct, edges);
-                        }
-                    }
-                    ast::ForInit::Expr(expr) => {
-                        scan_expr_divergence(expr, function_ids, direct, edges);
-                    }
-                }
-            }
-            if let Some(expr) = condition {
-                scan_expr_divergence(expr, function_ids, direct, edges);
-            }
-            if let Some(expr) = step {
-                scan_expr_divergence(expr, function_ids, direct, edges);
-            }
-            scan_statement_divergence(body, function_ids, direct, edges);
-        }
-        ast::Stmt::Switch {
-            expression, body, ..
-        } => {
-            scan_expr_divergence(expression, function_ids, direct, edges);
-            scan_statement_divergence(body, function_ids, direct, edges);
-        }
-        ast::Stmt::Case { value, body, .. } => {
-            scan_expr_divergence(value, function_ids, direct, edges);
-            scan_statement_divergence(body, function_ids, direct, edges);
-        }
-        ast::Stmt::Default { body, .. } => {
-            scan_statement_divergence(body, function_ids, direct, edges);
-        }
-        ast::Stmt::Break(_) | ast::Stmt::Continue(_) => {}
-    }
-}
-
-fn scan_expr_divergence(
-    expr: &ast::Expr,
-    function_ids: &HashMap<String, FunctionId>,
-    direct: &mut bool,
-    edges: &mut Vec<FunctionId>,
-) {
-    match &expr.kind {
-        ast::ExprKind::Call { callee, args } => {
-            if callee == "warp_lane_id" {
-                *direct = true;
-            } else if let Some(id) = function_ids.get(callee) {
-                if !edges.contains(id) {
-                    edges.push(*id);
-                }
-            }
-            for arg in args {
-                scan_expr_divergence(arg, function_ids, direct, edges);
-            }
-        }
-        ast::ExprKind::Unary(_, operand) => {
-            scan_expr_divergence(operand, function_ids, direct, edges);
-        }
-        ast::ExprKind::SizeofExpr(_) => {}
-        ast::ExprKind::Binary(_, left, right)
-        | ast::ExprKind::Assign(_, left, right)
-        | ast::ExprKind::Index(left, right) => {
-            scan_expr_divergence(left, function_ids, direct, edges);
-            scan_expr_divergence(right, function_ids, direct, edges);
-        }
-        ast::ExprKind::Conditional {
-            condition,
-            then_expr,
-            else_expr,
-        } => {
-            scan_expr_divergence(condition, function_ids, direct, edges);
-            scan_expr_divergence(then_expr, function_ids, direct, edges);
-            scan_expr_divergence(else_expr, function_ids, direct, edges);
-        }
-        ast::ExprKind::Member { base, .. } => {
-            scan_expr_divergence(base, function_ids, direct, edges);
-        }
-        ast::ExprKind::Name(name) if name == "WARP" => *direct = true,
-        ast::ExprKind::Number(_)
-        | ast::ExprKind::Char(_)
-        | ast::ExprKind::String(_)
-        | ast::ExprKind::Name(_)
-        | ast::ExprKind::SizeofType(_) => {}
     }
 }
 
@@ -2507,6 +2505,42 @@ fn inline_expr_has_unsupported_operation(expr: &ast::Expr) -> bool {
 fn value_type(ty: Type) -> Type {
     ty.decay()
 }
+
+fn varying_source(expr: &TypedExpr, locals: &[LocalInfo]) -> Option<String> {
+    match &expr.kind {
+        TypedExprKind::Intrinsic {
+            intrinsic: Intrinsic::LaneId,
+            ..
+        } => Some("varying lane value 'WARP'".to_string()),
+        TypedExprKind::LValue(LValue::Local(local)) if locals[*local].shape == ValueShape::Warp => {
+            let local = &locals[*local];
+            Some(format!(
+                "ordinary warp value '{}' declared at {}:{}",
+                local.name, local.span.line, local.span.column
+            ))
+        }
+        TypedExprKind::Unary(_, operand) => varying_source(operand, locals),
+        TypedExprKind::Binary { left, right, .. }
+        | TypedExprKind::PointerDiff { left, right, .. } => {
+            varying_source(left, locals).or_else(|| varying_source(right, locals))
+        }
+        TypedExprKind::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => varying_source(condition, locals)
+            .or_else(|| varying_source(then_expr, locals))
+            .or_else(|| varying_source(else_expr, locals)),
+        TypedExprKind::PointerAdd { pointer, index, .. } => {
+            varying_source(pointer, locals).or_else(|| varying_source(index, locals))
+        }
+        TypedExprKind::Call { .. } => Some("an ordinary warp-valued function result".to_string()),
+        TypedExprKind::Intrinsic { args, .. } => args
+            .iter()
+            .find_map(|argument| varying_source(argument, locals)),
+        _ => None,
+    }
+}
 fn compatible_pointers(a: Type, b: Type) -> bool {
     a.is_pointer()
         && b.is_pointer()
@@ -2627,7 +2661,7 @@ pub const WARP_VIDEO_BASE: u32 = 0x0010_0000;
 
 fn builtin_constant(name: &str) -> Option<u32> {
     match name {
-        "WARP_RAM_SIZE_WORDS" => Some(RAM_SIZE_WORDS as u32),
+        "WARP_RAM_WORDS" | "WARP_RAM_SIZE_WORDS" => Some(RAM_SIZE_WORDS as u32),
         "WARP_VIDEO_WIDTH" => Some(WARP_VIDEO_WIDTH),
         "WARP_VIDEO_HEIGHT" => Some(WARP_VIDEO_HEIGHT),
         "WARP_VIDEO_WORDS" => Some(WARP_VIDEO_WORDS),
@@ -2842,11 +2876,12 @@ pub fn dump_uniformity(program: &TypedProgram) -> String {
     let mut out = String::new();
     for (id, local) in program.locals.iter().enumerate() {
         out.push_str(&format!(
-            "local #{id} {}: {} at {}:{} => {:?}\n",
+            "local #{id} {}: {} at {}:{} => shape={:?}, expression={:?}\n",
             local.name,
             local.ty.name(&program.structs),
             local.span.line,
             local.span.column,
+            local.shape,
             local.uniformity
         ));
     }
@@ -2872,7 +2907,7 @@ mod tests {
     #[test]
     fn default_ram_constraint_is_65536_words() {
         let program = source(
-            "unsigned expanded[20000]; int main(void) { return WARP_RAM_SIZE_WORDS == 65536 ? 42 : 0; }",
+            "unsigned expanded[20000]; int main(void) { return (WARP_RAM_WORDS == 65536) & (WARP_RAM_SIZE_WORDS == WARP_RAM_WORDS) ? 42 : 0; }",
         )
         .unwrap();
         assert_eq!(program.data_words.len(), 20_000);
@@ -2920,19 +2955,19 @@ mod tests {
     #[test]
     fn warp_intrinsics_propagate_uniformity() {
         let p = source(
-            "int main(void) { unsigned vm=warp_vm_id(); unsigned lane=warp_lane_id(); unsigned mixed=lane+vm+1; int i=0; for (; i<3; ++i) {} if (mixed<32) i=42; return 42; }",
+            "int main(void) { uniform unsigned vm=warp_vm_id(); unsigned lane=warp_lane_id(); unsigned mixed=lane+vm+1; uniform int i=0; for (; i<3; ++i) {} if (mixed<32) i=42; return 42; }",
         )
         .unwrap();
         assert_eq!(p.locals[0].uniformity, Uniformity::Uniform);
         assert_eq!(p.locals[1].uniformity, Uniformity::Divergent);
         assert_eq!(p.locals[2].uniformity, Uniformity::Divergent);
-        assert_eq!(p.locals[3].uniformity, Uniformity::Divergent);
+        assert_eq!(p.locals[3].uniformity, Uniformity::Uniform);
     }
 
     #[test]
     fn shuffle_uniformity_follows_its_source_lane_semantics() {
         let p = source(
-            "int main(void) { int value=WARP*3; int s31=warp_shuffle(value,31); int s0=warp_shuffle(value,0); int self=warp_shuffle(value,WARP); int laneVar=WARP^1; int varying=warp_shuffle(value,laneVar); int uniformLane=warp_vm_id()&31; int dynamic=warp_shuffle(value,uniformLane); int xorValue=warp_shuffle_xor(value,1); int broadcast=warp_broadcast(value,31); return 42; }",
+            "int main(void) { int value=WARP*3; uniform int s31=warp_shuffle(value,31); uniform int s0=warp_shuffle(value,0); int self=warp_shuffle(value,WARP); int laneVar=WARP^1; int varying=warp_shuffle(value,laneVar); uniform int uniformLane=warp_vm_id()&31; uniform int dynamic=warp_shuffle(value,uniformLane); int xorValue=warp_shuffle_xor(value,1); uniform int broadcast=warp_broadcast(value,31); return 42; }",
         )
         .unwrap();
         assert_eq!(p.locals[0].uniformity, Uniformity::Divergent);
@@ -2950,7 +2985,7 @@ mod tests {
     #[test]
     fn uniform_shuffle_result_allows_uniform_control_propagation() {
         source(
-            "int main(void) { int value=WARP; int x=warp_shuffle(value,31); if (x==31 && warp_vm_id()>=0) return 42; return 0; }",
+            "int main(void) { int value=WARP; uniform int x=warp_shuffle(value,31); if (x==31 && warp_vm_id()>=0) return 42; return 0; }",
         )
         .unwrap();
     }
@@ -2958,7 +2993,7 @@ mod tests {
     #[test]
     fn conditional_and_min_max_infer_types_and_uniformity() {
         let p = source(
-            "int main(void) { int a=1?2:3; unsigned b=min(9u,4); int c=WARP<16?a:max(WARP,7); return a+b+c; }",
+            "int main(void) { uniform int a=1?2:3; uniform unsigned b=min(9u,4); int c=WARP<16?a:max(WARP,7); return a+b+c; }",
         )
         .unwrap();
         assert_eq!(p.locals[0].ty, Type::I32);
@@ -2994,7 +3029,7 @@ mod tests {
     }
 
     #[test]
-    fn local_uniformity_never_downgrades_after_divergent_assignment() {
+    fn ordinary_local_shape_stays_warp_valued() {
         let p = source(
             "int main(void) { int value=1; if (warp_lane_id()<16) value=2; if (warp_vm_id()==0) value=3; return value; }",
         )
@@ -3008,7 +3043,8 @@ mod tests {
             "int main(void) { int lane=warp_lane_id(); while (lane<16) ++lane; return 42; }",
         )
         .unwrap_err();
-        assert!(err.message.contains("while condition must be uniform"));
+        assert!(err.message.contains("while condition is varying"));
+        assert!(err.message.contains("lane"));
         let err = source(
             "int f(void) { if (warp_vm_id()) return 2; return 1; } int main(void) { int lane=warp_lane_id(); int x=0; if (lane<16) x=f(); return 42; }",
         )
@@ -3017,7 +3053,7 @@ mod tests {
     }
 
     #[test]
-    fn divergent_function_summary_crosses_forward_calls() {
+    fn ordinary_function_result_is_warp_valued_across_forward_calls() {
         let p = source(
             "int lane_value(void); int main(void) { int x=lane_value(); if (x<16) x=42; else x=42; return x; } int lane_value(void) { return warp_lane_id(); }",
         )
@@ -3033,7 +3069,7 @@ mod tests {
     #[test]
     fn inline_helper_preserves_argument_evaluation_and_result_uniformity() {
         let p = source(
-            "int twice(int x){return x*2;} int lane_value(int base){int out=base+WARP;return out;} int main(void){int side=0;int answer=twice(++side);int lanes=lane_value(10);return answer+lanes-lanes+40;}",
+            "uniform int twice(uniform int x){return x*2;} int lane_value(int base){int out=base+WARP;return out;} int main(void){uniform int side=0;uniform int answer=twice(++side);int lanes=lane_value(10);return answer+lanes-lanes+40;}",
         )
         .unwrap();
         let side = p.locals.iter().find(|local| local.name == "side").unwrap();
@@ -3058,5 +3094,57 @@ mod tests {
             "int add(int a,int b){int sum=a+b;return sum;} int main(void){int x=0;if(WARP<16)x=add(WARP,1);else x=add(WARP,1);return 42+x-x;}",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn explicit_uniform_is_a_stable_value_shape() {
+        let p = source(
+            "int main(void){int ordinary=1;uniform int control=1;uniform int sum=control+2;int mixed=sum+WARP;if(WARP==99)control=7;return ordinary+mixed-mixed+41;}",
+        )
+        .unwrap();
+        assert_eq!(p.locals[0].shape, ValueShape::Warp);
+        assert_eq!(p.locals[0].uniformity, Uniformity::Divergent);
+        assert_eq!(p.locals[1].shape, ValueShape::Uniform);
+        assert_eq!(p.locals[2].uniformity, Uniformity::Uniform);
+        assert_eq!(p.locals[3].uniformity, Uniformity::Divergent);
+    }
+
+    #[test]
+    fn uniform_storage_rejects_varying_values_immediately() {
+        for text in [
+            "int main(void){uniform int row=WARP;return 0;}",
+            "int main(void){uniform int row=0;row=WARP+1;return 0;}",
+        ] {
+            let error = source(text).unwrap_err();
+            assert!(error.message.contains("uniform local 'row'"), "{error:?}");
+            assert!(error.message.contains("varying"), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn function_signatures_control_argument_and_return_shape() {
+        source(
+            "int f(int value,uniform int scale){return value*scale;} uniform int g(uniform int x){return x+1;} int main(void){return f(WARP,g(2));}",
+        )
+        .unwrap();
+
+        let argument =
+            source("int f(uniform int value){return value;} int main(void){return f(WARP);}")
+                .unwrap_err();
+        assert!(argument.message.contains("parameter 'value'"));
+        assert!(argument.message.contains("function 'f'"));
+
+        let returned =
+            source("uniform int f(void){return WARP;} int main(void){return f();}").unwrap_err();
+        assert!(returned.message.contains("uniform function"));
+    }
+
+    #[test]
+    fn varying_loop_diagnostic_names_the_ordinary_value() {
+        let error =
+            source("int main(void){int y=WARP*4;y=0;for(;y<128;y=y+1){}return 42;}").unwrap_err();
+        assert!(error.message.contains("for condition is varying"));
+        assert!(error.message.contains("'y'"));
+        assert!(error.message.contains("'uniform' control variable"));
     }
 }

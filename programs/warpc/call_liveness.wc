@@ -3,15 +3,15 @@
 /* Control flow keeps these helpers and every test wrapper on CALL/RET. */
 unsigned identity(unsigned value)
 {
-    if (value == 0xffffffffu)
-        return 0u;
+    for (uniform unsigned once = 0u; once < 1u; ++once)
+        value = value;
     return value;
 }
 
 unsigned add_pair(unsigned a, unsigned b)
 {
-    if (a == 0xffffffffu)
-        return 0u;
+    for (uniform unsigned once = 0u; once < 1u; ++once)
+        a = a;
     return a + b;
 }
 
@@ -65,7 +65,7 @@ unsigned test_branch_kill(void)
 unsigned test_loop_carried(void)
 {
     unsigned carried = WARP;
-    for (unsigned i = 0u; i < 5u; ++i) {
+    for (uniform unsigned i = 0u; i < 5u; ++i) {
         carried = carried + identity(i);
         if (i == 1u)
             continue;
@@ -113,9 +113,9 @@ unsigned test_genuine_high_live(void)
     unsigned d = WARP + 4u;
     unsigned e = WARP + 5u;
     unsigned f = WARP + 6u;
-    unsigned u = 11u;
-    unsigned v = 13u;
-    unsigned w = 17u;
+    uniform unsigned u = 11u;
+    uniform unsigned v = 13u;
+    uniform unsigned w = 17u;
     unsigned result = identity(WARP);
     unsigned sum = a + b + c + d + e + f + u + v + w + result;
     return sum == WARP * 7u + 62u;

@@ -38,7 +38,7 @@ int main(void)
 
     /* Inclusive prefix sum of the keep predicate. */
     unsigned val = p;
-    int d;
+    uniform int d;
     for (d = 1; d < 32; d = d << 1) {
         unsigned below = warp_shuffle(val, WARP - d);
         if (WARP >= d)

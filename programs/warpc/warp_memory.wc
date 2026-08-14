@@ -3,20 +3,20 @@
 unsigned source_words[128];
 unsigned target_words[128];
 
-int test_length(unsigned words)
+int test_length(uniform unsigned words)
 {
     unsigned sentinel = 0xdeadbeefu;
     unsigned fill = 0x12345678u;
     int ok = 1;
 
-    for (unsigned base = 0; base < 128; base += 32) {
+    for (uniform unsigned base = 0; base < 128; base += 32) {
         unsigned i = base + WARP;
         source_words[i] = 1000u + i;
         target_words[i] = sentinel;
     }
 
     warp_memcpy(target_words, source_words, words);
-    for (unsigned base = 0; base < 128; base += 32) {
+    for (uniform unsigned base = 0; base < 128; base += 32) {
         unsigned i = base + WARP;
         unsigned expected = sentinel;
         if (i < words)
@@ -26,7 +26,7 @@ int test_length(unsigned words)
     }
 
     warp_memset(target_words, fill, words);
-    for (unsigned base = 0; base < 128; base += 32) {
+    for (uniform unsigned base = 0; base < 128; base += 32) {
         unsigned i = base + WARP;
         unsigned expected = sentinel;
         if (i < words)

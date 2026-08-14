@@ -8,13 +8,13 @@ int g_fail;
 
 int main(void)
 {
-    int gen;
-    int base;
+    uniform int gen;
+    uniform int base;
     int i;
     int left;
     int centre;
     int right;
-    int weighted;
+    uniform int weighted;
 
     g_fail = 0;
 

@@ -2,8 +2,8 @@ use crate::ast::{AssignOp, BinaryOp, UnaryOp};
 use crate::sema::{
     type_size, FunctionId, GlobalInfo, Intrinsic, LValue, LocalId, LocalInfo, StructInfo,
     SwitchLabel, Type, TypedBlock, TypedExpr, TypedExprKind, TypedForInit, TypedFunction,
-    TypedInitializer, TypedProgram, TypedStmt, Uniformity, RAM_SIZE_WORDS, WARP_VIDEO_BASE,
-    WARP_VIDEO_WIDTH,
+    TypedInitializer, TypedProgram, TypedStmt, Uniformity, ValueShape, RAM_SIZE_WORDS,
+    WARP_VIDEO_BASE, WARP_VIDEO_WIDTH,
 };
 use crate::span::{Diagnostic, Span};
 use std::collections::{HashMap, HashSet};
@@ -635,10 +635,16 @@ fn allocate_function(
 
     let mut scalar_assignments: Vec<(LocalId, u8)> = Vec::new();
     let parameters: HashSet<LocalId> = function.params.iter().copied().collect();
+    for (abi_reg, &parameter) in function.params.iter().enumerate() {
+        if locals[parameter].shape == ValueShape::Uniform && storage[parameter].is_none() {
+            storage[parameter] = Some(LocalStorage::Scalar(abi_reg as u8));
+            scalar_assignments.push((parameter, abi_reg as u8));
+        }
+    }
     for &local in &function_locals {
         if storage[local].is_some()
             || parameters.contains(&local)
-            || locals[local].uniformity != Uniformity::Uniform
+            || locals[local].shape != ValueShape::Uniform
         {
             continue;
         }
@@ -727,8 +733,11 @@ struct Generator<'a> {
     switch_labels: Vec<Vec<(usize, String)>>,
     function_labels: Vec<String>,
     function_names: &'a [String],
+    function_param_shapes: &'a [Vec<ValueShape>],
+    function_return_shapes: &'a [ValueShape],
     current_function: Option<FunctionId>,
     current_return_type: Type,
+    current_return_shape: ValueShape,
     current_frame_words: usize,
     main_function: FunctionId,
     locals: &'a [LocalInfo],
@@ -771,8 +780,11 @@ impl<'a> Generator<'a> {
                 .map(|name| format!("__warpc_fn_{name}"))
                 .collect(),
             function_names: &program.function_names,
+            function_param_shapes: &program.function_param_shapes,
+            function_return_shapes: &program.function_return_shapes,
             current_function: None,
             current_return_type: Type::VOID,
+            current_return_shape: ValueShape::Warp,
             current_frame_words: 0,
             main_function: program.main,
             locals: &program.locals,
@@ -861,6 +873,7 @@ impl<'a> Generator<'a> {
         self.mask_stack.clear();
         self.current_function = Some(function.id);
         self.current_return_type = function.return_type;
+        self.current_return_shape = function.return_shape;
         self.current_frame_words = allocation.frame_words;
         self.line(&format!("{}:", self.function_labels[function.id]));
         for local in 0..self.local_storage.len() {
@@ -881,10 +894,12 @@ impl<'a> Generator<'a> {
             ));
         }
         for (abi_reg, &local) in function.params.iter().enumerate() {
-            self.used[abi_reg] = true;
-            if matches!(self.local_storage[local], Some(LocalStorage::Vector(_))) {
-                self.local_active[local] = true;
+            match self.local_storage[local] {
+                Some(LocalStorage::Vector(_)) => self.used[abi_reg] = true,
+                Some(LocalStorage::Scalar(reg)) => self.scalar_used[reg as usize] = true,
+                _ => {}
             }
+            self.local_active[local] = true;
         }
         self.update_peak_vector_regs();
         if self.current_frame_words != 0 {
@@ -907,7 +922,11 @@ impl<'a> Generator<'a> {
             self.emit_return();
         } else {
             if function.return_type != Type::VOID {
-                self.instr("MOV r0, 0");
+                if function.return_shape == ValueShape::Uniform {
+                    self.instr("S_MOV_I s0, 0");
+                } else {
+                    self.instr("MOV r0, 0");
+                }
             }
             self.emit_return();
         }
@@ -957,7 +976,9 @@ impl<'a> Generator<'a> {
             TypedStmt::Return(value, span) => {
                 if let Some(value) = value {
                     let result = self.expr(value)?;
-                    if result.reg != 0 {
+                    if self.current_return_shape == ValueShape::Uniform {
+                        self.instr(&format!("S_GET s0, r{}", result.reg));
+                    } else if result.reg != 0 {
                         self.instr(&format!("MOV r0, r{}", result.reg));
                     }
                     self.release(result);
@@ -1045,6 +1066,18 @@ impl<'a> Generator<'a> {
         then_branch: &TypedStmt,
         else_branch: Option<&TypedStmt>,
     ) -> Result<(), Diagnostic> {
+        if else_branch.is_none() && self.current_guard.is_none() {
+            if let Some(lane) = exact_lane_condition(condition) {
+                if simple_predicated_statement(then_branch) {
+                    self.raw_instr(&format!("CMP_EQ p3, r{LANE_REG}, {lane}"));
+                    self.current_guard = Some(3);
+                    let result = self.statement(then_branch);
+                    self.current_guard = None;
+                    result?;
+                    return Ok(());
+                }
+            }
+        }
         if condition.uniformity == Uniformity::Divergent || self.current_guard.is_some() {
             return self.masked_if_statement(condition, then_branch, else_branch);
         }
@@ -1250,6 +1283,21 @@ impl<'a> Generator<'a> {
         init: Option<&TypedInitializer>,
         span: Span,
     ) -> Result<(), Diagnostic> {
+        if self.locals[local].shape == ValueShape::Uniform {
+            if let Some(guard) = self.current_guard {
+                let write = self.label("uniform_decl_write");
+                let done = self.label("uniform_decl_done");
+                self.raw_instr(&format!("JMP_IF_ANY p{guard}, {write}"));
+                self.raw_instr(&format!("JMP {done}"));
+                self.line(&format!("{write}:"));
+                self.current_guard = None;
+                let result = self.declaration(local, init, span);
+                self.current_guard = Some(guard);
+                result?;
+                self.line(&format!("{done}:"));
+                return Ok(());
+            }
+        }
         if matches!(self.local_storage[local], Some(LocalStorage::Frame(_))) {
             let size = type_size(self.locals[local].ty, self.structs);
             match init {
@@ -1461,45 +1509,71 @@ impl<'a> Generator<'a> {
                 increment,
                 postfix,
                 scale,
-            } => {
-                let current = self.load_lvalue(target, expr.span)?;
-                if *postfix {
-                    let old = self.alloc_reg(expr.span)?;
-                    self.instr(&format!("MOV r{old}, r{}", current.reg));
-                    let mnemonic = if *increment { "ADD" } else { "SUB" };
-                    let updated = self.alloc_reg(expr.span)?;
-                    self.instr(&format!("{mnemonic} r{updated}, r{}, {scale}", current.reg));
-                    let old_value = Value {
-                        reg: old,
-                        owned: true,
-                    };
-                    let updated_value = Value {
-                        reg: updated,
-                        owned: true,
-                    };
-                    self.protect(old_value);
-                    self.protect(updated_value);
-                    self.store_lvalue(target, updated, expr.span)?;
-                    self.unprotect(updated_value);
-                    self.unprotect(old_value);
-                    self.free_reg(updated);
-                    self.release(current);
-                    Ok(old_value)
-                } else {
-                    let mnemonic = if *increment { "ADD" } else { "SUB" };
-                    let updated = self.alloc_reg(expr.span)?;
-                    self.instr(&format!("{mnemonic} r{updated}, r{}, {scale}", current.reg));
-                    let updated_value = Value {
-                        reg: updated,
-                        owned: true,
-                    };
-                    self.protect(updated_value);
-                    self.store_lvalue(target, updated, expr.span)?;
-                    self.unprotect(updated_value);
-                    self.release(current);
-                    Ok(updated_value)
+            } => self.inc_dec(target, *increment, *postfix, *scale, expr.span),
+        }
+    }
+
+    fn inc_dec(
+        &mut self,
+        target: &LValue,
+        increment: bool,
+        postfix: bool,
+        scale: usize,
+        span: Span,
+    ) -> Result<Value, Diagnostic> {
+        if let LValue::Local(local) = target {
+            if self.locals[*local].shape == ValueShape::Uniform {
+                if let Some(guard) = self.current_guard {
+                    let write = self.label("uniform_incdec_write");
+                    let done = self.label("uniform_incdec_done");
+                    self.raw_instr(&format!("JMP_IF_ANY p{guard}, {write}"));
+                    self.raw_instr(&format!("JMP {done}"));
+                    self.line(&format!("{write}:"));
+                    self.current_guard = None;
+                    let result = self.inc_dec(target, increment, postfix, scale, span);
+                    self.current_guard = Some(guard);
+                    let result = result?;
+                    self.line(&format!("{done}:"));
+                    return Ok(result);
                 }
             }
+        }
+        let current = self.load_lvalue(target, span)?;
+        if postfix {
+            let old = self.alloc_reg(span)?;
+            self.instr(&format!("MOV r{old}, r{}", current.reg));
+            let mnemonic = if increment { "ADD" } else { "SUB" };
+            let updated = self.alloc_reg(span)?;
+            self.instr(&format!("{mnemonic} r{updated}, r{}, {scale}", current.reg));
+            let old_value = Value {
+                reg: old,
+                owned: true,
+            };
+            let updated_value = Value {
+                reg: updated,
+                owned: true,
+            };
+            self.protect(old_value);
+            self.protect(updated_value);
+            self.store_lvalue(target, updated, span)?;
+            self.unprotect(updated_value);
+            self.unprotect(old_value);
+            self.free_reg(updated);
+            self.release(current);
+            Ok(old_value)
+        } else {
+            let mnemonic = if increment { "ADD" } else { "SUB" };
+            let updated = self.alloc_reg(span)?;
+            self.instr(&format!("{mnemonic} r{updated}, r{}, {scale}", current.reg));
+            let updated_value = Value {
+                reg: updated,
+                owned: true,
+            };
+            self.protect(updated_value);
+            self.store_lvalue(target, updated, span)?;
+            self.unprotect(updated_value);
+            self.release(current);
+            Ok(updated_value)
         }
     }
 
@@ -1810,6 +1884,14 @@ impl<'a> Generator<'a> {
         else_expr: &TypedExpr,
         expr: &TypedExpr,
     ) -> Result<Value, Diagnostic> {
+        if condition.uniformity == Uniformity::Divergent
+            && expr.ty.is_integer()
+            && cheap_select_expr(condition)
+            && cheap_select_expr(then_expr)
+            && cheap_select_expr(else_expr)
+        {
+            return self.cheap_conditional(condition, then_expr, else_expr, expr.span);
+        }
         if condition.uniformity == Uniformity::Divergent || self.current_guard.is_some() {
             return self.masked_conditional(condition, then_expr, else_expr, expr.span);
         }
@@ -1844,6 +1926,34 @@ impl<'a> Generator<'a> {
             reg: out,
             owned: true,
         })
+    }
+
+    fn cheap_conditional(
+        &mut self,
+        condition: &TypedExpr,
+        then_expr: &TypedExpr,
+        else_expr: &TypedExpr,
+        span: Span,
+    ) -> Result<Value, Diagnostic> {
+        let condition = self.expr(condition)?;
+        self.raw_instr(&format!("CMP_NE p1, r{}, 0", condition.reg));
+        self.release(condition);
+
+        let out = self.alloc_reg(span)?;
+        let otherwise = self.expr(else_expr)?;
+        self.instr(&format!("MOV r{out}, r{}", otherwise.reg));
+        self.release(otherwise);
+
+        let output = Value {
+            reg: out,
+            owned: true,
+        };
+        self.protect(output);
+        let selected = self.expr(then_expr)?;
+        self.unprotect(output);
+        self.guarded_instr(1, false, &format!("MOV r{out}, r{}", selected.reg));
+        self.release(selected);
+        Ok(output)
     }
 
     fn masked_conditional(
@@ -1920,6 +2030,8 @@ impl<'a> Generator<'a> {
         call_site: usize,
     ) -> Result<Value, Diagnostic> {
         let values = self.expr_values(args)?;
+        let param_shapes = self.function_param_shapes[function].clone();
+        let return_shape = self.function_return_shapes[function];
 
         let semantic_live = self.call_live_out.get(&call_site).cloned().ok_or_else(|| {
             Diagnostic::new(
@@ -2064,15 +2176,28 @@ impl<'a> Generator<'a> {
             self.stack_address(argument_base + index);
             self.instr(&format!("STORE r{STACK_ADDR_REG}, r{}", value.reg));
         }
-        for arg_reg in 0..values.len() {
+        for (arg_reg, shape) in param_shapes.iter().enumerate() {
             self.stack_address(argument_base + arg_reg);
-            self.instr(&format!("LOAD r{arg_reg}, r{STACK_ADDR_REG}"));
+            match shape {
+                ValueShape::Warp => {
+                    self.instr(&format!("LOAD r{arg_reg}, r{STACK_ADDR_REG}"));
+                }
+                ValueShape::Uniform => {
+                    self.instr(&format!("LOAD r15, r{STACK_ADDR_REG}"));
+                    self.instr(&format!("S_GET s{arg_reg}, r15"));
+                }
+            }
         }
         let target = self.function_labels[function].clone();
         self.instr(&format!("CALL {target}"));
         if let Some(slot) = return_slot {
             self.stack_address(slot);
-            self.instr(&format!("STORE r{STACK_ADDR_REG}, r0"));
+            if return_shape == ValueShape::Uniform {
+                self.instr("S_BCAST r15, s0");
+                self.instr(&format!("STORE r{STACK_ADDR_REG}, r15"));
+            } else {
+                self.instr(&format!("STORE r{STACK_ADDR_REG}, r0"));
+            }
         }
         for (slot, &reg) in saved.iter().enumerate() {
             self.stack_address(slot);
@@ -2246,6 +2371,24 @@ impl<'a> Generator<'a> {
         scale: usize,
         expr: &TypedExpr,
     ) -> Result<Value, Diagnostic> {
+        if let LValue::Local(local) = target {
+            if self.locals[*local].shape == ValueShape::Uniform {
+                if let Some(guard) = self.current_guard {
+                    let write = self.label("uniform_assign_write");
+                    let done = self.label("uniform_assign_done");
+                    self.raw_instr(&format!("JMP_IF_ANY p{guard}, {write}"));
+                    self.raw_instr(&format!("JMP {done}"));
+                    self.line(&format!("{write}:"));
+                    self.current_guard = None;
+                    let result =
+                        self.assignment(target, op, right_expr, operation_type, scale, expr);
+                    self.current_guard = Some(guard);
+                    let result = result?;
+                    self.line(&format!("{done}:"));
+                    return Ok(result);
+                }
+            }
+        }
         let right = self.expr(right_expr)?;
         self.protect(right);
         if op == AssignOp::Assign {
@@ -2577,12 +2720,7 @@ impl<'a> Generator<'a> {
                 }
             }
             Some(LocalStorage::Scalar(target)) => {
-                if self.current_guard.is_some() {
-                    return Err(Diagnostic::new(
-                        span,
-                        "internal error: divergent value allocated to scalar register",
-                    ));
-                }
+                debug_assert!(self.current_guard.is_none());
                 self.instr(&format!("S_GET s{target}, r{source}"));
             }
             Some(LocalStorage::Frame(_)) => {
@@ -2777,6 +2915,85 @@ fn assignment_binary(op: AssignOp) -> BinaryOp {
     }
 }
 
+fn exact_lane_condition(condition: &TypedExpr) -> Option<u32> {
+    let TypedExprKind::Binary {
+        op: BinaryOp::Eq,
+        left,
+        right,
+        ..
+    } = &condition.kind
+    else {
+        return None;
+    };
+    fn lane_id(expr: &TypedExpr) -> bool {
+        matches!(
+            expr.kind,
+            TypedExprKind::Intrinsic {
+                intrinsic: Intrinsic::LaneId,
+                ref args,
+            } if args.is_empty()
+        )
+    }
+    match (&left.kind, &right.kind) {
+        (_, TypedExprKind::Literal(lane)) if lane_id(left) && *lane < 32 => Some(*lane),
+        (TypedExprKind::Literal(lane), _) if *lane < 32 && lane_id(right) => Some(*lane),
+        _ => None,
+    }
+}
+
+fn simple_predicated_statement(statement: &TypedStmt) -> bool {
+    match statement {
+        TypedStmt::Expr(Some(TypedExpr {
+            kind: TypedExprKind::Assign { target, right, .. },
+            ..
+        })) => cheap_lvalue(target) && cheap_select_expr(right),
+        TypedStmt::Block(block) if block.statements.len() == 1 => {
+            simple_predicated_statement(&block.statements[0])
+        }
+        _ => false,
+    }
+}
+
+fn cheap_lvalue(value: &LValue) -> bool {
+    match value {
+        LValue::Local(_) | LValue::Global(_) => true,
+        LValue::Deref(pointer) => cheap_select_expr(pointer),
+        LValue::Index { base, index, .. } => cheap_select_expr(base) && cheap_select_expr(index),
+        LValue::Member { base, .. } => cheap_lvalue(base),
+    }
+}
+
+fn cheap_select_expr(expr: &TypedExpr) -> bool {
+    match &expr.kind {
+        TypedExprKind::Literal(_) | TypedExprKind::StringAddress(_) => true,
+        TypedExprKind::LValue(LValue::Local(_) | LValue::Global(_)) => true,
+        TypedExprKind::Intrinsic {
+            intrinsic: Intrinsic::LaneId | Intrinsic::VmId,
+            args,
+        } => args.is_empty(),
+        TypedExprKind::Unary(op, operand) => {
+            !matches!(
+                op,
+                UnaryOp::PreInc | UnaryOp::PreDec | UnaryOp::PostInc | UnaryOp::PostDec
+            ) && cheap_select_expr(operand)
+        }
+        TypedExprKind::Binary {
+            op, left, right, ..
+        } => {
+            !matches!(
+                op,
+                BinaryOp::Div
+                    | BinaryOp::Mod
+                    | BinaryOp::LogicalAnd
+                    | BinaryOp::LogicalOr
+                    | BinaryOp::Comma
+            ) && cheap_select_expr(left)
+                && cheap_select_expr(right)
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2802,7 +3019,7 @@ mod tests {
 
     #[test]
     fn logical_and_is_short_circuit_control_flow() {
-        let text = assembly("int main(void) { int x = 0; return x && ++x; }");
+        let text = assembly("int main(void) { uniform int x = 0; return x && ++x; }");
         assert!(text.contains("JMP_IF_ANY"));
         assert!(text.contains("logical_end"));
     }
@@ -2810,7 +3027,7 @@ mod tests {
     #[test]
     fn structured_control_emits_explicit_targets() {
         let text = assembly(
-            "int main(void) { int x = 0; while (x < 3) { ++x; if (x == 2) continue; } do { --x; } while (x); for (int i = 0; i < 2; ++i) { if (i) continue; x += i; } return x; }",
+            "int main(void) { uniform int x = 0; while (x < 3) { ++x; if (x == 2) continue; } do { --x; } while (x); for (uniform int i = 0; i < 2; ++i) { if (i) continue; x += i; } return x; }",
         );
         assert!(text.contains("while_condition"));
         assert!(text.contains("do_condition"));
@@ -2821,7 +3038,7 @@ mod tests {
     #[test]
     fn switch_emits_dispatch_and_case_labels() {
         let text = assembly(
-            "int main(void) { int x = 2; switch (x) { case 1: x = 3; case 1 + 1: x = 42; break; default: x = 0; } return x; }",
+            "int main(void) { uniform int x = 2; switch (x) { case 1: x = 3; case 1 + 1: x = 42; break; default: x = 0; } return x; }",
         );
         assert!(text.contains("CMP_EQ p0"));
         assert!(text.contains("switch_case"));
@@ -2831,7 +3048,7 @@ mod tests {
     #[test]
     fn calls_use_the_lane_private_stack_abi() {
         let text = assembly(
-            "int add(int, int); int main(void) { int keep = 20; return add(keep, 22); } int add(int a, int b) { if (a == 20) return a + b; return 0; }",
+            "int add(int, int); int main(void) { int keep = 20; return add(keep, 22); } int add(int a, int b) { for (uniform int once=0; once<1; ++once) a=a; return a+b; }",
         );
         assert!(text.contains("LANEID r13"));
         assert!(text.contains("S_MOV_I s7, 65536"));
@@ -2845,7 +3062,7 @@ mod tests {
     #[test]
     fn call_arguments_are_staged_independently_of_source_registers() {
         let text = assembly(
-            "int f(int a,int b) { if(a<0) return b; return a+b; } int main(void) { int side=0; int local=WARP+4; int a=f(WARP,1); int b=f(WARP+1,++side); int c=f(WARP*3+7,WARP); int d=f(local,warp_lane_id()); return 42+a-a+b-b+c-c+d-d+side-side; }",
+            "int f(int a,int b) { for(uniform int once=0;once<1;++once)a=a; return a+b; } int main(void) { int side=0; int local=WARP+4; int a=f(WARP,1); int b=f(WARP+1,++side); int c=f(WARP*3+7,WARP); int d=f(local,warp_lane_id()); return 42+a-a+b-b+c-c+d-d+side-side; }",
         );
         assert!(text.contains("CALL __warpc_fn_f"));
         // WARP and warp_lane_id both reside in reserved r13. They are now
@@ -2857,7 +3074,7 @@ mod tests {
     #[test]
     fn call_diagnostics_separate_save_transport_and_fixed_frames() {
         let almost_empty = assembly(
-            "int id(int x) { if (x) return x; return 0; } int main(void) { return id(WARP); }",
+            "int id(int x) { for(uniform int once=0;once<1;++once)x=x; return x; } int main(void) { return id(WARP); }",
         );
         assert!(almost_empty.contains(
             "; call id: saved_vector_slots=0 saved_scalar_slots=0 argument_slots=1 return_slots=1 call_frame_slots=2 call_frame_words=64"
@@ -2867,7 +3084,7 @@ mod tests {
         ), "{almost_empty}");
 
         let live_caller = assembly(
-            "int id(int x) { if (x) return x; return 0; } int main(void) { int a=WARP+1; int b=WARP+2; int c=WARP+3; int d=WARP+4; return id(WARP)+a+b+c+d; }",
+            "int id(int x) { for(uniform int once=0;once<1;++once)x=x; return x; } int main(void) { int a=WARP+1; int b=WARP+2; int c=WARP+3; int d=WARP+4; return id(WARP)+a+b+c+d; }",
         );
         assert!(live_caller.contains(
             "; call id: saved_vector_slots=4 saved_scalar_slots=0 argument_slots=1 return_slots=1 call_frame_slots=6 call_frame_words=192"
@@ -2878,7 +3095,7 @@ mod tests {
         );
 
         let many_live = assembly(
-            "int id(int x) { if (x) return x; return 0; } int main(void) { int a=WARP+1; int b=WARP+2; int c=WARP+3; int d=WARP+4; int e=WARP+5; int f=WARP+6; int u=11; int v=13; int w=17; return id(WARP)+a+b+c+d+e+f+u+v+w; }",
+            "int id(int x) { for(uniform int once=0;once<1;++once)x=x; return x; } int main(void) { int a=WARP+1; int b=WARP+2; int c=WARP+3; int d=WARP+4; int e=WARP+5; int f=WARP+6; uniform int u=11; uniform int v=13; uniform int w=17; return id(WARP)+a+b+c+d+e+f+u+v+w; }",
         );
         assert!(many_live.contains(
             "; call id: saved_vector_slots=6 saved_scalar_slots=3 argument_slots=1 return_slots=1 call_frame_slots=11 call_frame_words=352"
@@ -2891,7 +3108,7 @@ mod tests {
 
     #[test]
     fn call_live_out_is_definition_sensitive_across_control_flow() {
-        let helper = "int id(int x) { if (x < 0) return 0; return x; }";
+        let helper = "int id(int x) { for(uniform int once=0;once<1;++once)x=x; return x; }";
 
         let dead = assembly(&format!(
             "{helper} int main(void) {{ int a=WARP+1; id(3); a=7; return a; }}"
@@ -2928,7 +3145,7 @@ mod tests {
         );
 
         let loop_carried = assembly(&format!(
-            "{helper} int main(void) {{ int a=WARP; for(int i=0;i<3;++i) a=a+id(i); return a; }}"
+            "{helper} int main(void) {{ int a=WARP; for(uniform int i=0;i<3;++i) a=a+id(i); return a; }}"
         ));
         assert!(
             loop_carried.contains("semantic_live_out=2 [a, i]"),
@@ -2940,7 +3157,7 @@ mod tests {
         );
 
         let while_carried = assembly(&format!(
-            "{helper} int main(void) {{ int a=WARP; int i=0; while(i<3) {{ a=a+id(i); ++i; }} return a; }}"
+            "{helper} int main(void) {{ int a=WARP; uniform int i=0; while(i<3) {{ a=a+id(i); ++i; }} return a; }}"
         ));
         assert!(
             while_carried.contains("semantic_live_out=2 [a, i]"),
@@ -2948,7 +3165,7 @@ mod tests {
         );
 
         let do_carried = assembly(&format!(
-            "{helper} int main(void) {{ int a=WARP; int i=0; do {{ a=a+id(i); ++i; }} while(i<3); return a; }}"
+            "{helper} int main(void) {{ int a=WARP; uniform int i=0; do {{ a=a+id(i); ++i; }} while(i<3); return a; }}"
         ));
         assert!(
             do_carried.contains("semantic_live_out=2 [a, i]"),
@@ -2975,7 +3192,7 @@ mod tests {
     #[test]
     fn calls_preserve_crossing_temporaries_without_resaving_spills() {
         let nested = assembly(
-            "int id(int x) { if(x<0)return 0; return x; } int main(void) { return id(WARP)+id(WARP+1); }",
+            "int id(int x) { for(uniform int once=0;once<1;++once)x=x; return x; } int main(void) { return id(WARP)+id(WARP+1); }",
         );
         assert_eq!(
             nested.matches("; call id: semantic_live_out=0 []").count(),
@@ -2986,7 +3203,7 @@ mod tests {
         assert!(nested.contains("saved_vector_slots=1 saved_scalar_slots=0 argument_slots=1 return_slots=1 call_frame_slots=3 call_frame_words=96"), "{nested}");
 
         let spills = assembly(
-            "int id(int x) { if(x<0)return 0; return x; } int main(void) { int a=WARP+1; int b=WARP+2; int c=WARP+3; int d=WARP+4; int e=WARP+5; int f=WARP+6; int g=WARP+7; int h=WARP+8; int i=WARP+9; int j=WARP+10; int r=id(5); return a+b+c+d+e+f+g+h+i+j+r; }",
+            "int id(int x) { for(uniform int once=0;once<1;++once)x=x; return x; } int main(void) { int a=WARP+1; int b=WARP+2; int c=WARP+3; int d=WARP+4; int e=WARP+5; int f=WARP+6; int g=WARP+7; int h=WARP+8; int i=WARP+9; int j=WARP+10; int r=id(5); return a+b+c+d+e+f+g+h+i+j+r; }",
         );
         assert!(
             spills.contains("semantic_live_out=10 [a, b, c, d, e, f, g, h, i, j]"),
@@ -3014,7 +3231,7 @@ mod tests {
     #[test]
     fn inline_bindings_cover_parameters_locals_loops_and_divergence() {
         let text = assembly(
-            "int mix(int a,int b) { int sum=a+b; int adjusted=sum+1; return adjusted; } int lane_value(int base) { return base+WARP; } int main(void) { int total=0; for(int i=0;i<2;++i) total+=mix(i,19); if(WARP<16) total+=mix(WARP,1); int v=lane_value(10); return 42+v-v; }",
+            "int mix(int a,int b) { int sum=a+b; int adjusted=sum+1; return adjusted; } int lane_value(int base) { return base+WARP; } int main(void) { int total=0; for(uniform int i=0;i<2;++i) total+=mix(i,19); if(WARP<16) total+=mix(WARP,1); int v=lane_value(10); return 42+v-v; }",
         );
         assert!(!text.contains("CALL"), "{text}");
         assert!(text.contains("[inlined mix]"));
@@ -3025,7 +3242,7 @@ mod tests {
     #[test]
     fn larger_control_flow_helper_keeps_call_ret_abi() {
         let text = assembly(
-            "int choose(int x) { if(x<0) return -x; if(x==0) return 1; return x+1; } int main(void) { return choose(41); }",
+            "uniform int choose(uniform int x) { if(x<0) return -x; if(x==0) return 1; return x+1; } int main(void) { return choose(41); }",
         );
         assert!(text.contains("CALL __warpc_fn_choose"));
         assert!(text.contains("__warpc_fn_choose:"));
@@ -3067,7 +3284,7 @@ mod tests {
     #[test]
     fn vm_id_is_direct_and_uniform_if_stays_branched() {
         let text = assembly(
-            "int main(void) { unsigned vm=warp_vm_id(); int x=0; if (vm==0) x=42; else x=42; return x; }",
+            "int main(void) { uniform unsigned vm=warp_vm_id(); int x=0; if (vm==0) x=42; else x=42; return x; }",
         );
         assert!(text.contains("VMID"));
         assert!(text.contains("JMP_IF_ANY"));
@@ -3096,6 +3313,53 @@ mod tests {
     }
 
     #[test]
+    fn pure_divergent_conditional_is_predicated_without_ballot() {
+        let text = assembly(
+            "int main(void) { int centre=WARP; int neighbour=WARP+1; int out=(WARP==0)?centre:neighbour; return out; }",
+        );
+        assert!(text.contains("CMP_NE p1"), "{text}");
+        assert!(text.contains("@p1 MOV"), "{text}");
+        assert!(!text.contains("BALLOT"), "{text}");
+    }
+
+    #[test]
+    fn exact_lane_store_uses_direct_predicate_without_ballot() {
+        let text = assembly(
+            "int out[1]; int main(void) { uniform int total=42; if(WARP==0) out[0]=total; return out[0]; }",
+        );
+        assert!(text.contains("CMP_EQ p3, r13, 0"), "{text}");
+        assert!(text.contains("@p3 STORE"), "{text}");
+        assert!(!text.contains("BALLOT"), "{text}");
+    }
+
+    #[test]
+    fn mixed_shape_call_abi_keeps_vector_arguments_vector() {
+        let text = assembly(
+            "int scale(int value,uniform int factor){for(uniform int once=0;once<1;++once)value=value*factor;return value;} int main(void){return scale(WARP,3);}",
+        );
+        let callee = text
+            .split("__warpc_fn_scale:")
+            .nth(1)
+            .unwrap()
+            .split("; allocation scale:")
+            .next()
+            .unwrap();
+        assert!(callee.contains("local value: Divergent -> r0"), "{text}");
+        assert!(callee.contains("local factor: Uniform -> s1"), "{text}");
+        assert!(!callee.contains("S_GET s0, r0"), "{text}");
+    }
+
+    #[test]
+    fn pure_ternary_helper_remains_inline_eligible() {
+        let text = assembly(
+            "int edge(int value,int neighbour){return WARP==0?value:neighbour;} int main(void){return edge(WARP,WARP+1);}",
+        );
+        assert!(!text.contains("CALL __warpc_fn_edge"), "{text}");
+        assert!(!text.contains("__warpc_fn_edge:"), "{text}");
+        assert!(text.contains("CMP_NE p1"), "{text}");
+    }
+
+    #[test]
     fn min_max_use_existing_unsigned_isa_with_signed_bias() {
         let text = assembly(
             "int main(void) { unsigned u=WARP; int s=WARP-20; return min(s, 7) + max(u, 9u); }",
@@ -3118,7 +3382,7 @@ mod tests {
             .find(|line| line.contains("; allocation main:"))
             .unwrap();
         assert!(summary.contains("spills=0"), "{summary}");
-        assert!(summary.contains("scalar_homes=2"), "{summary}");
+        assert!(summary.contains("scalar_homes=0"), "{summary}");
     }
 
     #[test]

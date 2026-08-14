@@ -4,17 +4,17 @@
  * argsort key selection, and Mandelbrot colour selection. */
 int main(void)
 {
-    int failures = 0;
+    uniform int failures = 0;
 
     /* ?: has lower precedence than arithmetic and associates to the right. */
-    int precedence = 1 + 2 ? 7 : 9;
-    int nested = 0 ? 1 : 0 ? 2 : 3;
+    uniform int precedence = 1 + 2 ? 7 : 9;
+    uniform int nested = 0 ? 1 : 0 ? 2 : 3;
     if (precedence != 7 || nested != 3)
         failures = 1;
 
     /* A uniform condition must execute only the selected side-effecting arm. */
-    int uniform_side = 0;
-    int uniform_value = warp_vm_id() == 0
+    uniform int uniform_side = 0;
+    uniform int uniform_value = warp_vm_id() == 0
         ? (uniform_side += 2)
         : (uniform_side += 100);
     if (warp_vm_id() == 0) {
@@ -23,8 +23,8 @@ int main(void)
     } else if (uniform_value != 100 || uniform_side != 100) {
         failures = 3;
     }
-    int uniform_false_side = 0;
-    int uniform_false_value = 0
+    uniform int uniform_false_side = 0;
+    uniform int uniform_false_value = 0
         ? (uniform_false_side += 100)
         : (uniform_false_side += 3);
     if (uniform_false_value != 3 || uniform_false_side != 3)
@@ -42,7 +42,7 @@ int main(void)
         failures = 6;
 
     /* Signed and unsigned boundary/equality cases. */
-    int signed_low = -2147483647 - 1;
+    uniform int signed_low = -2147483647 - 1;
     if (min(signed_low, 2147483647) != signed_low)
         failures = 7;
     if (max(signed_low, 2147483647) != 2147483647)
@@ -66,8 +66,8 @@ int main(void)
 
     /* Mandelbrot-style divergent colour selection. */
     int escaped = WARP * WARP > 100;
-    unsigned black = 0xff000000u;
-    unsigned white = 0xffffffffu;
+    uniform unsigned black = 0xff000000u;
+    uniform unsigned white = 0xffffffffu;
     unsigned colour = escaped ? black : white;
     if (!warp_all(colour == (escaped ? black : white)))
         failures = 13;

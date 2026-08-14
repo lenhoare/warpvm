@@ -2,8 +2,8 @@ char *global_greeting = "hello";
 
 int string_length(char *text)
 {
-    int length = 0;
-    while (*text != 0) {
+    uniform int length = 0;
+    while (warp_all(*text != 0)) {
         ++length;
         ++text;
     }
@@ -12,8 +12,8 @@ int string_length(char *text)
 
 int string_compare(char *left, char *right)
 {
-    while (*left == *right) {
-        if (*left == 0)
+    while (warp_all(*left == *right)) {
+        if (warp_all(*left == 0))
             return 0;
         ++left;
         ++right;

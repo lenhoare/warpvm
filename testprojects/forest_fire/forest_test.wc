@@ -1,0 +1,36 @@
+#include <warp.h>
+
+unsigned g_colour[32];
+
+/* The loop deliberately keeps paint on the real CALL/RET path. Its ordinary
+ * parameter and return value must remain 32-lane warp values. */
+unsigned paint(int state)
+{
+    unsigned colour = 0xff030508u;
+    for (uniform int once = 0; once < 1; ++once) {
+        if (state == 1)
+            colour = 0xff187038u;
+        if (state == 2)
+            colour = 0xffff5a18u;
+    }
+    return colour;
+}
+
+int main(void)
+{
+    int state = WARP % 3;
+    unsigned colour = paint(state);
+    unsigned expected = state == 0
+        ? 0xff030508u
+        : (state == 1 ? 0xff187038u : 0xffff5a18u);
+
+    g_colour[WARP] = colour;
+    if (!warp_all(g_colour[WARP] == expected))
+        return 0;
+
+    /* Adjacent states deliberately have different colours. A lane-0 collapse
+     * would fail both this check and the complete per-lane oracle above. */
+    if (!warp_all(colour != warp_shuffle(colour, (WARP + 1) & 31)))
+        return 0;
+    return 42;
+}

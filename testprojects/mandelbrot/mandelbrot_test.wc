@@ -32,7 +32,8 @@ int main(void)
     int count = 0;
     int escaped = 0;
     int a;
-    int iter;
+    uniform int iter;
+    int violation;
 
     for (iter = 0; iter < 255; ++iter) {
         a = (zr * zr) >> 12;          /* zr^2 in Q4.12 (zi == 0)     */
@@ -47,18 +48,18 @@ int main(void)
     /* Classification with margins that avoid the slow-escape boundary. The
      * loop registers are dead here, so they are reused as flags rather than
      * spending fresh registers from the ~13-register budget:
-     *   escaped -> clear_in, a -> clear_out, zr -> in_set, iter -> violation. */
+     *   escaped -> clear_in, a -> clear_out, zr -> in_set. */
     escaped = (cr > -7782) & (cr < 410);        /* clear_in:  -1.9 .. 0.1   */
     a = (cr < -8397) | (cr > 1638);             /* clear_out: < -2.05, > 0.4 */
     zr = count >= 255;                          /* in_set                    */
-    iter = (escaped & (1 - zr)) | (a & zr);     /* violation                 */
+    violation = (escaped & (1 - zr)) | (a & zr);
 
     g_nin = warp_reduce_add_u(escaped);
     g_nout = warp_reduce_add_u(a);
 
     /* Pass only if no checked lane is misclassified and both classes are
      * actually exercised. */
-    if (warp_all(iter == 0) && (g_nin > 0u) && (g_nout > 0u))
+    if (warp_all(violation == 0) && (g_nin > 0u) && (g_nout > 0u))
         return 42;
     return 0;
 }

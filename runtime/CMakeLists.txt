@@ -102,6 +102,51 @@ add_test(NAME warpc_uniformity
           ${WVM_WARPC} $<TARGET_FILE:warpvm>
           ${CMAKE_SOURCE_DIR}/programs/warpc/uniformity.wc
           ${CMAKE_BINARY_DIR}/warpc_uniformity warpc_uniformity)
+add_test(NAME warpc_explicit_uniform
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_acceptance.sh
+          ${WVM_WARPC} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/programs/warpc/explicit_uniform.wc
+          ${CMAKE_BINARY_DIR}/warpc_explicit_uniform warpc_explicit_uniform)
+add_test(NAME warpc_forest_fire
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_acceptance.sh
+          ${WVM_WARPC} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/testprojects/forest_fire/forest_test.wc
+          ${CMAKE_BINARY_DIR}/warpc_forest_fire warpc_forest_fire)
+add_test(NAME warpc_matvec
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_acceptance.sh
+          ${WVM_WARPC} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/testprojects/matvec/matvec.wc
+          ${CMAKE_BINARY_DIR}/warpc_matvec warpc_matvec)
+add_test(NAME warpc_stencil
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_acceptance.sh
+          ${WVM_WARPC} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/testprojects/stencil/stencil.wc
+          ${CMAKE_BINARY_DIR}/warpc_stencil warpc_stencil)
+add_test(NAME warpc_darts
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_acceptance.sh
+          ${WVM_WARPC} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/testprojects/darts/darts.wc
+          ${CMAKE_BINARY_DIR}/warpc_darts warpc_darts)
+add_test(NAME warpc_rule30
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_acceptance.sh
+          ${WVM_WARPC} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/testprojects/rule30/rule30_test.wc
+          ${CMAKE_BINARY_DIR}/warpc_rule30 warpc_rule30)
+add_test(NAME warpc_particles
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_acceptance.sh
+          ${WVM_WARPC} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/testprojects/particles/particles_test.wc
+          ${CMAKE_BINARY_DIR}/warpc_particles warpc_particles)
+add_test(NAME warpc_sandpile
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_acceptance.sh
+          ${WVM_WARPC} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/testprojects/sandpile/sandpile_test.wc
+          ${CMAKE_BINARY_DIR}/warpc_sandpile warpc_sandpile)
+add_test(NAME warpc_wave
+  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_acceptance.sh
+          ${WVM_WARPC} $<TARGET_FILE:warpvm>
+          ${CMAKE_SOURCE_DIR}/testprojects/wave/wave_test.wc
+          ${CMAKE_BINARY_DIR}/warpc_wave warpc_wave)
 add_test(NAME warpc_divergent_if
   COMMAND bash ${CMAKE_SOURCE_DIR}/tests/warpc_acceptance.sh
           ${WVM_WARPC} $<TARGET_FILE:warpvm>

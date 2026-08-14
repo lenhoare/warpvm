@@ -23,13 +23,13 @@ impl<'a> Parser<'a> {
                 structs.push(self.struct_definition()?);
                 continue;
             }
-            let base = self.type_name()?;
+            let (uniform, base) = self.decl_spec()?;
             let decl = self.declarator(true)?;
             let Some(name) = decl.name.clone() else {
                 unreachable!()
             };
             if self.at(&TokenKind::LParen) && decl.array_len.is_none() {
-                functions.push(self.function(base, decl, name)?);
+                functions.push(self.function(uniform, base, decl, name)?);
             } else {
                 let span = decl.span;
                 let init = if self.at(&TokenKind::Equal) {
@@ -44,6 +44,7 @@ impl<'a> Parser<'a> {
                 )?;
                 globals.push(Global {
                     ty: DeclType {
+                        uniform,
                         base,
                         declarator: decl,
                     },
@@ -81,11 +82,15 @@ impl<'a> Parser<'a> {
         let mut fields = Vec::new();
         while !self.at(&TokenKind::RBrace) {
             let field_span = self.peek().span;
-            let base = self.type_name()?;
+            let (uniform, base) = self.decl_spec()?;
             let declarator = self.declarator(true)?;
             self.expect(TokenKind::Semicolon, "expected ';' after structure field")?;
             fields.push(FieldDecl {
-                ty: DeclType { base, declarator },
+                ty: DeclType {
+                    uniform,
+                    base,
+                    declarator,
+                },
                 span: field_span,
             });
         }
@@ -99,6 +104,7 @@ impl<'a> Parser<'a> {
 
     fn function(
         &mut self,
+        uniform: bool,
         base: TypeName,
         decl: Declarator,
         name: String,
@@ -116,10 +122,11 @@ impl<'a> Parser<'a> {
         } else {
             while !self.at(&TokenKind::RParen) {
                 let param_span = self.peek().span;
-                let param_base = self.type_name()?;
+                let (param_uniform, param_base) = self.decl_spec()?;
                 let param_decl = self.declarator(false)?;
                 params.push(Parameter {
                     ty: DeclType {
+                        uniform: param_uniform,
                         base: param_base,
                         declarator: param_decl,
                     },
@@ -140,6 +147,7 @@ impl<'a> Parser<'a> {
         };
         Ok(Function {
             return_type: DeclType {
+                uniform,
                 base,
                 declarator: Declarator {
                     name: None,
@@ -294,7 +302,7 @@ impl<'a> Parser<'a> {
             None
         } else if self.starts_type() {
             let decl_span = self.peek().span;
-            let base = self.type_name()?;
+            let (uniform, base) = self.decl_spec()?;
             let declarator = self.declarator(true)?;
             let init = if self.at(&TokenKind::Equal) {
                 self.bump();
@@ -304,7 +312,11 @@ impl<'a> Parser<'a> {
             };
             self.expect(TokenKind::Semicolon, "expected ';' after for initializer")?;
             Some(ForInit::Decl {
-                ty: DeclType { base, declarator },
+                ty: DeclType {
+                    uniform,
+                    base,
+                    declarator,
+                },
                 init,
                 span: decl_span,
             })
@@ -346,7 +358,7 @@ impl<'a> Parser<'a> {
 
     fn declaration(&mut self) -> Result<Stmt, Diagnostic> {
         let span = self.peek().span;
-        let base = self.type_name()?;
+        let (uniform, base) = self.decl_spec()?;
         let declarator = self.declarator(true)?;
         let init = if self.at(&TokenKind::Equal) {
             self.bump();
@@ -356,7 +368,11 @@ impl<'a> Parser<'a> {
         };
         self.expect(TokenKind::Semicolon, "expected ';' after declaration")?;
         Ok(Stmt::Decl {
-            ty: DeclType { base, declarator },
+            ty: DeclType {
+                uniform,
+                base,
+                declarator,
+            },
             init,
             span,
         })
@@ -379,6 +395,16 @@ impl<'a> Parser<'a> {
             )),
             _ => Err(Diagnostic::new(token.span, "expected Warp C type")),
         }
+    }
+
+    fn decl_spec(&mut self) -> Result<(bool, TypeName), Diagnostic> {
+        let uniform = if self.at(&TokenKind::Uniform) {
+            self.bump();
+            true
+        } else {
+            false
+        };
+        Ok((uniform, self.type_name()?))
     }
 
     fn declarator(&mut self, require_name: bool) -> Result<Declarator, Diagnostic> {
@@ -568,11 +594,15 @@ impl<'a> Parser<'a> {
                     .is_some_and(|t| Self::kind_starts_type(&t.kind))
             {
                 self.bump();
-                let base = self.type_name()?;
+                let (uniform, base) = self.decl_spec()?;
                 let declarator = self.declarator(false)?;
                 self.expect(TokenKind::RParen, "expected ')' after sizeof type")?;
                 return Ok(Expr {
-                    kind: ExprKind::SizeofType(Box::new(DeclType { base, declarator })),
+                    kind: ExprKind::SizeofType(Box::new(DeclType {
+                        uniform,
+                        base,
+                        declarator,
+                    })),
                     span,
                 });
             }
@@ -684,7 +714,8 @@ impl<'a> Parser<'a> {
     fn kind_starts_type(kind: &TokenKind) -> bool {
         matches!(
             kind,
-            TokenKind::Int
+            TokenKind::Uniform
+                | TokenKind::Int
                 | TokenKind::Unsigned
                 | TokenKind::CharKw
                 | TokenKind::Void

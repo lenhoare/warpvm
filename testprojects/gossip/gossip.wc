@@ -32,10 +32,10 @@ unsigned g_cnt;            /* count of messages received this round     */
 
 int main(void)
 {
-    unsigned vm = warp_vm_id();
-    unsigned partner;
-    unsigned n;
-    unsigned batch;
+    uniform unsigned vm = warp_vm_id();
+    uniform unsigned partner;
+    uniform unsigned n;
+    uniform unsigned batch;
 
     g_value = vm * 4096u;      /* gradient initial condition */
     g_frame = 0;

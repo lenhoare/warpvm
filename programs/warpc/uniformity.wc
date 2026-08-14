@@ -1,11 +1,11 @@
 int main(void)
 {
-    unsigned vm = warp_vm_id();
+    uniform unsigned vm = warp_vm_id();
     unsigned lane = warp_lane_id();
     unsigned propagated = lane + 1;
     int result = 36;
 
-    for (int i = 0; i < 4; ++i)
+    for (uniform int i = 0; i < 4; ++i)
         result += i;
 
     if (vm != warp_vm_id())

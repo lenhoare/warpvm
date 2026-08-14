@@ -8,9 +8,9 @@ int main(void)
     int y;
     int vx;
     int vy;
-    int t;
-    int wall_x;
-    int wall_v;
+    uniform int t;
+    uniform int wall_x;
+    uniform int wall_v;
 
     g_fail = 0;
 

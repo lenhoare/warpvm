@@ -35,8 +35,8 @@ int main(void)
     g_in_key[WARP] = key;
     g_in_pay[WARP] = pay;
 
-    int k;
-    int j;
+    uniform int k;
+    uniform int j;
     unsigned ok;     /* partner key (reused later as scratch)     */
     unsigned op;     /* partner payload (reused later as scratch) */
     for (k = 2; k <= 32; k = k << 1) {

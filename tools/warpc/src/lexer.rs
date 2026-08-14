@@ -22,6 +22,7 @@ pub enum TokenKind {
     Case,
     Default,
     Struct,
+    Uniform,
     Sizeof,
     LParen,
     RParen,
@@ -196,6 +197,7 @@ impl<'a> Lexer<'a> {
             "case" => TokenKind::Case,
             "default" => TokenKind::Default,
             "struct" => TokenKind::Struct,
+            "uniform" => TokenKind::Uniform,
             "sizeof" => TokenKind::Sizeof,
             _ => TokenKind::Ident(text.to_string()),
         }

@@ -921,8 +921,8 @@ private per VM, dynamically described by `mem_size_words`, and bounds-checked;
 small-memory fault tests can still construct smaller VM images. The framebuffer
 remains a separate 16,384-word memory-mapped region at `VIDEO_BASE`.
 
-Assembly exposes `RAM_SIZE_WORDS`, while Warp C exposes
-`WARP_RAM_SIZE_WORDS`. An acceptance program allocates a 20,000-word global
+Assembly exposes `RAM_SIZE_WORDS`, while Warp C exposes `WARP_RAM_WORDS` and
+the compatibility alias `WARP_RAM_SIZE_WORDS`. An acceptance program allocates a 20,000-word global
 array and verifies interpreted/native access at addresses above the old RAM
 boundary.
 
@@ -968,3 +968,28 @@ A deterministic four-body regression generated 85,383 bytes of PTX and proved
 cross-body logical messaging, shared-body/private-state isolation, exact
 interpreter/compiled result equivalence, per-VM stop/resume and fault handling,
 cold rebind with preserved logical identity, and safe slot recycling.
+
+## 32. Warp C values need an explicit, stable shape
+
+**Discovered by:** forest-fire, histogram, stencil, particles and sandpile
+
+**Classification:** compiler language/ABI correction; no ISA change
+
+An unqualified Warp C scalar or parameter is one value per lane. Equal lane
+contents at one program point do not make the declaration scalar, and a call
+site passing a literal must not change the meaning of an ordinary callee
+parameter. The previous inferred model could lower an ordinary parameter via
+`S_GET`, silently copying lane 0 across the warp; forest-fire colours exposed
+this as 32-pixel column collapse.
+
+`uniform` now explicitly denotes the one warp-wide case for automatic values,
+parameters and returns. Function signatures select vector versus scalar ABI
+homes. A uniform write reached through varying control occurs once when the
+active mask is nonempty and not at all when it is empty; the right-hand side
+must itself be uniform. Ordinary lane values remain ordinary throughout their
+function, even after assignment from a literal.
+
+This required no opcode or VM change. `WARP_RAM_WORDS` now publishes the
+65,536-word RAM size, with `WARP_RAM_SIZE_WORDS` retained as an alias. Pure
+integer ternaries and simple exact-lane stores also avoid general ballot
+lowering where direct predicate selection is sufficient.

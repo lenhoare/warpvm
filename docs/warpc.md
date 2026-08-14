@@ -5,8 +5,8 @@ a lexer, parser, typed semantic tree, uniformity analysis, and direct WarpVM
 assembly lowering. The generated assembly is passed to the existing Rust
 assembler library in-process, producing a canonical `.wvm` file.
 
-This document describes the implemented v0.1.4 Slice A through F compiler and
-the v0.1.5 warp-native language/library slice.
+This document describes the implemented compiler through the explicit-uniform
+value-shape slice.
 
 ## Command line
 
@@ -24,8 +24,13 @@ Programs may contain structure definitions, global declarations, and one or
 more function declarations and definitions, with exactly one defined
 `int main(void)` entry point. Bodies may contain nested blocks, local
 declarations, expression statements, structured control flow, function calls,
-and `return`. Ordinary scalar locals use WarpVM vector registers; aggregates
-and address-taken locals use lane-private RAM.
+and `return`.
+
+Warp C is array-first rather than scalar-first. An ordinary automatic scalar
+is naturally one value per lane: `int x;` denotes 32 `int` values owned by the
+warp. The spelling `uniform int x;` explicitly denotes one warp-wide value.
+Ordinary values use vector homes; uniform values may use scalar homes;
+aggregates and address-taken locals use lane-private RAM.
 
 Implemented types and memory objects:
 
@@ -34,6 +39,8 @@ Implemented types and memory objects:
 - `char`: unsigned value occupying one 32-bit WarpVM word;
 - `void`: accepted for the `main` parameter list;
 - word-addressed pointers, fixed-size one-dimensional arrays, and structures;
+- the `uniform` value qualifier on automatic scalar/pointer values, function
+  parameters, and function returns;
 - globals, address-taken automatic scalars, automatic arrays and structures;
 - one-word-per-character, zero-terminated string literals.
 
@@ -65,10 +72,11 @@ larger expressions. Definition parameters require names; prototype parameter
 names are optional. Recursion is rejected, and static call chains may not
 exceed WarpVM's eight-entry architectural call stack.
 
-The compiler conservatively inlines small, straight-line scalar helpers. An
+The compiler conservatively inlines small, straight-line helpers. An
 eligible helper has at most six statements and 48 expression/statement AST
 nodes, ends in one value-return statement, and contains no control flow,
-nested calls, arrays, structures, pointers, or address-taking. Actual
+nested calls, arrays, structures, pointers, or address-taking. Pure `?:`
+expressions remain eligible. Actual
 arguments are first bound once to fresh caller-local slots; helper locals are
 also fresh at every call site, so side effects, parameter assignment, and name
 shadowing retain normal call semantics. Inlined result expressions keep their
@@ -77,9 +85,9 @@ divergent masks. Helpers outside this deliberately small policy continue to
 use the unchanged WarpVM CALL/RET ABI. Recursive helpers are never candidates
 and remain rejected by normal call-graph validation.
 
-Slice B requires controlling expressions to be uniform. This is checked in
-the typed semantic layer rather than inferred from the current lowering.
-Slice E relaxes that restriction specifically for structured `if` / `else`.
+Loops, switches and short-circuit control require explicit/proven uniform
+conditions. Structured `if` / `else` also accepts varying lane predicates and
+uses masked execution.
 
 The deliberately small declarator subset currently supports one array suffix,
 ordinary pointer stars, and top-level named structure definitions. Brace
@@ -106,8 +114,9 @@ deliberately not a general preprocessor: other `#` directives are diagnosed.
 The interface and its matching documentation header at `include/warp.h`
 provide:
 
-- `WARP_VIDEO_WIDTH`, `WARP_VIDEO_HEIGHT`, `WARP_VIDEO_WORDS`, and
-  `WARP_VIDEO_BASE` as unsigned constant expressions;
+- `WARP_VIDEO_WIDTH`, `WARP_VIDEO_HEIGHT`, `WARP_VIDEO_WORDS`,
+  `WARP_VIDEO_BASE`, `WARP_RAM_WORDS` (65,536), and the compatibility alias
+  `WARP_RAM_SIZE_WORDS` as unsigned constant expressions;
 - `warp_framebuffer()` returning the ordinary word-addressed ARGB8888 buffer;
 - `warp_argb(a, r, g, b)` masking and packing four 8-bit components;
 - `warp_set_pixel(x, y, colour)` lowering to address arithmetic and `STORE`;
@@ -180,12 +189,46 @@ sign-bit bias for signed comparisons, magnitude/sign reconstruction for
 division and remainder, and sign-fill construction for arithmetic shifts. No
 new ISA operation is required.
 
-## Current allocation and ABI
+## Value shapes, allocation, and ABI
+
+Declaration shape is stable for the whole function:
+
+```text
+ordinary int          one value per lane (32 values)
+uniform int           one value shared by the warp
+ordinary parameter    accepts either shape and receives a vector
+uniform parameter     accepts only a uniform argument
+ordinary return       produces a vector value
+uniform return        requires and produces a uniform value
+```
+
+An ordinary local does not become uniform because its initializer happens to
+be equal in every lane. Conversely, a `uniform` local cannot be initialized or
+assigned from `WARP`, an ordinary local, or another varying expression. This
+prevents the compiler from silently manufacturing uniformity by extracting
+lane 0.
+
+Uniform writes under varying `if` masks have warp-owned semantics. If the
+current mask contains at least one lane, the uniform right-hand side is
+evaluated once and the single value is updated once. If the mask is empty, the
+write does not happen:
+
+```c
+uniform int x = 0;
+if (WARP == 7)  x = 7;  /* x becomes 7 */
+if (WARP == 99) x = 9;  /* no active lane: x remains 7 */
+```
+
+If both masks of a varying `if/else` are nonempty, separate uniform writes in
+both arms occur in lowering order; the later write is the final value. Use
+`warp_any` or `warp_all` when the control decision itself should be explicitly
+warp-wide.
 
 Warp C's first calling convention is deliberately small:
 
-- `r0`–`r3` carry up to four vector arguments;
-- `r0` carries a non-void vector return value;
+- argument position `i` uses `r[i]` for an ordinary parameter and `s[i]` for
+  a uniform parameter, for up to four parameters;
+- `r0` carries an ordinary non-void return and `s0` a uniform return;
 - `r0`–`r12` hold C locals and temporaries and are caller-saved;
 - `s0`–`s6` hold liveness-allocated uniform C locals and are caller-saved;
 - `r13` permanently holds the lane ID;
@@ -195,20 +238,19 @@ Warp C's first calling convention is deliberately small:
 - `p0`–`p3` are temporary condition masks;
 - architectural `CALL` / `RET` preserve return continuations.
 
-Entry initializes `s7` to `WARP_RAM_SIZE_WORDS`, currently word address
+Entry initializes `s7` to `WARP_RAM_WORDS`, currently word address
 65,536. The software stack grows down.
 Every saved vector value occupies 32 consecutive words: slot lane `i` belongs
-to lane `i`. A call frame currently stores every allocator-active caller
-vector and scalar register in ascending register order, followed by dedicated
+to lane `i`. A call frame stores the caller values genuinely live after that
+call in ascending register order, followed by dedicated
 argument slots and, for a non-void call, one return-value slot. Arguments are
-loaded into `r0`–`r3`; after `RET`, the return is parked in its stack slot,
+loaded into their signature-selected vector/scalar homes; after `RET`, the
+return is parked in its stack slot,
 caller registers are restored, and the result is reloaded into a free
 temporary. Uniform scalar saves currently replicate the same value into all
-32 lane words. This layout is deliberately conservative and preserves
-genuinely lane-varying values correctly, but allocator-active intervals can be
-larger than the values genuinely live across a particular call. A second
-backward pass therefore annotates every real call with definition-sensitive
-semantic live-out. CALL lowering saves only those register homes plus any
+32 lane words. A backward pass annotates every real call with
+definition-sensitive semantic live-out. CALL lowering saves only those
+register homes plus any
 already-evaluated expression temporaries that must survive a nested or later
 call; live values whose authoritative home is already in the function's RAM
 frame need no duplicate call save.
@@ -216,13 +258,13 @@ frame need no duplicate call save.
 Before assembly lowering, a small structured lifetime pass records every
 local's first and last required program point. Lifetimes are conservatively
 extended through loops and across both control-flow paths. Non-overlapping
-locals reuse the same home: uniform locals prefer `s0`–`s6`, while divergent
-locals use vector homes. Allocation begins with eight vector homes, leaving
+locals reuse the same home: explicit uniform locals prefer `s0`–`s6`, while
+ordinary locals use vector homes. Allocation begins with eight vector homes, leaving
 five transient registers, and retries a function with seven or six homes only
 when its actual expression lowering needs more transient capacity.
 
-When genuinely overlapping local pressure exceeds those homes, scalar locals
-spill into the existing lane-private function frame. Arrays, structures, and
+When genuinely overlapping local pressure exceeds those homes, locals spill
+into the existing lane-private function frame. Arrays, structures, and
 address-taken scalars use that frame unconditionally. A frame is
 lane-major: all words of lane 0's C objects are consecutive, followed by lane
 1's, and so on. Consequently an automatic `p + 1` is a physical address
@@ -231,7 +273,7 @@ each lane. Function-local frames and allocator spill slots coexist with the
 older word-major caller-save spill frames; the latter are never exposed as C
 pointers.
 
-`--emit-asm` prints each local's uniformity and chosen home, leaves all reloads
+`--emit-asm` prints each local's value shape and chosen home, leaves all reloads
 and stores visible, and appends an allocation summary to each function, for
 example:
 
@@ -255,29 +297,51 @@ eventual broader C implementation.
 
 ## Uniformity and divergent control
 
-The typed semantic tree records every expression and local as `Uniform` or
-`Divergent`. Literals, `warp_vm_id()`, and ordinary loop counters begin
-uniform. `warp_lane_id()` is divergent, and binary expressions join their
-operands. Initializers, assignments, increments, and function arguments
-propagate the result. An order-independent call-graph summary marks a function
-result divergent when that function, or a transitive callee, uses the lane ID;
-forward prototypes cannot hide divergence.
+The typed semantic tree separates declaration shape from temporary expression
+uniformity. Literals, direct globals, `warp_vm_id()`, reductions, broadcasts,
+and a shuffle from one uniform source-lane index are uniform expressions.
+`WARP`, ordinary local/parameter references, ordinary function returns, and
+lane-indexed operations are varying. Unary expressions preserve shape and
+lane-wise binary expressions are uniform only when both operands are uniform.
+Function signatures—not call-site inference—define parameter and return
+shape.
+
+The practical control distinction is:
+
+```text
+ordinary arithmetic: 32 lane-wise results
+comparison:           32-lane predicate
+& and |:              lane-wise predicate composition
+&& and ||:            uniform short-circuit control only
+```
 
 Uniform `if` statements retain the original comparison-and-jump lowering.
-For a divergent condition, the compiler ballots the materialized condition
+For a general divergent condition, the compiler ballots the materialized condition
 into `p3`, emits the then side guarded by `@p3`, complements the mask for the
 else side, and reconverges simply by returning to unguarded emission. A nested
 divergent `if` intersects its condition with the parent mask in `p2`. `p0` and
 `p1` remain comparison/temporary masks. Both branch bodies are linear in the
 bytecode and only their selected lanes write registers or memory.
 
-Slice E deliberately supports two nested divergent mask levels. It diagnoses
-deeper nesting, divergent loop conditions and switches, calls or returns
-inside divergent regions, divergent `break` / `continue`, and divergent
-short-circuit expressions. Those constructs need either more predicate
+The compiler supports two nested divergent mask levels. It diagnoses deeper
+nesting, varying loop conditions and switches, calls or returns inside
+varying regions, varying `break` / `continue`, and varying short-circuit
+expressions. Diagnostics name ordinary values that make loop control varying
+and recommend a separately named `uniform` counter. Those constructs need either more predicate
 storage or mask-aware control-transfer semantics; they are rejected rather
 than guessed. Uniform loops, switches, calls, returns, and short-circuit
 expressions are unchanged.
+
+Pure integer `?:` expressions use direct predicate selection: both effect-free
+arms are evaluated and predicated moves choose each lane's value without a
+general `BALLOT`/reconvergence sequence. Side-effecting or otherwise unsupported
+arms keep the selective masked lowering. A simple `if (WARP == constant)`
+assignment/store similarly lowers directly under the known lane predicate.
+
+For cooperative output, assign each lane ownership of one output and gather,
+shuffle or load the required inputs. A loop such as `base + WARP` naturally
+writes 32 distinct values. Use a `uniform` loop counter for `base`; do not turn
+the lane-owned output itself into a uniform value.
 
 ## Verification
 

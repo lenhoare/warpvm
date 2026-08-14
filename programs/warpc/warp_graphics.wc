@@ -2,12 +2,12 @@
 
 int main(void)
 {
-    unsigned *framebuffer = warp_framebuffer();
-    unsigned vm = warp_vm_id();
+    uniform unsigned *framebuffer = warp_framebuffer();
+    uniform unsigned vm = warp_vm_id();
     int result = 42;
 
-    for (unsigned y = 0; y < WARP_VIDEO_HEIGHT; ++y) {
-        for (unsigned base = 0; base < WARP_VIDEO_WIDTH; base += 32) {
+    for (uniform unsigned y = 0; y < WARP_VIDEO_HEIGHT; ++y) {
+        for (uniform unsigned base = 0; base < WARP_VIDEO_WIDTH; base += 32) {
             unsigned x = base + WARP;
             unsigned colour = warp_argb(255, (x + vm * 4) & 255, y, x ^ y);
             framebuffer[y * WARP_VIDEO_WIDTH + x] = colour;
@@ -15,8 +15,8 @@ int main(void)
     }
 
     /* Every lane verifies its own quarter-row chunks across the full frame. */
-    for (unsigned y = 0; y < WARP_VIDEO_HEIGHT; ++y) {
-        for (unsigned base = 0; base < WARP_VIDEO_WIDTH; base += 32) {
+    for (uniform unsigned y = 0; y < WARP_VIDEO_HEIGHT; ++y) {
+        for (uniform unsigned base = 0; base < WARP_VIDEO_WIDTH; base += 32) {
             unsigned x = base + WARP;
             unsigned expected = warp_argb(255, (x + vm * 4) & 255, y, x ^ y);
             if (framebuffer[y * WARP_VIDEO_WIDTH + x] != expected)

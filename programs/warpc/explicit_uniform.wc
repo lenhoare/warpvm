@@ -1,0 +1,37 @@
+#include <warp.h>
+
+int scale_bias(int value, uniform int scale, uniform int bias)
+{
+    /* Keep this helper on CALL/RET so the mixed vector/scalar ABI is tested. */
+    for (uniform int once = 0; once < 1; ++once)
+        value = value * scale + bias;
+    return value;
+}
+
+uniform int mode(uniform int seed)
+{
+    for (uniform int once = 0; once < 1; ++once)
+        seed = seed + 3;
+    return seed;
+}
+
+int main(void)
+{
+    uniform int selected = 0;
+
+    /* A uniform write under an empty varying mask does nothing. */
+    if (WARP == 99)
+        selected = 9;
+    if (selected != 0)
+        return 0;
+
+    /* A nonempty varying mask updates the one warp-wide value once. */
+    if (WARP == 7)
+        selected = 4;
+    if (selected != 4)
+        return 0;
+
+    if (!warp_all(scale_bias(WARP, selected, mode(2)) == WARP * 4 + 5))
+        return 0;
+    return 42;
+}

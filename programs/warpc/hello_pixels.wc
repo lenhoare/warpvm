@@ -2,15 +2,15 @@
 
 int main(void)
 {
-    unsigned *framebuffer = warp_framebuffer();
-    unsigned red = warp_argb(255, 255, 0, 0);
-    unsigned green = warp_argb(255, 0, 255, 0);
-    unsigned blue = warp_argb(255, 0, 0, 255);
-    unsigned white = warp_argb(255, 255, 255, 255);
+    uniform unsigned *framebuffer = warp_framebuffer();
+    uniform unsigned red = warp_argb(255, 255, 0, 0);
+    uniform unsigned green = warp_argb(255, 0, 255, 0);
+    uniform unsigned blue = warp_argb(255, 0, 0, 255);
+    uniform unsigned white = warp_argb(255, 255, 255, 255);
 
-    for (int y = 0; y < WARP_VIDEO_HEIGHT; ++y) {
-        for (int x = 0; x < WARP_VIDEO_WIDTH; ++x) {
-            unsigned colour = 0;
+    for (uniform int y = 0; y < WARP_VIDEO_HEIGHT; ++y) {
+        for (uniform int x = 0; x < WARP_VIDEO_WIDTH; ++x) {
+            uniform unsigned colour = 0;
             switch ((x >> 4) & 3) {
             case 0:
                 colour = red;
@@ -31,10 +31,10 @@ int main(void)
 
     /* Check every word through the ordinary framebuffer pointer. This makes
      * the acceptance test prove a complete image, not just sampled pixels. */
-    int result = 42;
-    for (int y = 0; y < WARP_VIDEO_HEIGHT; ++y) {
-        for (int x = 0; x < WARP_VIDEO_WIDTH; ++x) {
-            unsigned expected = 0;
+    uniform int result = 42;
+    for (uniform int y = 0; y < WARP_VIDEO_HEIGHT; ++y) {
+        for (uniform int x = 0; x < WARP_VIDEO_WIDTH; ++x) {
+            uniform unsigned expected = 0;
             switch ((x >> 4) & 3) {
             case 0:
                 expected = red;

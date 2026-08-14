@@ -28,7 +28,7 @@ int main(void)
     int v;
     int got;
     int expected;
-    int base;
+    uniform int base;
     int i;
     int left;
     int right;

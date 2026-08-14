@@ -30,7 +30,7 @@ unsigned g_palbase;    /* per-VM hue offset                   */
 
 int main(void)
 {
-    unsigned batch;
+    uniform unsigned batch;
     int dx;
     int dy;
     int rx;

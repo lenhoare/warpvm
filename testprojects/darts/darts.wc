@@ -22,8 +22,8 @@ int main(void)
 {
     int dart_x;
     int dart_y;
-    int row;
-    int col;
+    uniform int row;
+    uniform int col;
     int hit;
     int colour;
     int board;

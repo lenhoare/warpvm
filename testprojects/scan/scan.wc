@@ -10,7 +10,7 @@
  * lane 0, and the only cross-lane traffic is one shuffle-up per step.
  *
  * warp_shuffle takes a runtime per-lane source lane, so `warp_shuffle(val,
- * WARP - d)` reads d lanes down with an ordinary loop variable d. Low lanes
+ * WARP - d)` reads d lanes down with a uniform loop variable d. Low lanes
  * where WARP-d < 0 read a wrapped lane, but their guarded add discards it.
  *
  * The input carries deliberate duplicates (values 1..4 repeating) to show the
@@ -32,7 +32,7 @@ int main(void)
     unsigned val = x;                     /* becomes the inclusive scan */
     g_in[WARP] = x;
 
-    int d;
+    uniform int d;
     for (d = 1; d < 32; d = d << 1) {
         unsigned below = warp_shuffle(val, WARP - d);
         if (WARP >= d)
@@ -48,12 +48,12 @@ int main(void)
     unsigned recovered = val;
     if (WARP > 0)
         recovered = val - prev;
-    int all_recovered = warp_all(recovered == x);
+    uniform int all_recovered = warp_all(recovered == x);
 
     /* The final inclusive value is the whole-warp total; compare it with an
      * independent reduction of the input. */
     g_total = warp_reduce_add_u(x);
-    unsigned last = warp_broadcast(val, 31);
+    uniform unsigned last = warp_broadcast(val, 31);
 
     if (all_recovered && (last == g_total))
         return 42;

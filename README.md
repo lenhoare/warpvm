@@ -56,6 +56,13 @@ provides framebuffer and mailbox APIs, including nested divergent `if` /
 `else`. It emits inspectable
 WarpVM assembly and assembles it in-process to canonical `.wvm`:
 
+An ordinary Warp C scalar is a 32-lane warp value. Use the explicit `uniform`
+qualifier for one warp-wide control or pointer value, for example
+`for (uniform int row = 0; row < 128; ++row)`. Function parameter and return
+shapes are part of their signatures, so ordinary values are never silently
+collapsed through lane 0. `WARP_RAM_WORDS` publishes the 65,536-word VM RAM
+size; `WARP_RAM_SIZE_WORDS` remains as a compatibility alias.
+
 ```sh
 build/tools-rust/release/warpc programs/warpc/integer_smoke.wc \
   -o build/warpc_integer_smoke.wvm --emit-asm --dump-uniformity
@@ -303,6 +310,7 @@ control-poll, and memory breakdown is in
 | v0.1.7-C/D | fixed-capacity supervisor lifecycle, safe slot recycling and cold program rebind | done |
 | v0.1.7-E | long-lived supervisor CLI, startup files and logical-ID viewer | done |
 | v0.1.7-F | heterogeneous combined compiled kernel and warp-uniform program selection | done |
+| spec-08 | explicit uniform values, mixed call ABI, warp-value correction, cheap select/exact-lane lowering | done |
 
 ## v0.1 milestone
 

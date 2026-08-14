@@ -13,11 +13,11 @@
 int g_cur[4096];
 int g_nxt[4096];
 
-int topple(int *cur, int *nxt)
+uniform int topple(uniform int *cur, uniform int *nxt)
 {
     int seen;
-    int y;
-    int base;
+    uniform int y;
+    uniform int base;
     int x;
     int i;
     int h;
@@ -57,11 +57,11 @@ int height_colour(int h)
 
 int main(void)
 {
-    int vm;
-    int drop;
-    int sweep;
-    int y;
-    int base;
+    uniform int vm;
+    uniform int drop;
+    uniform int sweep;
+    uniform int y;
+    uniform int base;
     int x;
     int h;
     int sx;

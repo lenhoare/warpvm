@@ -7,8 +7,8 @@ unsigned target[4096];
 
 int main(void)
 {
-    unsigned words = 32;
-    unsigned repetitions = 8192;
+    uniform unsigned words = 32;
+    uniform unsigned repetitions = 8192;
     if (benchmark_case == 1) {
         words = 128;
         repetitions = 2048;
@@ -23,18 +23,18 @@ int main(void)
     }
 
     if (benchmark_operation == 0) {
-        for (unsigned repeat = 0; repeat < repetitions; ++repeat)
-            for (unsigned i = 0; i < words; ++i)
+        for (uniform unsigned repeat = 0; repeat < repetitions; ++repeat)
+            for (uniform unsigned i = 0; i < words; ++i)
                 target[i] = source_a[i];
     }
     if (benchmark_operation == 1) {
-        for (unsigned repeat = 0; repeat < repetitions; ++repeat)
-            for (unsigned i = 0; i < words; ++i)
+        for (uniform unsigned repeat = 0; repeat < repetitions; ++repeat)
+            for (uniform unsigned i = 0; i < words; ++i)
                 target[i] = 0x12345678u;
     }
     if (benchmark_operation == 2) {
-        for (unsigned repeat = 0; repeat < repetitions; ++repeat)
-            for (unsigned i = 0; i < words; ++i)
+        for (uniform unsigned repeat = 0; repeat < repetitions; ++repeat)
+            for (uniform unsigned i = 0; i < words; ++i)
                 target[i] = source_a[i] + source_b[i] + 1;
     }
     return 42;

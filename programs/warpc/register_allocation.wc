@@ -26,7 +26,7 @@ int main(void)
     int a17 = 18; sequential += a17;
     int a18 = 19; sequential += a18;
     int a19 = 20; sequential += a19;
-    if (sequential != 210)
+    if (!warp_all(sequential == 210))
         return 0;
 
     /* All fourteen values remain live until the accumulation starts. */
@@ -74,7 +74,7 @@ int main(void)
 
     /* `carried` and the uniform loop counter are live across the backedge. */
     int carried = WARP;
-    for (int i = 0; i < 5; ++i)
+    for (uniform int i = 0; i < 5; ++i)
         carried += i;
     if (!warp_all(carried == WARP + 10))
         return 0;

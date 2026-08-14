@@ -27,8 +27,7 @@ int square(int value)
 void consume(int a, int b, int c, int d)
 {
     int checksum = a + b + c + d;
-    if (checksum == 46)
-        return;
+    checksum = checksum;
     return;
 }
 

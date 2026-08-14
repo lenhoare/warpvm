@@ -1,11 +1,14 @@
 #ifndef WARP_H
 #define WARP_H
 
-/* Warp C v0.1.5 compiler-provided platform interface.
+/* Warp C compiler-provided platform interface.
  * Addresses and sizes are in 32-bit VM words. Pixels are ARGB8888 words.
  * WARP is a predefined divergent int containing the current lane ID (0..31);
- * it is part of the language and intentionally has no declaration here. */
-#define WARP_RAM_SIZE_WORDS 65536
+ * it is part of the language and intentionally has no declaration here.
+ * Ordinary values are one-per-lane; `uniform` explicitly denotes one value
+ * shared by the warp. */
+#define WARP_RAM_WORDS 65536
+#define WARP_RAM_SIZE_WORDS WARP_RAM_WORDS
 #define WARP_VIDEO_WIDTH 128
 #define WARP_VIDEO_HEIGHT 128
 #define WARP_VIDEO_WORDS 16384
@@ -47,7 +50,9 @@ int min(int a, int b);
 int max(int a, int b);
 
 /* Compiler-provided Warp C source routines. Sizes and addresses are words. */
-void warp_memcpy(unsigned *dst, unsigned *src, unsigned words);
-void warp_memset(unsigned *dst, unsigned value, unsigned words);
+void warp_memcpy(uniform unsigned *dst, uniform unsigned *src,
+                 uniform unsigned words);
+void warp_memset(uniform unsigned *dst, unsigned value,
+                 uniform unsigned words);
 
 #endif

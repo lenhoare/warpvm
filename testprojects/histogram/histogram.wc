@@ -20,7 +20,7 @@ unsigned g_fail;
 int count_chunk(int sample, int valid)
 {
     int hits = 0;
-    unsigned src;
+    uniform unsigned src;
     for (src = 0u; src < 32u; src = src + 1u) {
         int value = warp_shuffle(sample, src);
         int live = warp_shuffle(valid, src);
@@ -49,12 +49,12 @@ int main(void)
 {
     int hits;
     int sample;
-    unsigned base;
+    uniform unsigned base;
     unsigned index;
     int live;
     int expected;
-    int bin7_shuffle;
-    int bin7_reduce;
+    uniform int bin7_shuffle;
+    uniform int bin7_reduce;
 
     g_fail = 0;
 

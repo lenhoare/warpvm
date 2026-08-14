@@ -5,10 +5,10 @@ int g_b[4096];
 int g_c[4096];
 int g_fail;
 
-void wave_step(int *u, int *prev, int *out)
+void wave_step(uniform int *u, uniform int *prev, uniform int *out)
 {
-    int y;
-    int base;
+    uniform int y;
+    uniform int base;
     int x;
     int i;
     int c;
@@ -35,14 +35,14 @@ void wave_step(int *u, int *prev, int *out)
 
 int main(void)
 {
-    int *u;
-    int *prev;
-    int *nxt;
-    int *tmp;
-    int y;
-    int base;
-    int t;
-    int total;
+    uniform int *u;
+    uniform int *prev;
+    uniform int *nxt;
+    uniform int *tmp;
+    uniform int y;
+    uniform int base;
+    uniform int t;
+    uniform int total;
 
     g_fail = 0;
 

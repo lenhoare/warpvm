@@ -1,0 +1,53 @@
+#include <warp.h>
+
+/* One byte-like state per pixel, stored as ordinary WarpVM words:
+ * 0 empty, 1 tree, 2 burning. */
+unsigned g_state[16384];
+unsigned g_frame;
+
+/* Intentionally non-inlined so the visual program continuously exercises an
+ * ordinary varying argument and return across the CALL ABI. */
+unsigned paint(int state)
+{
+    unsigned colour = 0xff030508u;
+    for (uniform int once = 0; once < 1; ++once) {
+        if (state == 1)
+            colour = 0xff165b32u;
+        if (state == 2)
+            colour = 0xffff681cu;
+    }
+    return colour;
+}
+
+int main(void)
+{
+    uniform unsigned vm = warp_vm_id();
+
+    for (uniform unsigned batch = 0; batch < 512u; ++batch) {
+        unsigned index = batch * 32u + WARP;
+        unsigned seed = index * 1103515245u + vm * 12345u;
+        g_state[index] = ((seed >> 27) < 23u) ? 1u : 0u;
+    }
+    if (WARP == 0)
+        g_state[(32u + (vm & 63u)) * 128u + 64u] = 2u;
+
+    while (1) {
+        for (uniform unsigned batch = 0; batch < 512u; ++batch) {
+            unsigned index = batch * 32u + WARP;
+            unsigned state = g_state[index];
+            unsigned neighbour = g_state[(index + 1u) & 16383u];
+            unsigned ignite = (state == 1u) & (neighbour == 2u)
+                            & (((index + g_frame) & 7u) == 0u);
+            state = state == 2u ? 0u : (ignite ? 2u : state);
+            g_state[index] = state;
+            warp_set_pixel(index & 127u, index >> 7, paint(state));
+        }
+
+        /* Keep a small deterministic ignition moving through the forest. */
+        if (WARP == 0)
+            g_state[((g_frame + vm * 17u) & 127u) * 128u
+                    + ((g_frame * 3u + vm) & 127u)] = 2u;
+        warp_flip();
+        g_frame = g_frame + 1u;
+    }
+}

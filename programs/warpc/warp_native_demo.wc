@@ -12,8 +12,8 @@ unsigned bright_mask;
 
 int main(void)
 {
-    unsigned vm = warp_vm_id();
-    unsigned *fb = warp_framebuffer();
+    uniform unsigned vm = warp_vm_id();
+    uniform unsigned *fb = warp_framebuffer();
     warp_memset(history, 0, 64);
 
     while (1) {
@@ -36,8 +36,8 @@ int main(void)
             warp_send((vm + 1) % 64, 2, current_energy);
         }
 
-        for (unsigned y = 0; y < WARP_VIDEO_HEIGHT; ++y) {
-            for (unsigned base = 0; base < WARP_VIDEO_WIDTH; base += 32) {
+        for (uniform unsigned y = 0; y < WARP_VIDEO_HEIGHT; ++y) {
+            for (uniform unsigned base = 0; base < WARP_VIDEO_WIDTH; base += 32) {
                 unsigned x = base + WARP;
                 unsigned memory = history[WARP];
                 memory += history[32 + WARP];

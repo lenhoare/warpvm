@@ -26,8 +26,8 @@ int main(void)
     g_sum_in = warp_reduce_add_u(val);
     g_xor_in = warp_reduce_xor(val);
 
-    int k;
-    int j;
+    uniform int k;
+    uniform int j;
     for (k = 2; k <= 32; k = k << 1) {
         for (j = k >> 1; j > 0; j = j >> 1) {
             unsigned other = warp_shuffle(val, WARP ^ j);
@@ -46,7 +46,7 @@ int main(void)
     int ordered = 1;
     if (WARP < 31)
         ordered = val <= above;
-    int all_ordered = warp_all(ordered);
+    uniform int all_ordered = warp_all(ordered);
 
     if (all_ordered && (g_sum_out == g_sum_in) && (g_xor_out == g_xor_in))
         return 42;

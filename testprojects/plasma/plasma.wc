@@ -57,7 +57,7 @@ int main(void)
         g_src2y = 64 + isin(g_t + 170u) / 2;
         g_palette = g_pal_base + (g_t >> 1);
 
-        for (unsigned batch = 0; batch < 512u; ++batch) {
+        for (uniform unsigned batch = 0; batch < 512u; ++batch) {
             unsigned px = (batch * 32u + WARP) & 127u;
             unsigned py = (batch * 32u + WARP) >> 7;
             int wave;

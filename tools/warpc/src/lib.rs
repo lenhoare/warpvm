@@ -42,9 +42,9 @@ pub fn compile(source: &str) -> Result<Compilation, Diagnostic> {
 }
 
 const WARP_MEMCPY_SOURCE: &str = r#"
-void warp_memcpy(unsigned *dst, unsigned *src, unsigned words)
+void warp_memcpy(uniform unsigned *dst, uniform unsigned *src, uniform unsigned words)
 {
-    for (unsigned base = 0; base < words; base += 32) {
+    for (uniform unsigned base = 0; base < words; base += 32) {
         unsigned i = base + WARP;
         if (i < words)
             dst[i] = src[i];
@@ -53,9 +53,9 @@ void warp_memcpy(unsigned *dst, unsigned *src, unsigned words)
 "#;
 
 const WARP_MEMSET_SOURCE: &str = r#"
-void warp_memset(unsigned *dst, unsigned value, unsigned words)
+void warp_memset(uniform unsigned *dst, unsigned value, uniform unsigned words)
 {
-    for (unsigned base = 0; base < words; base += 32) {
+    for (uniform unsigned base = 0; base < words; base += 32) {
         unsigned i = base + WARP;
         if (i < words)
             dst[i] = value;
@@ -143,7 +143,7 @@ mod tests {
     #[test]
     fn lowers_graphics_intrinsics_to_existing_isa() {
         let result = compile(
-            "#include <warp.h>\nint main(void) { unsigned c=warp_argb(255,1,2,3); warp_set_pixel(4,5,c); unsigned *p=warp_framebuffer(); warp_flip(); if (p[5*WARP_VIDEO_WIDTH+4]==c) return 42; return 0; }",
+            "#include <warp.h>\nint main(void) { uniform unsigned c=warp_argb(255,1,2,3); warp_set_pixel(4,5,c); uniform unsigned *p=warp_framebuffer(); warp_flip(); if (p[5*WARP_VIDEO_WIDTH+4]==c) return 42; return 0; }",
         )
         .unwrap();
         assert!(result.assembly.contains("STORE"));
@@ -240,7 +240,7 @@ mod tests {
     #[test]
     fn shuffle_uniformity_is_visible_in_dump_and_branch_lowering() {
         let result = compile(
-            "int main(void) { int value=WARP*7; int fixed=warp_shuffle(value,31); int self=warp_shuffle(value,WARP); if (fixed==217 && warp_vm_id()>=0) return 42; return self-self; }",
+            "int main(void) { int value=WARP*7; uniform int fixed=warp_shuffle(value,31); int self=warp_shuffle(value,WARP); if (fixed==217 && warp_vm_id()>=0) return 42; return self-self; }",
         )
         .unwrap();
         let fixed = result
